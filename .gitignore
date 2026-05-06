@@ -1,0 +1,53 @@
+# Build artifacts
+/bin/
+/dist/
+
+# Runtime data — anything mounted as ./data or ./creds
+/data/*
+!/data/.gitkeep
+/creds/*
+!/creds/.gitkeep
+
+# SQLite databases anywhere in the tree
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-journal
+
+# Local environment (NOT .env.example)
+.env
+.env.*
+!.env.example
+
+# Credential files left around (defensive — should always live under /creds)
+*.credentials.json
+.credentials.json
+
+# Go test cache / coverage
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Logs
+*.log
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Docker
+.docker/
+
+# Vendored research material (not part of the repo proper)
+/pi-mono/
+
+# Internal development notes — exclude unless explicitly committed
+/NOTES.md
+/NOTES_2.md
+/TASK.md
