@@ -18,11 +18,11 @@ func Open(path string) (*DB, error) {
 		return nil, err
 	}
 	if err := sdb.Ping(); err != nil {
-		sdb.Close()
+		_ = sdb.Close()
 		return nil, err
 	}
 	if _, err := sdb.Exec(schema); err != nil {
-		sdb.Close()
+		_ = sdb.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
 	for _, alter := range []string{
@@ -34,7 +34,7 @@ func Open(path string) (*DB, error) {
 		`ALTER TABLE credentials ADD COLUMN weight INTEGER NOT NULL DEFAULT 1`,
 	} {
 		if _, err := sdb.Exec(alter); err != nil && !isDuplicateColumn(err) {
-			sdb.Close()
+			_ = sdb.Close()
 			return nil, fmt.Errorf("migrate %q: %w", alter, err)
 		}
 	}

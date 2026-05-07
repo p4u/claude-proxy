@@ -96,10 +96,6 @@ func metadataUserID(body []byte) string {
 // preamble + project CLAUDE.md) stays identical and the first user message
 // rarely changes once the session has started.
 func contentHash(body []byte) string {
-	type textBlock struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
 	type message struct {
 		Role    string          `json:"role"`
 		Content json.RawMessage `json:"content"`
@@ -139,7 +135,7 @@ func writeSystem(h hashWriter, raw json.RawMessage) {
 	// system can be a string OR an array of {type:"text", text:"..."}.
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
-		h.Write([]byte(s))
+		_, _ = h.Write([]byte(s))
 		return
 	}
 	var blocks []struct {
@@ -149,7 +145,7 @@ func writeSystem(h hashWriter, raw json.RawMessage) {
 	if err := json.Unmarshal(raw, &blocks); err == nil {
 		for _, b := range blocks {
 			if b.Type == "text" {
-				h.Write([]byte(b.Text))
+				_, _ = h.Write([]byte(b.Text))
 			}
 		}
 	}
@@ -161,7 +157,7 @@ func writeContent(h hashWriter, raw json.RawMessage) {
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
-		h.Write([]byte(s))
+		_, _ = h.Write([]byte(s))
 		return
 	}
 	var blocks []struct {
@@ -171,7 +167,7 @@ func writeContent(h hashWriter, raw json.RawMessage) {
 	if err := json.Unmarshal(raw, &blocks); err == nil {
 		for _, b := range blocks {
 			if b.Type == "text" {
-				h.Write([]byte(b.Text))
+				_, _ = h.Write([]byte(b.Text))
 			}
 		}
 	}

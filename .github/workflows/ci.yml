@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Go version is read from go.mod via `go-version-file` on actions/setup-go,
+# so there is nothing to keep in sync here.
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Static analysis: gofmt, go vet, golangci-lint.
+  # ----------------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "::error::gofmt found unformatted files:"
+            echo "$out"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          # Pin v2 explicitly: the action's `latest` still resolves to v1.x.
+          version: v2.12.2
+          # Compile against the Go runtime set up above (= go.mod's directive)
+          # so the linter binary can target whatever module version we declare.
+          install-mode: goinstall
+          args: --timeout=5m
+
+  # ----------------------------------------------------------------------------
+  # Unit + integration tests with race detector and coverage.
+  # ----------------------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test (race + coverage)
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -n 1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 14
+
+  # ----------------------------------------------------------------------------
+  # Build & publish the multi-arch docker image to GHCR.
+  # Runs only on push to main and on semver tags. Pull-request builds are
+  # skipped to avoid leaking the registry token to forks.
+  # ----------------------------------------------------------------------------
+  image:
+    name: Image (GHCR)
+    needs: [lint, test]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=claude-proxy
+            org.opencontainers.image.description=Sticky multi-subscription HTTP proxy for Claude Code
+            org.opencontainers.image.licenses=AGPL-3.0-only
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Image summary
+        run: |
+          echo "## Published images" >> $GITHUB_STEP_SUMMARY
+          for t in ${{ steps.meta.outputs.tags }}; do
+            echo "- \`$t\`" >> $GITHUB_STEP_SUMMARY
+          done

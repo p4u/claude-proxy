@@ -230,7 +230,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 
 	if resp.StatusCode == http.StatusUnauthorized && allowRetry {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		h.log.Warn("upstream 401; attempting refresh",
 			"cred", cred.ID,
 			"snippet", decodeBodySnippet(raw, resp.Header.Get("Content-Encoding")))
@@ -336,4 +336,3 @@ func parseRetryAfter(v string) time.Time {
 	}
 	return time.Now().Add(60 * time.Second)
 }
-

@@ -1,5 +1,9 @@
 # claude-proxy
 
+[![CI](https://github.com/p4u/claude-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/p4u/claude-proxy/actions/workflows/ci.yml)
+[![GHCR](https://img.shields.io/badge/ghcr.io-claude--proxy-blue?logo=docker)](https://github.com/p4u/claude-proxy/pkgs/container/claude-proxy)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](./LICENSE)
+
 A sticky multi-subscription HTTP proxy for [Claude Code](https://docs.claude.com/en/docs/agents-and-tools/claude-code/overview).
 It pools multiple Claude subscription OAuth credentials, assigns each new
 conversation to one of them via weighted round-robin, and pins that
@@ -76,15 +80,31 @@ to keep them alive.
 
 ## Quick start (Docker, recommended)
 
-Requires `docker` (with the `compose` plugin) and `make`.
+Requires `docker` (with the `compose` plugin) and `make`. **No Go toolchain
+needed** — the published image at
+[`ghcr.io/p4u/claude-proxy`](https://github.com/p4u/claude-proxy/pkgs/container/claude-proxy)
+is built and pushed by CI on every commit to `main`.
 
 ```bash
 git clone https://github.com/p4u/claude-proxy.git
 cd claude-proxy
 make env                         # generates .env with current UID/GID + auth token
-make build                       # builds the image
+make pull                        # pulls the latest GHCR image
 make up                          # starts the proxy
 make health                      # → {"ok":true}
+```
+
+Pin a specific version in `.env` for production:
+
+```dotenv
+CLAUDE_PROXY_IMAGE=ghcr.io/p4u/claude-proxy:v0.2.0
+```
+
+Or build from source if you've changed the code:
+
+```bash
+make build                       # builds locally; sets the same image tag
+make up
 ```
 
 Now import a credential. For each Claude subscription you want in the pool:
@@ -148,6 +168,7 @@ go build -o ./bin/claude-proxy ./cmd/claude-proxy
 | `TLS_EMAIL` | (empty) | contact email for Let's Encrypt expiry notices (required when `TLS_DOMAIN` is set). |
 | `TLS_CASERVER` | LE production | switch to LE staging URL while debugging to avoid rate limits. |
 | `TRAEFIK_LOG_LEVEL` | `INFO` | `DEBUG` while diagnosing cert issuance. |
+| `CLAUDE_PROXY_IMAGE` | `ghcr.io/p4u/claude-proxy:latest` | which container image to use. Pin a tag for production; switch to `claude-proxy:dev` if you `make build` from source. |
 
 ## Downstream auth
 
@@ -276,7 +297,8 @@ Setup
   make token                Print the configured PROXY_AUTH_TOKEN
   make rotate-token         Generate a new token and recreate the container
   make fix-perms            chown ./data and ./creds to the host UID:GID
-  make build                Build the docker image
+  make build                Build the docker image locally (source-tree dev)
+  make pull                 Pull the latest published image from GHCR
 
 Service lifecycle
   make up                   Start the proxy (and traefik, if TLS_DOMAIN is set)
@@ -429,6 +451,32 @@ internal/proxy/             forwarder, header rewrites, retries, downstream auth
 internal/admin/             /admin/* JSON endpoints
 internal/prettylog/         tty-friendly slog handler with per-credential color
 ```
+
+## Continuous integration & releases
+
+GitHub Actions runs on every push and pull request:
+
+| job | runs |
+|---|---|
+| `lint` | `gofmt -l`, `go vet`, `golangci-lint run` |
+| `test` | `go build ./...`, `go test -race -covermode=atomic ./...` |
+| `image` | multi-arch (`linux/amd64` + `linux/arm64`) `docker buildx`, push to `ghcr.io/p4u/claude-proxy` — only on push to `main` and on `v*.*.*` tags |
+
+Image tags published:
+
+| event | tags pushed |
+|---|---|
+| commit on `main` | `:latest`, `:main`, `:sha-<short>` |
+| tag `v1.2.3` | `:v1.2.3`, `:1.2.3`, `:1.2`, `:1`, `:latest`, `:sha-<short>` |
+
+Pull a specific commit's build from GHCR by short sha:
+
+```bash
+docker pull ghcr.io/p4u/claude-proxy:sha-abc1234
+```
+
+Workflow file: [`.github/workflows/ci.yml`](./.github/workflows/ci.yml).
+Lint config: [`.golangci.yml`](./.golangci.yml).
 
 ## Testing
 

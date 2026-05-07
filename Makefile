@@ -91,8 +91,11 @@ rotate-token: ## Generate a new PROXY_AUTH_TOKEN, write to .env, recreate the co
 	 echo "rotated to $$TOKEN"
 	@$(DC) up -d --force-recreate $(SERVICE) 2>/dev/null || true
 
-build: env ## Build the docker image.
+build: env ## Build the docker image locally (only needed for source-tree dev).
 	$(DC) build
+
+pull: env ## Pull the published image from GHCR.
+	$(DC) pull $(SERVICE)
 
 ##@ Service lifecycle
 
@@ -185,7 +188,22 @@ stats: ## GET /admin/stats.
 ##@ Maintenance
 
 test: ## Run the Go test suite (locally, not in docker).
-	go test ./...
+	go test -race ./...
+
+lint: ## Run gofmt, go vet, and golangci-lint locally (matches CI).
+	@out=$$(gofmt -l .); if [ -n "$$out" ]; then echo "gofmt would change:"; echo "$$out"; exit 1; fi
+	go vet ./...
+	@if command -v golangci-lint >/dev/null 2>&1; then \
+		golangci-lint run --timeout=5m; \
+	elif [ -x "$$(go env GOPATH)/bin/golangci-lint" ]; then \
+		"$$(go env GOPATH)/bin/golangci-lint" run --timeout=5m; \
+	else \
+		echo "golangci-lint not installed. Run 'make lint-install'." >&2; exit 1; \
+	fi
+
+lint-install: ## go-install golangci-lint v2.12.2 into $GOPATH/bin.
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+	@echo "Installed to $$(go env GOPATH)/bin/golangci-lint"
 
 clean: ## Stop service and delete the SQLite DB. Keeps creds/.
 	-$(DC) down
@@ -195,7 +213,7 @@ distclean: clean ## clean + remove built image and .env.
 	-docker rmi claude-proxy:latest
 	rm -f $(ENV_FILE)
 
-.PHONY: help env token rotate-token fix-perms build up down restart logs logs-traefik tls-info ps \
+.PHONY: help env token rotate-token fix-perms build pull up down restart logs logs-traefik tls-info ps lint lint-install \
         import list disable rm refresh weight \
         health credentials conversations stats \
         test clean distclean
