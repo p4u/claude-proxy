@@ -41,15 +41,16 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      # Install golangci-lint v2 directly via `go install` to dodge the
+      # golangci-lint-action quirk where some action versions hardcode the v1
+      # module path. Compiling here uses the Go toolchain set up above
+      # (= go.mod's directive), so the linter binary targets the same Go
+      # version the module declares.
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
-        with:
-          # Pin v2 explicitly: the action's `latest` still resolves to v1.x.
-          version: v2.12.2
-          # Compile against the Go runtime set up above (= go.mod's directive)
-          # so the linter binary can target whatever module version we declare.
-          install-mode: goinstall
-          args: --timeout=5m
+        run: golangci-lint run --timeout=5m
 
   # ----------------------------------------------------------------------------
   # Unit + integration tests with race detector and coverage.
