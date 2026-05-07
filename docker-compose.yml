@@ -14,13 +14,11 @@ services:
       # Read by the binary at startup. Empty disables downstream auth.
       CLAUDE_PROXY_AUTH_TOKEN: "${PROXY_AUTH_TOKEN:-}"
     ports:
+      # When traefik is active (profile=tls), keep this on 127.0.0.1 — traefik
+      # reaches the container over the docker network, no host port needed.
       - "${HOST_BIND:-127.0.0.1}:${HOST_PORT:-8787}:8787"
     volumes:
-      # SQLite database + WAL files persist across restarts.
       - ./data:/data
-      # Drop your .credentials.json files here, then run:
-      #   docker compose run --rm claude-proxy creds import \
-      #       --from /creds/acct-A.json --label acct-A --db /data/proxy.db
       - ./creds:/creds:ro
     command:
       - "serve"
@@ -40,3 +38,47 @@ services:
       timeout: 5s
       retries: 3
       start_period: 5s
+    labels:
+      # Traefik routes to this container only when the `tls` profile is active.
+      # When traefik isn't running, these labels are harmless.
+      - "traefik.enable=true"
+      - "traefik.docker.network=claude-proxy_default"
+      - "traefik.http.routers.claude-proxy.rule=Host(`${TLS_DOMAIN:-claude-proxy.invalid}`)"
+      - "traefik.http.routers.claude-proxy.entrypoints=websecure"
+      - "traefik.http.routers.claude-proxy.tls=true"
+      - "traefik.http.routers.claude-proxy.tls.certresolver=le"
+      - "traefik.http.services.claude-proxy.loadbalancer.server.port=8787"
+
+  traefik:
+    image: traefik:v3.2
+    container_name: claude-proxy-traefik
+    restart: unless-stopped
+    # Activated only when COMPOSE_PROFILES contains "tls" (the Makefile sets
+    # this automatically whenever TLS_DOMAIN is non-empty in .env).
+    profiles:
+      - tls
+    depends_on:
+      - claude-proxy
+    command:
+      - "--log.level=${TRAEFIK_LOG_LEVEL:-INFO}"
+      - "--accesslog=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=claude-proxy_default"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--entrypoints.web.http.redirections.entrypoint.permanent=true"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.le.acme.tlschallenge=true"
+      - "--certificatesresolvers.le.acme.email=${TLS_EMAIL}"
+      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
+      # Use the Let's Encrypt staging endpoint when TLS_STAGING=1 — useful to
+      # avoid the production rate limit while testing your DNS / firewall setup.
+      - "--certificatesresolvers.le.acme.caserver=${TLS_CASERVER:-https://acme-v02.api.letsencrypt.org/directory}"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./data/letsencrypt:/letsencrypt
+      - /var/run/docker.sock:/var/run/docker.sock:ro

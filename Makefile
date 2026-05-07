@@ -13,11 +13,23 @@ RUN     := $(DC) run --rm --no-deps $(SERVICE)
 # .env must exist for compose env_file to resolve. `make env` bootstraps it.
 ENV_FILE := .env
 
-# Where on the host imports/admin curls hit the running service. Re-read from
-# .env on every invocation so the user can edit it freely.
-HOST_BIND ?= $(shell . ./$(ENV_FILE) 2>/dev/null; echo $${HOST_BIND:-127.0.0.1})
-HOST_PORT ?= $(shell . ./$(ENV_FILE) 2>/dev/null; echo $${HOST_PORT:-8787})
-BASE      := http://$(HOST_BIND):$(HOST_PORT)
+# Read .env values via grep (avoids quoting/sourcing surprises).
+HOST_BIND  ?= $(shell grep -E '^HOST_BIND=..*'  $(ENV_FILE) 2>/dev/null | tail -n1 | cut -d= -f2- )
+HOST_PORT  ?= $(shell grep -E '^HOST_PORT=..*'  $(ENV_FILE) 2>/dev/null | tail -n1 | cut -d= -f2- )
+TLS_DOMAIN ?= $(shell grep -E '^TLS_DOMAIN=..*' $(ENV_FILE) 2>/dev/null | tail -n1 | cut -d= -f2- )
+HOST_BIND  := $(if $(HOST_BIND),$(HOST_BIND),127.0.0.1)
+HOST_PORT  := $(if $(HOST_PORT),$(HOST_PORT),8787)
+
+# When TLS_DOMAIN is non-empty, activate the `tls` compose profile (traefik)
+# AND have all `make` inspection commands hit https://$TLS_DOMAIN instead of
+# the plain-HTTP loopback listener.
+ifneq ($(strip $(TLS_DOMAIN)),)
+COMPOSE_PROFILES := tls
+export COMPOSE_PROFILES
+BASE := https://$(TLS_DOMAIN)
+else
+BASE := http://$(HOST_BIND):$(HOST_PORT)
+endif
 
 .DEFAULT_GOAL := help
 
@@ -27,7 +39,7 @@ help: ## Show this help.
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) }' $(MAKEFILE_LIST)
 
 env: ## Create or upgrade .env: sync UID/GID to host shell, add missing auth token.
-	@mkdir -p data creds
+	@mkdir -p data creds data/letsencrypt
 	@if [ ! -f $(ENV_FILE) ]; then cp .env.example $(ENV_FILE); echo "wrote fresh $(ENV_FILE)"; fi
 	@HOST_UID=$$(id -u); HOST_GID=$$(id -g); \
 	 if grep -q '^PROXY_UID=' $(ENV_FILE); then \
@@ -84,7 +96,8 @@ build: env ## Build the docker image.
 
 ##@ Service lifecycle
 
-up: env ## Start the proxy in the background.
+up: env ## Start the proxy (and traefik, if TLS_DOMAIN is set).
+	@if [ -n "$(TLS_DOMAIN)" ]; then echo "TLS enabled — domain=$(TLS_DOMAIN), starting traefik (profile=tls)"; fi
 	$(DC) up -d
 	@sleep 1
 	@$(MAKE) -s health || true
@@ -97,6 +110,23 @@ restart: ## Restart the proxy.
 
 logs: ## Tail proxy logs (Ctrl-C to stop).
 	$(DC) logs -f --tail=200 $(SERVICE)
+
+logs-traefik: ## Tail traefik logs (only when TLS is enabled).
+	@if [ -z "$(TLS_DOMAIN)" ]; then echo "TLS_DOMAIN not set in .env — traefik is not running" >&2; exit 1; fi
+	$(DC) logs -f --tail=200 traefik
+
+tls-info: ## Show TLS / Traefik status.
+	@if [ -z "$(TLS_DOMAIN)" ]; then \
+		echo "TLS disabled. Set TLS_DOMAIN (and TLS_EMAIL) in .env, then 'make up'."; \
+	else \
+		echo "TLS_DOMAIN: $(TLS_DOMAIN)"; \
+		echo "BASE URL : $(BASE)"; \
+		echo "Profiles : $$COMPOSE_PROFILES"; \
+		$(DC) ps traefik 2>/dev/null || true; \
+		if [ -f data/letsencrypt/acme.json ]; then \
+			echo "ACME storage: $$(stat -c '%s bytes (mode %a, owner %u:%g)' data/letsencrypt/acme.json)"; \
+		else echo "ACME storage: not yet created (will appear after first cert request)"; fi; \
+	fi
 
 ps: ## Show container status.
 	$(DC) ps
@@ -165,7 +195,7 @@ distclean: clean ## clean + remove built image and .env.
 	-docker rmi claude-proxy:latest
 	rm -f $(ENV_FILE)
 
-.PHONY: help env token rotate-token fix-perms build up down restart logs ps \
+.PHONY: help env token rotate-token fix-perms build up down restart logs logs-traefik tls-info ps \
         import list disable rm refresh weight \
         health credentials conversations stats \
         test clean distclean
