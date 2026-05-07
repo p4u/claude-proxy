@@ -54,7 +54,7 @@ services:
       - "traefik.http.services.claude-proxy.loadbalancer.server.port=8787"
 
   traefik:
-    image: traefik:v3.2
+    image: traefik:latest
     container_name: claude-proxy-traefik
     restart: unless-stopped
     # Activated only when COMPOSE_PROFILES contains "tls" (the Makefile sets
@@ -77,9 +77,6 @@ services:
       - "--certificatesresolvers.le.acme.tlschallenge=true"
       - "--certificatesresolvers.le.acme.email=${TLS_EMAIL}"
       - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
-      # Use the Let's Encrypt staging endpoint when TLS_STAGING=1 — useful to
-      # avoid the production rate limit while testing your DNS / firewall setup.
-      - "--certificatesresolvers.le.acme.caserver=${TLS_CASERVER:-https://acme-v02.api.letsencrypt.org/directory}"
     ports:
       - "80:80"
       - "443:443"
