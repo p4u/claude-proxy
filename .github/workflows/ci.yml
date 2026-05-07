@@ -140,8 +140,15 @@ jobs:
           provenance: false
 
       - name: Image summary
+        # `outputs.tags` is a newline-separated multi-line string; pass it
+        # through an env var so the shell receives it intact (inline ${{…}}
+        # substitution breaks the for-loop syntax).
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          echo "## Published images" >> $GITHUB_STEP_SUMMARY
-          for t in ${{ steps.meta.outputs.tags }}; do
-            echo "- \`$t\`" >> $GITHUB_STEP_SUMMARY
-          done
+          {
+            echo "## Published images"
+            while IFS= read -r t; do
+              [ -n "$t" ] && echo "- \`$t\`"
+            done <<< "$TAGS"
+          } >> "$GITHUB_STEP_SUMMARY"
