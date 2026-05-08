@@ -4,10 +4,16 @@
 [![GHCR](https://img.shields.io/badge/ghcr.io-claude--proxy-blue?logo=docker)](https://github.com/p4u/claude-proxy/pkgs/container/claude-proxy)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](./LICENSE)
 
-A sticky multi-subscription HTTP proxy for [Claude Code](https://docs.claude.com/en/docs/agents-and-tools/claude-code/overview).
+A sticky multi-subscription HTTP proxy for [Claude Code](https://docs.claude.com/en/docs/agents-and-tools/claude-code/overview)
+with an optional Anthropic-API-compatible bridge.
 It pools multiple Claude subscription OAuth credentials, assigns each new
 conversation to one of them via weighted round-robin, and pins that
 conversation to the chosen credential for the rest of its lifetime.
+
+The **API bridge** (`/api/v1/messages`) lets any Anthropic SDK client —
+not just Claude Code — point at the proxy and get full streaming responses
+backed by a long-lived `claude` CLI subprocess. No API key required; your
+pooled OAuth subscriptions do the auth.
 
 > [!WARNING]
 > **Research and educational proof-of-concept.** This project exists
@@ -40,17 +46,17 @@ that:
 ## Architecture
 
 ```
-                          ┌─────────────────────────────────┐
-  Claude Code agent A ───►│                                 │
-  Claude Code agent B ───►│         claude-proxy            │──► api.anthropic.com
-  Claude Code agent C ───►│                                 │
-                          │  • bearer auth (clients)        │
-                          │  • sticky conv → cred binding   │
-                          │  • weighted round-robin         │
-                          │  • 401 → refresh + retry        │
-                          │  • 429 → mark cred limited      │
-                          │  • SSE pass-through             │
-                          └─────────────────────────────────┘
+                          ┌─────────────────────────────────────┐
+  Claude Code agent A ───►│  /v1/*  (proxy mode)                │
+  Claude Code agent B ───►│  • sticky conv → cred binding       │──► api.anthropic.com
+  Claude Code agent C ───►│  • weighted round-robin             │
+                          │  • 401 → refresh + retry            │
+  Any Anthropic SDK  ────►│  /api/v1/*  (API bridge mode)       │
+  (Python, JS, …)         │  • long-lived claude CLI subprocess │──► (self-loop back to proxy)
+                          │  • one session per conversation     │
+                          │  • SSE & non-streaming responses    │
+                          │  • client-defined tools via MCP     │
+                          └─────────────────────────────────────┘
 ```
 
 Each Claude Code instance is configured with `ANTHROPIC_BASE_URL` pointing at
@@ -68,6 +74,7 @@ to keep them alive.
 
 ## Features
 
+- **API bridge** — exposes `/api/v1/messages` (Anthropic-compatible) backed by a persistent `claude` CLI subprocess per conversation. Drop-in for any Anthropic SDK client: change `base_url` to `http://<proxy>/api`, set any non-empty API key, and everything works — streaming, tool use, multi-turn.
 - **Sticky binding** — each Claude Code conversation pins to a single credential for its lifetime.
 - **Weighted round-robin** for new conversations, with smooth interleaved expansion. Default weights: `max`/`team`/`enterprise` = 5, `pro` = 1.
 - **Automatic refresh** — proactive (every 60 s if `expires_at < now+5min`) and reactive (on `401` retry once with a fresh token).
@@ -169,6 +176,10 @@ go build -o ./bin/claude-proxy ./cmd/claude-proxy
 | `TLS_CASERVER` | LE production | switch to LE staging URL while debugging to avoid rate limits. |
 | `TRAEFIK_LOG_LEVEL` | `INFO` | `DEBUG` while diagnosing cert issuance. |
 | `CLAUDE_PROXY_IMAGE` | `ghcr.io/p4u/claude-proxy:latest` | which container image to use. Pin a tag for production; switch to `claude-proxy:dev` if you `make build` from source. |
+| `ENABLE_API_BRIDGE` | `true` | Set to `false` to disable the `/api/v1/*` bridge. |
+| `AGENT_IDLE_TTL` | `10m` | Idle timeout before a `claude` subprocess is reaped. |
+| `AGENT_MAX_SESSIONS` | `32` | Max concurrent agent sessions. |
+| `AGENT_TOOLS` | `Read,Grep,Glob,WebFetch` | Built-in tools available to the agent subprocess. |
 
 ## Downstream auth
 
@@ -193,6 +204,86 @@ make token               # prints the new value
 > Always set `PROXY_AUTH_TOKEN` when `HOST_BIND=0.0.0.0` or the proxy is
 > reachable beyond loopback. Without it, anyone who can reach the listener
 > can spend your subscription quota.
+
+## API bridge
+
+The full Docker image (`Dockerfile`) ships with the `claude` CLI pre-installed.
+When `ENABLE_API_BRIDGE=true` (the default), the proxy also listens on
+`/api/v1/*` and implements the [Anthropic Messages API](https://docs.anthropic.com/en/api/messages)
+backed by a long-lived `claude` subprocess per conversation.
+
+### How it works
+
+1. A client sends `POST /api/v1/messages` (identical payload to `api.anthropic.com`).
+2. The proxy looks up or spawns a `claude` CLI subprocess for that conversation key.
+3. The user message is piped to `claude`'s stdin; `claude` streams events back on stdout.
+4. The proxy translates those events into an Anthropic-spec SSE stream (or a full JSON
+   response for non-streaming requests) and returns it to the client.
+5. The `claude` subprocess self-loops: its `ANTHROPIC_BASE_URL` points back at the proxy's
+   `/v1/*` endpoint, so all API calls go through the credential pool automatically.
+6. Sessions stay alive between turns (up to the idle TTL) so prompt-cache context is preserved.
+
+### Using the bridge from an SDK
+
+```python
+import anthropic
+
+client = anthropic.Anthropic(
+    base_url="http://localhost:8787/api",
+    api_key="any-non-empty-string",   # ignored by proxy when auth token is unset
+)
+
+message = client.messages.create(
+    model="claude-opus-4-5",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(message.content[0].text)
+```
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic({
+  baseURL: "http://localhost:8787/api",
+  apiKey: "any-non-empty-string",
+});
+```
+
+If `PROXY_AUTH_TOKEN` is set, pass it as the API key:
+
+```python
+client = anthropic.Anthropic(
+    base_url="http://localhost:8787/api",
+    api_key=os.environ["PROXY_AUTH_TOKEN"],
+)
+```
+
+### Tool use
+
+Client-defined tools are forwarded to the `claude` subprocess via an MCP server
+that the proxy starts per session. `claude` calls the tool; the proxy holds the
+call until the client's next request delivers the `tool_result` block, then
+resolves it through MCP and continues the stream.
+
+Built-in tools available to the subprocess (configurable via `AGENT_TOOLS`):
+`Read`, `Grep`, `Glob`, `WebFetch`. Destructive tools (`Bash`, `Edit`, `Write`,
+`NotebookEdit`) are always blocked.
+
+### API bridge configuration
+
+| variable | default | meaning |
+|---|---|---|
+| `ENABLE_API_BRIDGE` | `true` | Set to `false` to disable `/api/v1/*` entirely. |
+| `AGENT_IDLE_TTL` | `10m` | How long an idle session is kept before the subprocess is killed. |
+| `AGENT_MAX_SESSIONS` | `32` | Maximum concurrent `claude` subprocesses. Oldest idle session is evicted when the cap is reached. |
+| `AGENT_TOOLS` | `Read,Grep,Glob,WebFetch` | Comma-separated list of built-in tools the subprocess may use. |
+| `AGENT_WORKDIR` | (empty) | If set, passed as `--add-dir` to give the subprocess read access to that path. |
+
+> [!NOTE]
+> The API bridge requires the full image (`ghcr.io/p4u/claude-proxy:latest`).
+> The `proxy-only` image (`ghcr.io/p4u/claude-proxy:…-proxy-only`) has no Node.js
+> or `claude` CLI and always returns `503` for `/api/v1/*` requests.
 
 ## HTTPS via Traefik + Let's Encrypt (optional)
 
@@ -450,6 +541,9 @@ internal/pool/              weighted RR + sticky binding + janitor
 internal/proxy/             forwarder, header rewrites, retries, downstream auth
 internal/admin/             /admin/* JSON endpoints
 internal/prettylog/         tty-friendly slog handler with per-credential color
+internal/agent/             claude CLI subprocess lifecycle (session + manager)
+internal/bridge/            /api/v1/* HTTP handler + Anthropic SSE translation
+internal/mcpbridge/         MCP HTTP server for client-defined tool relay
 ```
 
 ## Continuous integration & releases
@@ -518,7 +612,7 @@ token rotation, and downstream auth behavior on `/v1/*`, `/admin/*`, `/health`.
 - KMS-backed token storage
 - Multi-tenant isolation (the proxy assumes a single trusting operator)
 - Web UI
-- Anthropic API-key (`x-api-key`) credentials — only OAuth subscription tokens
+- Anthropic API-key (`x-api-key`) credentials in the pool — only OAuth subscription tokens are pooled; `x-api-key` on incoming requests is accepted as the downstream auth token only
 - Bedrock / Vertex / Foundry pass-through
 - Metrics export (Prometheus / OTel)
 

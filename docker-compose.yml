@@ -10,13 +10,16 @@ services:
       dockerfile: Dockerfile
     container_name: claude-proxy
     restart: unless-stopped
-    # Run as the host user so bind-mounted ./data is writable.
-    user: "${PROXY_UID:-1000}:${PROXY_GID:-1000}"
     env_file:
       - .env
     environment:
-      # Read by the binary at startup. Empty disables downstream auth.
+      # Auth token — read by the binary at startup. Empty disables auth.
       CLAUDE_PROXY_AUTH_TOKEN: "${PROXY_AUTH_TOKEN:-}"
+      # Agent bridge — only used when claude CLI is present in the image.
+      ENABLE_API_BRIDGE: "${ENABLE_API_BRIDGE:-true}"
+      AGENT_IDLE_TTL: "${AGENT_IDLE_TTL:-10m}"
+      AGENT_MAX_SESSIONS: "${AGENT_MAX_SESSIONS:-32}"
+      AGENT_TOOLS: "${AGENT_TOOLS:-Read,Grep,Glob,WebFetch}"
     ports:
       # When traefik is active (profile=tls), keep this on 127.0.0.1 — traefik
       # reaches the container over the docker network, no host port needed.
@@ -24,6 +27,9 @@ services:
     volumes:
       - ./data:/data
       - ./creds:/creds:ro
+      # Persist claude CLI session state (oauth tokens, session UUIDs) across
+      # container restarts so agent sessions survive image upgrades.
+      - claude-home:/home/claude/.claude
     command:
       - "serve"
       - "--addr"
@@ -83,3 +89,8 @@ services:
     volumes:
       - ./data/letsencrypt:/letsencrypt
       - /var/run/docker.sock:/var/run/docker.sock:ro
+
+volumes:
+  # Named volume for claude CLI state: credentials, session UUIDs.
+  # Survives `docker compose down` (use `docker compose down -v` to wipe).
+  claude-home:

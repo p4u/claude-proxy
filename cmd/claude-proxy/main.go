@@ -5,8 +5,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -14,6 +16,8 @@ import (
 	"net/http"
 
 	"github.com/p4u/claude-proxy/internal/admin"
+	"github.com/p4u/claude-proxy/internal/agent"
+	"github.com/p4u/claude-proxy/internal/bridge"
 	"github.com/p4u/claude-proxy/internal/creds"
 	"github.com/p4u/claude-proxy/internal/ingest"
 	"github.com/p4u/claude-proxy/internal/pool"
@@ -54,8 +58,6 @@ func main() {
 	}
 }
 
-// isTerminal returns true if f is a character device (tty/pty), false for
-// pipes/files. Avoids depending on golang.org/x/term.
 func isTerminal(f *os.File) bool {
 	if f == nil {
 		return false
@@ -76,16 +78,64 @@ func openDB(path string) *store.DB {
 	return db
 }
 
+func findClaude() string {
+	if p, err := exec.LookPath("claude"); err == nil {
+		return p
+	}
+	return ""
+}
+
 func runServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := fs.String("addr", ":8787", "listen address")
 	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
 	authToken := fs.String("auth-token", os.Getenv("CLAUDE_PROXY_AUTH_TOKEN"),
-		"shared bearer token required from clients (env CLAUDE_PROXY_AUTH_TOKEN). empty disables auth.")
+		"shared bearer token (env CLAUDE_PROXY_AUTH_TOKEN). empty disables auth.")
 	_ = fs.String("on-limited", "passthrough", "behavior when pinned credential is limited")
 	logLevel := fs.String("log-level", "info", "log level: debug|info|warn|error")
-	logFormat := fs.String("log-format", "auto", "log format: auto|pretty|text|json (auto: pretty on tty, json otherwise)")
+	logFormat := fs.String("log-format", "auto", "log format: auto|pretty|text|json")
 	logColor := fs.String("log-color", "auto", "log color: auto|always|never")
+
+	// Agent / bridge flags (all overridable via env vars for docker-compose use).
+	agentEnableDefault := true
+	if v := os.Getenv("ENABLE_API_BRIDGE"); v == "false" || v == "0" {
+		agentEnableDefault = false
+	}
+	enableAgent := fs.Bool("enable-agent", agentEnableDefault,
+		"serve /api/v1/* via claude CLI agent (requires claude on PATH; env ENABLE_API_BRIDGE)")
+
+	agentIdleTTLDefault := 10 * time.Minute
+	if v := os.Getenv("AGENT_IDLE_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			agentIdleTTLDefault = d
+		}
+	}
+	agentIdleTTL := fs.Duration("agent-idle-ttl", agentIdleTTLDefault,
+		"kill idle agent sessions after this duration (env AGENT_IDLE_TTL)")
+
+	agentMaxSessionsDefault := 32
+	if v := os.Getenv("AGENT_MAX_SESSIONS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			agentMaxSessionsDefault = n
+		}
+	}
+	agentMaxSessions := fs.Int("agent-max-sessions", agentMaxSessionsDefault,
+		"max concurrent claude subprocesses (env AGENT_MAX_SESSIONS)")
+
+	agentToolsDefault := "Read,Grep,Glob,WebFetch"
+	if v := os.Getenv("AGENT_TOOLS"); v != "" {
+		agentToolsDefault = v
+	}
+	agentTools := fs.String("agent-tools", agentToolsDefault,
+		"comma-separated built-in tools allowed for the agent (env AGENT_TOOLS)")
+
+	agentWorkdir := fs.String("agent-workdir", os.Getenv("AGENT_WORKDIR"),
+		"directory to mount as --add-dir for the agent (read-only; env AGENT_WORKDIR)")
+	agentClaudeBin := fs.String("agent-claude-bin", os.Getenv("AGENT_CLAUDE_BIN"),
+		"path to claude binary (default: auto-detect from PATH; env AGENT_CLAUDE_BIN)")
+	agentBaseURL := fs.String("agent-base-url", os.Getenv("AGENT_CLAUDE_BASE_URL"),
+		"ANTHROPIC_BASE_URL for agent self-loop (default: http://<listen-addr>; env AGENT_CLAUDE_BASE_URL)")
+
 	_ = fs.Parse(args)
 
 	db := openDB(*dbPath)
@@ -94,6 +144,7 @@ func runServe(args []string) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// --- logger setup ---
 	var lvl slog.Level
 	switch *logLevel {
 	case "debug":
@@ -107,7 +158,6 @@ func runServe(args []string) {
 	}
 	hopts := &slog.HandlerOptions{Level: lvl}
 	tty := isTerminal(os.Stderr)
-
 	format := *logFormat
 	if format == "auto" {
 		if tty {
@@ -116,20 +166,13 @@ func runServe(args []string) {
 			format = "json"
 		}
 	}
-
-	// Color default:
-	//   --log-color=always  -> on
-	//   --log-color=never   -> off
-	//   --log-color=auto    -> on whenever the active format is "pretty"
-	//                          (covers the common docker/ssh case where the
-	//                          operator explicitly asked for pretty logs).
 	useColor := false
 	switch *logColor {
 	case "always":
 		useColor = true
 	case "never":
 		useColor = false
-	default: // "auto"
+	default:
 		useColor = format == "pretty"
 	}
 	var handler slog.Handler
@@ -138,7 +181,7 @@ func runServe(args []string) {
 		handler = slog.NewJSONHandler(os.Stderr, hopts)
 	case "text":
 		handler = slog.NewTextHandler(os.Stderr, hopts)
-	default: // "pretty"
+	default:
 		handler = prettylog.New(os.Stderr, &prettylog.Options{Level: lvl, Color: useColor})
 	}
 	logger := slog.New(handler)
@@ -160,8 +203,60 @@ func runServe(args []string) {
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
 
+	// --- agent bridge ---
+	if *enableAgent {
+		claudeBin := *agentClaudeBin
+		if claudeBin == "" {
+			claudeBin = findClaude()
+		}
+		if claudeBin == "" {
+			logger.Warn("claude binary not found on PATH; /api endpoints will return 503. " +
+				"Install @anthropic-ai/claude-code or set --agent-claude-bin.")
+			mux.HandleFunc("/api/", func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w,
+					`{"type":"error","error":{"type":"api_error","message":"claude binary not found; agent disabled"}}`,
+					http.StatusServiceUnavailable)
+			})
+		} else {
+			baseURL := *agentBaseURL
+			if baseURL == "" {
+				// Self-loop: use the proxy's own listen address.
+				listenAddr := *addr
+				if strings.HasPrefix(listenAddr, ":") {
+					listenAddr = "127.0.0.1" + listenAddr
+				}
+				baseURL = "http://" + listenAddr
+			}
+
+			allowedTools := strings.Split(*agentTools, ",")
+			for i, t := range allowedTools {
+				allowedTools[i] = strings.TrimSpace(t)
+			}
+
+			agentCfg := agent.SessionConfig{
+				ClaudeBin:    claudeBin,
+				BaseURL:      baseURL,
+				AuthToken:    *authToken,
+				AllowedTools: allowedTools,
+				WorkDir:      *agentWorkdir,
+			}
+			mgr := agent.New(db, agentCfg, *agentIdleTTL, *agentMaxSessions)
+			go mgr.Janitor(ctx)
+
+			bridgeH := bridge.New(mgr, proxyH, db, logger)
+			mux.Handle("/api/", bridgeH)
+
+			logger.Info("agent bridge enabled",
+				"claude", claudeBin,
+				"base_url", baseURL,
+				"tools", *agentTools,
+				"idle_ttl", agentIdleTTL.String(),
+				"max_sessions", *agentMaxSessions)
+		}
+	}
+
 	if *authToken != "" {
-		logger.Info("downstream auth enabled (clients must send Authorization: Bearer <token>)")
+		logger.Info("downstream auth enabled (Authorization: Bearer / x-api-key)")
 	} else {
 		logger.Warn("downstream auth disabled — anyone reaching this proxy can use your credentials")
 	}
@@ -169,7 +264,6 @@ func runServe(args []string) {
 	srv := &http.Server{
 		Addr:    *addr,
 		Handler: proxy.AuthMiddleware(*authToken, mux),
-		// no read/write timeouts: SSE streams can be very long
 	}
 	go func() {
 		<-ctx.Done()
@@ -223,7 +317,6 @@ func credsImport(ctx context.Context, args []string) {
 	}
 	db := openDB(*dbPath)
 	defer db.Close()
-
 	c, err := ingest.Import(ctx, db, *from, *label, *weight)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "import: %v\n", err)
@@ -239,7 +332,6 @@ func credsList(ctx context.Context, args []string) {
 	_ = fs.Parse(args)
 	db := openDB(*dbPath)
 	defer db.Close()
-
 	list, err := creds.List(ctx, db)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "list: %v\n", err)

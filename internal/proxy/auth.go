@@ -7,9 +7,12 @@ import (
 )
 
 // AuthMiddleware enforces a shared-secret bearer token on incoming requests.
-// If token is empty the middleware is a no-op (used for loopback-only PoC
-// deployments). /health is always allowed through so container healthchecks
-// keep working.
+// It accepts the token via:
+//   - Authorization: Bearer <token>
+//   - x-api-key: <token>   (Anthropic SDK default)
+//
+// If token is empty the middleware is a no-op. /health is always allowed
+// through so container healthchecks keep working.
 func AuthMiddleware(token string, next http.Handler) http.Handler {
 	if token == "" {
 		return next
@@ -20,7 +23,13 @@ func AuthMiddleware(token string, next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+
+		// Try both header forms.
 		got := bearerFromHeader(r.Header.Get("Authorization"))
+		if got == "" {
+			got = strings.TrimSpace(r.Header.Get("X-Api-Key"))
+		}
+
 		if got == "" || subtle.ConstantTimeCompare([]byte(got), expected) != 1 {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="claude-proxy"`)
 			http.Error(w,

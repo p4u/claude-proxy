@@ -126,7 +126,22 @@ jobs:
             org.opencontainers.image.description=Sticky multi-subscription HTTP proxy for Claude Code
             org.opencontainers.image.licenses=AGPL-3.0-only
 
-      - name: Build & push
+      - name: Compute proxy-only image metadata
+        id: meta-proxy-only
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch,suffix=-proxy-only
+            type=ref,event=tag,suffix=-proxy-only
+            type=sha,format=short,suffix=-proxy-only
+            type=raw,value=proxy-only,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=claude-proxy-proxy-only
+            org.opencontainers.image.description=Sticky multi-subscription HTTP proxy for Claude Code (forward-only, no agent)
+            org.opencontainers.image.licenses=AGPL-3.0-only
+
+      - name: Build & push (full)
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -139,16 +154,33 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: false
 
+      - name: Build & push (proxy-only)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.proxy-only
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta-proxy-only.outputs.tags }}
+          labels: ${{ steps.meta-proxy-only.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
       - name: Image summary
         # `outputs.tags` is a newline-separated multi-line string; pass it
         # through an env var so the shell receives it intact (inline ${{…}}
         # substitution breaks the for-loop syntax).
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
+          PROXY_ONLY_TAGS: ${{ steps.meta-proxy-only.outputs.tags }}
         run: |
           {
             echo "## Published images"
             while IFS= read -r t; do
               [ -n "$t" ] && echo "- \`$t\`"
             done <<< "$TAGS"
+            while IFS= read -r t; do
+              [ -n "$t" ] && echo "- \`$t\` (proxy-only, no agent)"
+            done <<< "$PROXY_ONLY_TAGS"
           } >> "$GITHUB_STEP_SUMMARY"
