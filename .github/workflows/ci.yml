@@ -75,7 +75,7 @@ jobs:
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -n 1
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: coverage
@@ -116,10 +116,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -127,7 +127,7 @@ jobs:
 
       - name: Build & push full image (by digest)
         id: build-full
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
@@ -139,7 +139,7 @@ jobs:
 
       - name: Build & push proxy-only image (by digest)
         id: build-proxy-only
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile.proxy-only
@@ -158,7 +158,7 @@ jobs:
           touch "/tmp/digests/proxy-only-${proxy#sha256:}"
 
       - name: Upload digests
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: digests-${{ matrix.arch }}
           path: /tmp/digests/*
@@ -181,17 +181,17 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download digests
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: /tmp/digests
           pattern: digests-*
@@ -199,7 +199,7 @@ jobs:
 
       - name: Compute image metadata (full)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE }}
           tags: |
@@ -214,7 +214,7 @@ jobs:
 
       - name: Compute image metadata (proxy-only)
         id: meta-proxy-only
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE }}
           tags: |
