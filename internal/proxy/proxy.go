@@ -257,6 +257,10 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 
 		retryAt := parseRetryAfter(resp.Header.Get("Retry-After"))
 		retryIn := time.Until(retryAt).Round(time.Second)
+		// Synthesize Retry-After when upstream omitted it so the client knows when to retry.
+		if resp.Header.Get("Retry-After") == "" {
+			resp.Header.Set("Retry-After", strconv.Itoa(int(retryIn.Seconds())))
+		}
 		_ = creds.MarkLimited(r.Context(), h.db, cred.ID, retryAt)
 		_ = creds.MarkError(r.Context(), h.db, cred.ID)
 		h.log.Warn("upstream 429; marked credential limited",
