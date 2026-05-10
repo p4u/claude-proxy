@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -13,7 +17,6 @@ import (
 	"time"
 
 	"log/slog"
-	"net/http"
 
 	"github.com/p4u/claude-proxy/internal/admin"
 	"github.com/p4u/claude-proxy/internal/agent"
@@ -30,8 +33,11 @@ const usage = `claude-proxy — sticky multi-subscription proxy for Claude Code
 
 Usage:
   claude-proxy serve [flags]
-  claude-proxy creds import --from FILE [--label NAME] [--weight N]
+  claude-proxy creds import        --from FILE [--label NAME] [--weight N]
+  claude-proxy creds export        [--db PATH]   # JSONL to stdout
+  claude-proxy creds import-bulk   [--db PATH]   # JSONL from stdin
   claude-proxy creds list
+  claude-proxy creds usage [<id>]
   claude-proxy creds disable <id>
   claude-proxy creds rm <id>
   claude-proxy creds refresh <id>
@@ -281,15 +287,21 @@ func runServe(args []string) {
 
 func runCreds(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "creds: missing subcommand (import|list|disable|rm|refresh)")
+		fmt.Fprintln(os.Stderr, "creds: missing subcommand (import|export|import-bulk|list|usage|disable|rm|refresh|set-weight)")
 		os.Exit(2)
 	}
 	ctx := context.Background()
 	switch args[0] {
 	case "import":
 		credsImport(ctx, args[1:])
+	case "export":
+		credsExport(ctx, args[1:])
+	case "import-bulk":
+		credsImportBulk(ctx, args[1:])
 	case "list":
 		credsList(ctx, args[1:])
+	case "usage":
+		credsUsage(ctx, args[1:])
 	case "disable":
 		credsDisable(ctx, args[1:])
 	case "rm":
@@ -428,4 +440,194 @@ func credsRefresh(ctx context.Context, args []string) {
 		os.Exit(1)
 	}
 	fmt.Printf("refreshed %s expires=%s\n", c.ID, c.ExpiresAt.Format(time.RFC3339))
+}
+
+// exportLine is the JSONL format used by creds export / import-bulk.
+// It embeds the claudeAiOauth structure that ingest.Import expects, plus
+// label and weight metadata so a round-trip preserves the full configuration.
+type exportLine struct {
+	Label  string `json:"label"`
+	Weight int    `json:"weight"`
+	// claudeAiOauth mirrors internal/ingest credFile.ClaudeAiOauth.
+	ClaudeAiOauth struct {
+		AccessToken      string   `json:"accessToken"`
+		RefreshToken     string   `json:"refreshToken"`
+		ExpiresAt        int64    `json:"expiresAt"` // milliseconds
+		Scopes           []string `json:"scopes"`
+		SubscriptionType string   `json:"subscriptionType"`
+	} `json:"claudeAiOauth"`
+}
+
+// credsExport dumps all credentials to stdout as JSONL (one JSON object per line).
+// Redirect the output to a file to create a backup:
+//
+//	claude-proxy creds export --db ./proxy.db > backup.jsonl
+func credsExport(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("creds export", flag.ExitOnError)
+	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
+	_ = fs.Parse(args)
+	db := openDB(*dbPath)
+	defer db.Close()
+
+	list, err := creds.List(ctx, db)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "export: %v\n", err)
+		os.Exit(1)
+	}
+	enc := json.NewEncoder(os.Stdout)
+	for _, c := range list {
+		var line exportLine
+		line.Label = c.Label
+		line.Weight = c.Weight
+		line.ClaudeAiOauth.AccessToken = c.AccessToken
+		line.ClaudeAiOauth.RefreshToken = c.RefreshToken
+		line.ClaudeAiOauth.ExpiresAt = c.ExpiresAt.UnixMilli()
+		line.ClaudeAiOauth.Scopes = []string{"user:inference", "user:profile"}
+		line.ClaudeAiOauth.SubscriptionType = c.SubscriptionType
+		if err := enc.Encode(line); err != nil {
+			fmt.Fprintf(os.Stderr, "export: encode %s: %v\n", c.ID, err)
+			os.Exit(1)
+		}
+	}
+}
+
+// credsImportBulk reads JSONL from stdin (produced by creds export) and
+// imports each credential into the database.
+//
+//	cat backup.jsonl | claude-proxy creds import-bulk --db ./proxy.db
+func credsImportBulk(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("creds import-bulk", flag.ExitOnError)
+	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
+	_ = fs.Parse(args)
+	db := openDB(*dbPath)
+	defer db.Close()
+
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 4<<20), 4<<20)
+	n := 0
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var el exportLine
+		if err := json.Unmarshal([]byte(line), &el); err != nil {
+			fmt.Fprintf(os.Stderr, "import-bulk: parse line %d: %v\n", n+1, err)
+			os.Exit(1)
+		}
+		// Write to a temp file so ingest.Import can read it.
+		tmp, err := os.CreateTemp("", "claude-proxy-import-*.json")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "import-bulk: temp file: %v\n", err)
+			os.Exit(1)
+		}
+		// Re-encode only the claudeAiOauth wrapper that ingest expects.
+		type credFile struct {
+			ClaudeAiOauth any `json:"claudeAiOauth"`
+		}
+		if err := json.NewEncoder(tmp).Encode(credFile{ClaudeAiOauth: el.ClaudeAiOauth}); err != nil {
+			tmp.Close()
+			_ = os.Remove(tmp.Name())
+			fmt.Fprintf(os.Stderr, "import-bulk: write temp: %v\n", err)
+			os.Exit(1)
+		}
+		tmp.Close()
+
+		c, err := ingest.Import(ctx, db, tmp.Name(), el.Label, el.Weight)
+		_ = os.Remove(tmp.Name())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "import-bulk: import %q: %v\n", el.Label, err)
+			os.Exit(1)
+		}
+		fmt.Printf("imported %s  label=%q  sub=%s  weight=%d  expires=%s\n",
+			c.ID, c.Label, c.SubscriptionType, c.Weight, c.ExpiresAt.Format(time.RFC3339))
+		n++
+	}
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "import-bulk: read stdin: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("imported %d credential(s)\n", n)
+}
+
+// credsUsage fetches the 5-hour and 7-day usage percentages from Anthropic's
+// undocumented OAuth usage endpoint for each credential (or a single one).
+func credsUsage(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("creds usage", flag.ExitOnError)
+	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
+	_ = fs.Parse(args)
+	db := openDB(*dbPath)
+	defer db.Close()
+
+	list, err := creds.List(ctx, db)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "list: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Filter to a single credential if an ID was given as a positional arg.
+	if fs.NArg() > 0 {
+		id := fs.Arg(0)
+		var filtered []*creds.Credential
+		for _, c := range list {
+			if c.ID == id {
+				filtered = append(filtered, c)
+			}
+		}
+		if len(filtered) == 0 {
+			fmt.Fprintf(os.Stderr, "no credential with id %q\n", id)
+			os.Exit(1)
+		}
+		list = filtered
+	}
+
+	fmt.Printf("%-30s  %-10s  %-9s  %10s  %10s\n",
+		"ID", "LABEL", "STATUS", "5H_USAGE%", "7D_USAGE%")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	for _, c := range list {
+		fiveHour, sevenDay, fetchErr := fetchUsage(ctx, client, c.AccessToken)
+		if fetchErr != nil {
+			fmt.Printf("%-30s  %-10s  %-9s  %s\n",
+				c.ID, c.Label, string(c.Status), fetchErr.Error())
+			continue
+		}
+		fmt.Printf("%-30s  %-10s  %-9s  %9.1f%%  %9.1f%%\n",
+			c.ID, c.Label, string(c.Status), fiveHour, sevenDay)
+	}
+}
+
+// fetchUsage calls GET https://api.anthropic.com/api/oauth/usage and returns
+// the five_hour and seven_day usage percentages (0–100).
+func fetchUsage(ctx context.Context, client *http.Client, accessToken string) (fiveHour, sevenDay float64, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"https://api.anthropic.com/api/oauth/usage", nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, 0, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return 0, 0, fmt.Errorf("rate limited (429)")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return 0, 0, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var result struct {
+		FiveHour float64 `json:"five_hour"`
+		SevenDay float64 `json:"seven_day"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return 0, 0, fmt.Errorf("parse response: %w", err)
+	}
+	return result.FiveHour, result.SevenDay, nil
 }

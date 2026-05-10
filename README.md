@@ -404,10 +404,18 @@ Credentials
   make import FROM=foo.json LABEL=acct-A [WEIGHT=N]
                             Import a credential from ./creds/foo.json
   make list                 List credentials with status, weight, counters
+  make usage                Fetch 5h/7d usage % for all credentials from Anthropic
+  make usage ID=cred_xxx    Fetch usage % for a single credential
   make disable ID=cred_xxx  Mark a credential disabled (excluded from RR)
   make rm ID=cred_xxx       Remove a credential row
   make refresh ID=cred_xxx  Force-refresh a credential's tokens
   make weight ID=... W=...  Set the round-robin weight
+
+Credential backup / restore
+  make export-credentials   Dump all credentials (with current tokens) to stdout
+                              e.g. make export-credentials > backup.jsonl
+  make import-credentials   Import credentials from JSONL on stdin
+                              e.g. cat backup.jsonl | make import-credentials
 
 Inspection
   make health               GET /health
@@ -431,16 +439,35 @@ claude-proxy serve [--addr :8787] [--db ./proxy.db]
                    [--log-format auto|pretty|text|json]
                    [--log-color  auto|always|never]
 
-claude-proxy creds import     --from FILE [--label NAME] [--weight N]
+claude-proxy creds import        --from FILE [--label NAME] [--weight N]
+claude-proxy creds export        [--db PATH]   # JSONL to stdout
+claude-proxy creds import-bulk   [--db PATH]   # JSONL from stdin
 claude-proxy creds list
-claude-proxy creds disable    <id>
-claude-proxy creds rm         <id>
-claude-proxy creds refresh    <id>
-claude-proxy creds set-weight <id> <weight>
+claude-proxy creds usage         [<id>]
+claude-proxy creds disable       <id>
+claude-proxy creds rm            <id>
+claude-proxy creds refresh       <id>
+claude-proxy creds set-weight    <id> <weight>
 ```
 
 `--auth-token` falls back to `CLAUDE_PROXY_AUTH_TOKEN` env var. All `creds`
 subcommands accept `--db` (defaults to `./proxy.db`).
+
+### Backup and restore
+
+`creds export` outputs JSONL with current tokens (not the original import file —
+tokens rotate on every refresh, so only the DB copy is valid after initial import):
+
+```bash
+# Backup
+make export-credentials > backup.jsonl
+
+# Restore after a wipe
+cat backup.jsonl | make import-credentials
+
+# Migrate to a new host
+make export-credentials | ssh newhost 'cd claude-proxy && cat | make import-credentials'
+```
 
 ## Admin API
 

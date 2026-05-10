@@ -67,17 +67,15 @@ token: ## Print the configured PROXY_AUTH_TOKEN (for setting ANTHROPIC_AUTH_TOKE
 	 fi; \
 	 echo "$$T"
 
-fix-perms: ## chown ./data and ./creds to the current host UID:GID (uses sudo if needed).
-	@HOST_UID=$$(id -u); HOST_GID=$$(id -g); \
-	 NEED_SUDO=""; \
+fix-perms: ## chown ./data and ./creds to uid 65532 (the claude container user).
+	@WANT="65532:65532"; \
 	 for d in data creds; do \
 		[ -e "$$d" ] || mkdir -p "$$d"; \
 		owner=$$(stat -c '%u:%g' "$$d" 2>/dev/null || stat -f '%u:%g' "$$d"); \
-		want="$$HOST_UID:$$HOST_GID"; \
-		if [ "$$owner" != "$$want" ]; then \
-			if [ -w "$$d" ] && chown -R "$$want" "$$d" 2>/dev/null; then :; \
-			else NEED_SUDO=1; sudo chown -R "$$want" "$$d"; fi; \
-			echo "chowned $$d -> $$want"; \
+		if [ "$$owner" != "$$WANT" ]; then \
+			if chown -R "$$WANT" "$$d" 2>/dev/null; then :; \
+			else sudo chown -R "$$WANT" "$$d"; fi; \
+			echo "chowned $$d -> $$WANT"; \
 		fi; \
 	 done
 
@@ -151,6 +149,10 @@ import: env ## Import a .credentials.json (FROM=acct-A.json LABEL=acct-A [WEIGHT
 list: ## List all credentials in the pool.
 	$(RUN) creds list --db $(DB)
 
+# usage: make usage [ID=cred_xxx]
+usage: ## Show 5h/7d usage % for all credentials (or ID=cred_xxx for one).
+	$(RUN) creds usage $(if $(ID),"$(ID)",) --db $(DB)
+
 # usage: make disable ID=cred_xxx
 disable: ## Mark a credential disabled (ID=cred_xxx).
 	@if [ -z "$(ID)" ]; then echo "usage: make disable ID=cred_xxx"; exit 2; fi
@@ -173,17 +175,29 @@ weight: ## Set RR weight (ID=cred_xxx W=N).
 
 ##@ Inspection (curl the running service)
 
+# Read PROXY_AUTH_TOKEN from .env; pass as Bearer header when non-empty.
+_TOKEN := $(shell grep -E '^PROXY_AUTH_TOKEN=.+' $(ENV_FILE) 2>/dev/null | tail -n1 | cut -d= -f2-)
+_AUTH  := $(if $(_TOKEN),-H "Authorization: Bearer $(_TOKEN)",)
+
 health: ## GET /health.
 	@curl -sf $(BASE)/health && echo
 
 credentials: ## GET /admin/credentials (running service).
-	@curl -s $(BASE)/admin/credentials
+	@curl -s $(_AUTH) $(BASE)/admin/credentials
 
 conversations: ## GET /admin/conversations.
-	@curl -s $(BASE)/admin/conversations
+	@curl -s $(_AUTH) $(BASE)/admin/conversations
 
 stats: ## GET /admin/stats.
-	@curl -s $(BASE)/admin/stats
+	@curl -s $(_AUTH) $(BASE)/admin/stats
+
+##@ Credential backup / restore
+
+export-credentials: ## Dump all credentials as JSONL to stdout.  Usage: make export-credentials > backup.jsonl
+	$(RUN) creds export --db $(DB)
+
+import-credentials: ## Import credentials from JSONL on stdin.  Usage: cat backup.jsonl | make import-credentials
+	$(DC) run --rm --no-deps -i $(SERVICE) creds import-bulk --db $(DB)
 
 ##@ Maintenance
 
@@ -214,6 +228,7 @@ distclean: clean ## clean + remove built image and .env.
 	rm -f $(ENV_FILE)
 
 .PHONY: help env token rotate-token fix-perms build pull up down restart logs logs-traefik tls-info ps lint lint-install \
-        import list disable rm refresh weight \
+        import list usage disable rm refresh weight \
+        export-credentials import-credentials \
         health credentials conversations stats \
         test clean distclean
