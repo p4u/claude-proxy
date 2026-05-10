@@ -8,7 +8,7 @@
 DC      ?= docker compose
 SERVICE ?= claude-proxy
 DB      ?= /data/proxy.db
-RUN     := $(DC) run --rm --no-deps $(SERVICE)
+RUN     := $(DC) run --rm --no-deps -T $(SERVICE)
 
 # .env must exist for compose env_file to resolve. `make env` bootstraps it.
 ENV_FILE := .env
@@ -67,8 +67,8 @@ token: ## Print the configured PROXY_AUTH_TOKEN (for setting ANTHROPIC_AUTH_TOKE
 	 fi; \
 	 echo "$$T"
 
-fix-perms: ## chown ./data and ./creds to uid 65532 (the claude container user).
-	@WANT="65532:65532"; \
+fix-perms: ## chown ./data and ./creds to PROXY_UID:PROXY_GID (your host UID).
+	@WANT="$$(id -u):$$(id -g)"; \
 	 for d in data creds; do \
 		[ -e "$$d" ] || mkdir -p "$$d"; \
 		owner=$$(stat -c '%u:%g' "$$d" 2>/dev/null || stat -f '%u:%g' "$$d"); \
