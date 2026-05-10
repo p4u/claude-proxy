@@ -91,6 +91,16 @@ services:
       - ./data/letsencrypt:/letsencrypt
       - /var/run/docker.sock:/var/run/docker.sock:ro
 
+  watchtower:
+    image: containrrr/watchtower:1.7.1
+    container_name: claude-proxy-watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: claude-proxy --interval 300
+    environment:
+      WATCHTOWER_CLEANUP: "true"
+
 volumes:
   # Named volume for claude CLI state: credentials, session UUIDs.
   # Survives `docker compose down` (use `docker compose down -v` to wipe).
