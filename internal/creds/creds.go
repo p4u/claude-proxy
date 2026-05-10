@@ -225,8 +225,9 @@ func MarkSuccess(ctx context.Context, db *store.DB, id string) error {
 		UPDATE credentials
 		SET last_success_at=?,
 		    success_count=success_count+1,
-		    status=CASE WHEN status='limited' AND retry_after IS NOT NULL AND retry_after < ? THEN 'active' ELSE status END
-		WHERE id=?`, now, now, id)
+		    retry_after=CASE WHEN status='limited' THEN NULL ELSE retry_after END,
+		    status=CASE WHEN status='limited' THEN 'active' ELSE status END
+		WHERE id=?`, now, id)
 	return err
 }
 
