@@ -115,11 +115,12 @@ func (p *Pool) Bind(ctx context.Context, convID string) (*creds.Credential, bool
 //	weights {A:5, B:1}      -> A B A A A A
 //	weights {A:5, B:1, C:2} -> A B C A C A A A
 func (p *Pool) pickActiveLocked(ctx context.Context, tx *sql.Tx) (string, error) {
+	now := time.Now().Unix()
 	rows, err := tx.QueryContext(ctx, `
 		SELECT id, weight FROM credentials
 		WHERE status='active'
 		  AND (retry_after IS NULL OR retry_after < ?)
-		ORDER BY id`, time.Now().Unix())
+		ORDER BY id`, now)
 	if err != nil {
 		return "", err
 	}
@@ -139,6 +140,34 @@ func (p *Pool) pickActiveLocked(ctx context.Context, tx *sql.Tx) (string, error)
 	if err := rows.Err(); err != nil {
 		return "", err
 	}
+
+	// No active credentials — fall back to limited ones so the request
+	// reaches Anthropic and gets a real 429 (with Retry-After) instead
+	// of a confusing 503 "no active credentials in pool".
+	if len(pool) == 0 {
+		lrows, lerr := tx.QueryContext(ctx, `
+			SELECT id, weight FROM credentials
+			WHERE status='limited'
+			ORDER BY COALESCE(retry_after, 0) ASC, id`)
+		if lerr != nil {
+			return "", lerr
+		}
+		defer lrows.Close()
+		for lrows.Next() {
+			var e weightedEntry
+			if err := lrows.Scan(&e.id, &e.weight); err != nil {
+				return "", err
+			}
+			if e.weight < 1 {
+				e.weight = 1
+			}
+			pool = append(pool, e)
+		}
+		if err := lrows.Err(); err != nil {
+			return "", err
+		}
+	}
+
 	if len(pool) == 0 {
 		return "", ErrNoCredentials
 	}

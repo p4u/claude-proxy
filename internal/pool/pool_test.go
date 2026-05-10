@@ -124,6 +124,31 @@ func TestExistingConvKeptOnLimited(t *testing.T) {
 	}
 }
 
+func TestAllLimitedFallback(t *testing.T) {
+	db, cs := setup(t)
+	p := New(db)
+	ctx := context.Background()
+
+	// Mark all credentials limited.
+	for _, c := range cs {
+		if err := creds.MarkLimited(ctx, db, c.ID, time.Now().Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A new conversation should still bind (fall back to a limited credential)
+	// rather than return ErrNoCredentials.
+	c, isNew, err := p.Bind(ctx, "new-conv-all-limited")
+	if err != nil {
+		t.Fatalf("expected fallback to limited credential, got err: %v", err)
+	}
+	if !isNew {
+		t.Fatal("expected new conversation")
+	}
+	if c.Status != creds.StatusLimited {
+		t.Fatalf("expected limited credential, got status %s", c.Status)
+	}
+}
+
 func TestExpandInterleaved(t *testing.T) {
 	cases := []struct {
 		name string

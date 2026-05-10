@@ -226,7 +226,10 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 
 	h.log.Debug("upstream resp",
 		"cred", cred.ID, "label", cred.Label, "status", resp.StatusCode,
-		"req_id", resp.Header.Get("Request-Id"))
+		"req_id", resp.Header.Get("Request-Id"),
+		"rl_tokens_remaining", resp.Header.Get("Anthropic-Ratelimit-Tokens-Remaining"),
+		"rl_requests_remaining", resp.Header.Get("Anthropic-Ratelimit-Requests-Remaining"),
+	)
 
 	if resp.StatusCode == http.StatusUnauthorized && allowRetry {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
@@ -247,11 +250,25 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 	}
 
 	if resp.StatusCode == http.StatusTooManyRequests {
+		// Peek at the body so we can log the error message, then replay it for the client.
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
+		resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(raw), strings.NewReader("")))
+
 		retryAt := parseRetryAfter(resp.Header.Get("Retry-After"))
+		retryIn := time.Until(retryAt).Round(time.Second)
 		_ = creds.MarkLimited(r.Context(), h.db, cred.ID, retryAt)
 		_ = creds.MarkError(r.Context(), h.db, cred.ID)
 		h.log.Warn("upstream 429; marked credential limited",
-			"cred", cred.ID, "retry_after", retryAt.Format(time.RFC3339))
+			"cred", cred.ID,
+			"retry_in", retryIn.String(),
+			"retry_after", retryAt.Format(time.RFC3339),
+			"body", decodeBodySnippet(raw, resp.Header.Get("Content-Encoding")),
+			"rl_tokens_remaining", resp.Header.Get("Anthropic-Ratelimit-Tokens-Remaining"),
+			"rl_tokens_reset", resp.Header.Get("Anthropic-Ratelimit-Tokens-Reset"),
+			"rl_requests_remaining", resp.Header.Get("Anthropic-Ratelimit-Requests-Remaining"),
+			"rl_requests_reset", resp.Header.Get("Anthropic-Ratelimit-Requests-Reset"),
+		)
 	} else if resp.StatusCode == http.StatusOK {
 		_ = creds.MarkSuccess(r.Context(), h.db, cred.ID)
 	} else if resp.StatusCode >= 400 {
@@ -323,10 +340,11 @@ func isHopByHop(k string) bool {
 }
 
 // parseRetryAfter handles both delta-seconds and HTTP-date forms.
+// Default when the header is absent: 30s — short-term burst limits clear quickly.
 func parseRetryAfter(v string) time.Time {
 	v = strings.TrimSpace(v)
 	if v == "" {
-		return time.Now().Add(60 * time.Second)
+		return time.Now().Add(30 * time.Second)
 	}
 	if secs, err := strconv.Atoi(v); err == nil {
 		return time.Now().Add(time.Duration(secs) * time.Second)
@@ -334,5 +352,5 @@ func parseRetryAfter(v string) time.Time {
 	if t, err := http.ParseTime(v); err == nil {
 		return t
 	}
-	return time.Now().Add(60 * time.Second)
+	return time.Now().Add(30 * time.Second)
 }
