@@ -581,53 +581,74 @@ func credsUsage(ctx context.Context, args []string) {
 		list = filtered
 	}
 
-	fmt.Printf("%-30s  %-10s  %-9s  %10s  %10s\n",
-		"ID", "LABEL", "STATUS", "5H_USAGE%", "7D_USAGE%")
-
 	client := &http.Client{Timeout: 10 * time.Second}
 	for _, c := range list {
-		fiveHour, sevenDay, fetchErr := fetchUsage(ctx, client, c.AccessToken)
+		u, fetchErr := fetchUsage(ctx, client, c.AccessToken)
+		fmt.Printf("%s  %s  [%s]\n", c.ID, c.Label, string(c.Status))
 		if fetchErr != nil {
-			fmt.Printf("%-30s  %-10s  %-9s  %s\n",
-				c.ID, c.Label, string(c.Status), fetchErr.Error())
+			fmt.Printf("  error: %s\n", fetchErr.Error())
 			continue
 		}
-		fmt.Printf("%-30s  %-10s  %-9s  %9.1f%%  %9.1f%%\n",
-			c.ID, c.Label, string(c.Status), fiveHour, sevenDay)
+		printUsageBucket("  5h     ", &u.FiveHour)
+		printUsageBucket("  7d     ", &u.SevenDay)
+		printUsageBucket("  7d opus", u.SevenDayOpus)
+		printUsageBucket("  7d snnt", u.SevenDaySonnet)
+		fmt.Println()
 	}
 }
 
-// fetchUsage calls GET https://api.anthropic.com/api/oauth/usage and returns
-// the five_hour and seven_day usage percentages (0–100).
-func fetchUsage(ctx context.Context, client *http.Client, accessToken string) (fiveHour, sevenDay float64, err error) {
+type usageBucket struct {
+	Utilization *float64 `json:"utilization"`
+	ResetsAt    *string  `json:"resets_at"`
+}
+
+type usageResponse struct {
+	FiveHour       usageBucket  `json:"five_hour"`
+	SevenDay       usageBucket  `json:"seven_day"`
+	SevenDayOpus   *usageBucket `json:"seven_day_opus"`
+	SevenDaySonnet *usageBucket `json:"seven_day_sonnet"`
+}
+
+func printUsageBucket(label string, b *usageBucket) {
+	if b == nil || b.Utilization == nil {
+		return
+	}
+	resets := ""
+	if b.ResetsAt != nil && *b.ResetsAt != "" {
+		if t, err := time.Parse(time.RFC3339Nano, *b.ResetsAt); err == nil {
+			resets = "  resets " + t.UTC().Format("2006-01-02 15:04 UTC")
+		}
+	}
+	fmt.Printf("%s  %5.1f%%%s\n", label, *b.Utilization, resets)
+}
+
+// fetchUsage calls GET https://api.anthropic.com/api/oauth/usage.
+func fetchUsage(ctx context.Context, client *http.Client, accessToken string) (*usageResponse, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		"https://api.anthropic.com/api/oauth/usage", nil)
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, 0, fmt.Errorf("request failed: %w", err)
+		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return 0, 0, fmt.Errorf("rate limited (429)")
+		return nil, fmt.Errorf("rate limited (429)")
 	}
 	if resp.StatusCode != http.StatusOK {
-		return 0, 0, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
-	var result struct {
-		FiveHour float64 `json:"five_hour"`
-		SevenDay float64 `json:"seven_day"`
-	}
+	var result usageResponse
 	if err := json.Unmarshal(body, &result); err != nil {
-		return 0, 0, fmt.Errorf("parse response: %w", err)
+		return nil, fmt.Errorf("parse response: %w", err)
 	}
-	return result.FiveHour, result.SevenDay, nil
+	return &result, nil
 }
