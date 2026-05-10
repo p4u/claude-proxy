@@ -173,17 +173,25 @@ func (h *Handler) failBind(w http.ResponseWriter, err error) {
 	}
 }
 
-// pickAny returns any active credential (used for non-sticky paths). Picks
-// the same way the pool would for a new conversation but without persisting.
+// pickAny returns any credential for non-sticky paths. Prefers active; falls
+// back to limited so the request reaches Anthropic and gets a real 429 rather
+// than a proxy-generated 503.
 func (h *Handler) pickAny(ctx context.Context) (*creds.Credential, error) {
 	list, err := creds.List(ctx, h.db)
 	if err != nil {
 		return nil, err
 	}
+	var fallback *creds.Credential
 	for _, c := range list {
 		if c.Status == creds.StatusActive {
 			return c, nil
 		}
+		if c.Status == creds.StatusLimited && fallback == nil {
+			fallback = c
+		}
+	}
+	if fallback != nil {
+		return fallback, nil
 	}
 	return nil, pool.ErrNoCredentials
 }
