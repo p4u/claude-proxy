@@ -166,6 +166,16 @@ func List(ctx context.Context, db *store.DB) ([]*Credential, error) {
 	return out, rows.Err()
 }
 
+// HasRefreshToken reports whether any credential in the DB already uses the
+// given refresh token. Used during import to detect duplicates.
+func HasRefreshToken(ctx context.Context, db *store.DB, refreshToken string) (bool, error) {
+	var n int
+	err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM credentials WHERE refresh_token=?`, refreshToken,
+	).Scan(&n)
+	return n > 0, err
+}
+
 func Get(ctx context.Context, db *store.DB, id string) (*Credential, error) {
 	rows, err := db.QueryContext(ctx, `SELECT `+credSelectCols+` FROM credentials WHERE id=?`, id)
 	if err != nil {

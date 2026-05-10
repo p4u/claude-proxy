@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"time"
 
 	"github.com/p4u/claude-proxy/internal/creds"
 	"github.com/p4u/claude-proxy/internal/store"
@@ -49,14 +48,28 @@ func Import(ctx context.Context, db *store.DB, path, label string, weight int) (
 		return nil, fmt.Errorf("%s: access token does not look like a Claude Code OAuth token (no sk-ant-oat marker)", path)
 	}
 
-	// expiresAt is milliseconds.
-	expires := time.UnixMilli(o.ExpiresAt)
+	// Duplicate check: reject if this refresh token is already in the pool.
+	dup, err := creds.HasRefreshToken(ctx, db, o.RefreshToken)
+	if err != nil {
+		return nil, fmt.Errorf("duplicate check: %w", err)
+	}
+	if dup {
+		return nil, fmt.Errorf("credential already imported (refresh token already exists in the pool)")
+	}
+
+	// Liveness check: refresh the token now to confirm the credential is valid.
+	// This also gives us a fresh access token and the authoritative expiry.
+	fmt.Fprintf(os.Stderr, "verifying credential with Anthropic...\n")
+	accessToken, refreshToken, expires, err := creds.RefreshTokens(ctx, o.RefreshToken)
+	if err != nil {
+		return nil, fmt.Errorf("credential is not alive: %w", err)
+	}
 
 	if label == "" {
 		label = o.SubscriptionType
 	}
 
-	c, err := creds.Insert(ctx, db, label, o.SubscriptionType, o.AccessToken, o.RefreshToken, expires, weight)
+	c, err := creds.Insert(ctx, db, label, o.SubscriptionType, accessToken, refreshToken, expires, weight)
 	if err != nil {
 		return nil, err
 	}

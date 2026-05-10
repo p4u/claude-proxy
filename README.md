@@ -116,18 +116,50 @@ make up
 
 Now import a credential. For each Claude subscription you want in the pool:
 
-```bash
-# 1. Log in under a DEDICATED config dir (so a local `claude` won't reuse and
-#    rotate the same refresh token, which would invalidate the proxy's copy):
-CLAUDE_CONFIG_DIR=~/cp-creds/acct-A claude /login
+### Generating credentials (do this once per account)
 
-# 2. Move the resulting credentials into ./creds (the proxy's mount):
-mv ~/cp-creds/acct-A/.credentials.json ./creds/acct-A.json
+> [!IMPORTANT]
+> Each subscription account needs its **own isolated login** in a dedicated
+> directory. Never share a `credentials.json` between the proxy and a local
+> `claude` installation. Anthropic issues a new refresh token on every renewal
+> and immediately invalidates the old one — two consumers of the same token
+> chain will fight, and whichever loses ends up with a permanently revoked
+> credential.
+
+```bash
+# 1. Log in using a dedicated config directory — one per account.
+#    This keeps the proxy's token chain completely separate from your
+#    local claude installation.
+CLAUDE_CONFIG_DIR=~/cp-creds/acct-A claude /login
+#    Follow the browser prompt to authenticate with the Claude account
+#    you want to add to the pool.
+
+# 2. Copy the resulting credentials into ./creds (the proxy's bind mount).
+#    Use cp, not mv — keep the original as a fallback until import succeeds.
+cp ~/cp-creds/acct-A/.credentials.json ./creds/acct-A.json
 chmod 600 ./creds/acct-A.json
 
-# 3. Import into the pool:
+# 3. Import into the pool. The proxy verifies the credential is alive and
+#    performs an immediate token refresh before storing it.
 make import FROM=acct-A.json LABEL=acct-A
+
+# 4. Once import succeeds, delete the original file. The proxy now owns
+#    the token chain; any other user of the same file will cause revocation.
+rm -f ~/cp-creds/acct-A/.credentials.json
 ```
+
+> [!WARNING]
+> After a successful import the proxy **owns** that refresh token chain.
+> Delete the source `credentials.json` and never use `CLAUDE_CONFIG_DIR=~/cp-creds/acct-A`
+> again for that account — logging in again there or running any `claude`
+> command with it will rotate the refresh token and silently invalidate the
+> proxy's copy, causing `401 → refresh failed: invalid_grant → revoked`.
+>
+> **Backup instead of re-importing:** Before wiping the database, always run
+> `make export-credentials > backup.jsonl` to capture the current (rotated)
+> tokens. Re-importing the original `credentials.json` after the proxy has
+> been running will not work — the original refresh token is long since
+> superseded.
 
 Repeat for each account. Then point Claude Code at the proxy:
 
@@ -614,17 +646,11 @@ token rotation, and downstream auth behavior on `/v1/*`, `/admin/*`, `/health`.
 
 ## Operational gotchas
 
-- **Don't reuse a `.credentials.json` after import.** Once imported, the
-  proxy owns that refresh-token chain. If a local `claude` later uses the
-  same file, it will rotate the refresh token and the proxy's copy
-  silently goes stale (`401` → `refresh failed: invalid_grant` →
-  credential `expired`). Always log in under a dedicated `CLAUDE_CONFIG_DIR`
-  per credential.
+- **Don't reuse a `credentials.json` after import** — see [Generating credentials](#generating-credentials-do-this-once-per-account) for the full explanation. Short version: the proxy owns the token chain after import; any other consumer of the same file causes immediate revocation.
+- **Back up before wiping the DB.** The original `credentials.json` will not work after the proxy has been running — the refresh token has rotated. Always run `make export-credentials > backup.jsonl` before `make clean`.
 - **`HOST_BIND=127.0.0.1`** binds loopback only. If Claude Code runs on a
   different host, set `HOST_BIND=0.0.0.0` *and* set `PROXY_AUTH_TOKEN`.
-- **Permission errors on `/data/proxy.db`** mean `PROXY_UID`/`PROXY_GID` in
-  `.env` don't match the host owner of `./data`. `make env` resyncs them;
-  `make fix-perms` fixes the directory ownership.
+- **Permission errors on `/data/proxy.db`** mean the container user (uid 65532) doesn't own `./data`. Run `make fix-perms` to fix it.
 - **Refresh-token rotation is one-shot.** Anthropic invalidates old refresh
   tokens immediately on use. Two consumers of the same token chain will
   fight; whichever loses ends up `expired`.

@@ -56,6 +56,47 @@ type refreshResp struct {
 	Error        string `json:"error,omitempty"`
 }
 
+// RefreshTokens performs a stateless token refresh (no DB record required).
+// Used during import to verify a credential is alive before inserting it.
+// Returns the new access token, refresh token, and expiry on success.
+func RefreshTokens(ctx context.Context, refreshToken string) (accessToken, newRefreshToken string, expiresAt time.Time, err error) {
+	body, _ := json.Marshal(refreshReq{
+		GrantType:    "refresh_token",
+		ClientID:     ClientID,
+		RefreshToken: refreshToken,
+	})
+	req, err := http.NewRequestWithContext(ctx, "POST", TokenURL, bytes.NewReader(body))
+	if err != nil {
+		return "", "", time.Time{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", "", time.Time{}, fmt.Errorf("refresh request: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode == 400 || resp.StatusCode == 401 {
+		return "", "", time.Time{}, fmt.Errorf("credential rejected by Anthropic (%d): %s", resp.StatusCode, string(raw))
+	}
+	if resp.StatusCode != 200 {
+		return "", "", time.Time{}, fmt.Errorf("refresh upstream %d: %s", resp.StatusCode, string(raw))
+	}
+
+	var rr refreshResp
+	if err := json.Unmarshal(raw, &rr); err != nil {
+		return "", "", time.Time{}, fmt.Errorf("refresh decode: %w", err)
+	}
+	if rr.AccessToken == "" || rr.RefreshToken == "" {
+		return "", "", time.Time{}, fmt.Errorf("refresh missing tokens in response")
+	}
+	exp := time.Now().Add(time.Duration(rr.ExpiresIn)*time.Second - 5*time.Minute)
+	return rr.AccessToken, rr.RefreshToken, exp, nil
+}
+
 // Refresh refreshes if the credential is near expiry. Safe to call
 // concurrently — serialized per-id. Used by the proactive loop and by manual
 // `creds refresh`. If the credential is healthy and far from expiry, it is
