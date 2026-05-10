@@ -92,14 +92,12 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
 
   watchtower:
-    image: containrrr/watchtower:1.7.1
+    image: nickfedor/watchtower:latest
     container_name: claude-proxy-watchtower
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    command: claude-proxy --interval 300
-    environment:
-      WATCHTOWER_CLEANUP: "true"
+    command: claude-proxy --interval 300 --cleanup
 
 volumes:
   # Named volume for claude CLI state: credentials, session UUIDs.
