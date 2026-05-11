@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"math"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -106,27 +108,37 @@ func (p *Pool) Bind(ctx context.Context, convID string) (*creds.Credential, bool
 	return c, newConv, nil
 }
 
-// pickActiveLocked returns the next credential ID for a new conversation,
-// honoring per-credential weight via interleaved expansion: each round we
-// take one slot from every credential that still has weight remaining. This
-// gives a smoothly mixed sequence rather than long runs of the same id.
+// pickActiveLocked selects a credential ID for a new conversation using
+// usage-aware weighted-random selection.
 //
-//	weights {A:5, B:5}      -> A B A B A B A B A B
-//	weights {A:5, B:1}      -> A B A A A A
-//	weights {A:5, B:1, C:2} -> A B C A C A A A
+// Effective score per credential:
+//
+//	score = weight × blend²
+//	blend = 0.6×room_5h + 0.4×room_7d
+//	room_X = max(0, 1 − utilization_pct/100)
+//
+// The blend weights the short-term 5 h window more heavily (immediate
+// capacity) while still accounting for long-term 7 d quota. Squaring the
+// blend creates a convex penalty that strongly avoids near-saturated
+// credentials without hard-excluding them until they actually hit 100 %.
+//
+// Usage data older than 30 minutes is treated as stale; stale or absent
+// data falls back to weight-only scoring (blend = 1). When all computed
+// scores are zero, the credential with the highest configured weight is
+// chosen so traffic always has somewhere to go.
 func (p *Pool) pickActiveLocked(ctx context.Context, tx *sql.Tx) (string, error) {
-	now := time.Now().Unix()
+	now := time.Now()
 	rows, err := tx.QueryContext(ctx, `
 		SELECT id, weight FROM credentials
 		WHERE status='active'
 		  AND (retry_after IS NULL OR retry_after < ?)
-		ORDER BY id`, now)
+		ORDER BY id`, now.Unix())
 	if err != nil {
 		return "", err
 	}
 	defer rows.Close()
 
-	var pool []weightedEntry
+	var candidates []weightedEntry
 	for rows.Next() {
 		var e weightedEntry
 		if err := rows.Scan(&e.id, &e.weight); err != nil {
@@ -135,7 +147,7 @@ func (p *Pool) pickActiveLocked(ctx context.Context, tx *sql.Tx) (string, error)
 		if e.weight < 1 {
 			e.weight = 1
 		}
-		pool = append(pool, e)
+		candidates = append(candidates, e)
 	}
 	if err := rows.Err(); err != nil {
 		return "", err
@@ -144,7 +156,7 @@ func (p *Pool) pickActiveLocked(ctx context.Context, tx *sql.Tx) (string, error)
 	// No active credentials — fall back to limited ones so the request
 	// reaches Anthropic and gets a real 429 (with Retry-After) instead
 	// of a confusing 503 "no active credentials in pool".
-	if len(pool) == 0 {
+	if len(candidates) == 0 {
 		lrows, lerr := tx.QueryContext(ctx, `
 			SELECT id, weight FROM credentials
 			WHERE status='limited'
@@ -161,29 +173,18 @@ func (p *Pool) pickActiveLocked(ctx context.Context, tx *sql.Tx) (string, error)
 			if e.weight < 1 {
 				e.weight = 1
 			}
-			pool = append(pool, e)
+			candidates = append(candidates, e)
 		}
 		if err := lrows.Err(); err != nil {
 			return "", err
 		}
 	}
 
-	if len(pool) == 0 {
+	if len(candidates) == 0 {
 		return "", ErrNoCredentials
 	}
 
-	slots := expandInterleaved(pool)
-
-	var cursor int
-	if err := tx.QueryRowContext(ctx, `SELECT idx FROM rr_cursor WHERE k=0`).Scan(&cursor); err != nil {
-		return "", err
-	}
-	chosen := slots[cursor%len(slots)]
-	next := (cursor + 1) % len(slots)
-	if _, err := tx.ExecContext(ctx, `UPDATE rr_cursor SET idx=? WHERE k=0`, next); err != nil {
-		return "", err
-	}
-	return chosen, nil
+	return weightedRandPick(ctx, tx, candidates, now)
 }
 
 type weightedEntry struct {
@@ -191,30 +192,58 @@ type weightedEntry struct {
 	weight int
 }
 
-func expandInterleaved(pool []weightedEntry) []string {
-	total := 0
-	for _, e := range pool {
-		total += e.weight
-	}
-	slots := make([]string, 0, total)
-	remaining := make([]int, len(pool))
-	for i, e := range pool {
-		remaining[i] = e.weight
-	}
-	for {
-		progressed := false
-		for i, e := range pool {
-			if remaining[i] > 0 {
-				slots = append(slots, e.id)
-				remaining[i]--
-				progressed = true
-			}
+const usageStaleness = 30 * time.Minute
+
+// weightedRandPick computes a usage-aware effective score for each candidate
+// and returns one chosen by weighted-random selection.
+func weightedRandPick(ctx context.Context, tx *sql.Tx, candidates []weightedEntry, now time.Time) (string, error) {
+	staleThreshold := now.Add(-usageStaleness).Unix()
+
+	scores := make([]float64, len(candidates))
+	bestWeight := 0
+	bestIdx := 0
+	for i, e := range candidates {
+		var fhPct, sdPct float64
+		var capturedAt int64
+		err := tx.QueryRowContext(ctx, `
+			SELECT five_hour_pct, seven_day_pct, captured_at
+			FROM usage_history
+			WHERE credential_id=?
+			ORDER BY captured_at DESC LIMIT 1`, e.id).
+			Scan(&fhPct, &sdPct, &capturedAt)
+
+		blend := 1.0 // default: full score when data absent or stale
+		if err == nil && capturedAt >= staleThreshold {
+			roomFH := math.Max(0, 1-fhPct/100)
+			roomSD := math.Max(0, 1-sdPct/100)
+			blend = 0.6*roomFH + 0.4*roomSD
 		}
-		if !progressed {
-			break
+		scores[i] = float64(e.weight) * blend * blend
+
+		if e.weight > bestWeight {
+			bestWeight = e.weight
+			bestIdx = i
 		}
 	}
-	return slots
+
+	total := 0.0
+	for _, s := range scores {
+		total += s
+	}
+	if total <= 0 {
+		// All credentials are near 100 % — pick highest configured weight.
+		return candidates[bestIdx].id, nil
+	}
+
+	r := rand.Float64() * total
+	cumulative := 0.0
+	for i, s := range scores {
+		cumulative += s
+		if r < cumulative {
+			return candidates[i].id, nil
+		}
+	}
+	return candidates[len(candidates)-1].id, nil
 }
 
 func getCredTx(ctx context.Context, tx *sql.Tx, id string) (*creds.Credential, error) {

@@ -32,33 +32,28 @@ func setup(t *testing.T) (*store.DB, []*creds.Credential) {
 }
 
 func TestRoundRobinNewConversations(t *testing.T) {
-	db, _ := setup(t)
+	db, cs := setup(t)
 	p := New(db)
 	ctx := context.Background()
 
-	// First three new conversations must each get a distinct credential.
+	// Over enough new conversations all three equal-weight credentials must be
+	// selected. With weighted-random and no usage data the probability of any
+	// one credential being skipped in 30 draws is (2/3)^30 < 0.0001.
 	got := map[string]bool{}
-	var firstID string
-	for i, conv := range []string{"conv1", "conv2", "conv3"} {
-		c, isNew, err := p.Bind(ctx, conv)
+	for i := 0; i < 30; i++ {
+		c, isNew, err := p.Bind(ctx, fmt.Sprintf("conv-%d", i))
 		if err != nil {
 			t.Fatalf("bind %d: %v", i, err)
 		}
 		if !isNew {
-			t.Fatalf("expected new conversation for %s", conv)
+			t.Fatalf("bind %d: expected new conversation", i)
 		}
 		got[c.ID] = true
-		if i == 0 {
-			firstID = c.ID
+	}
+	for _, c := range cs {
+		if !got[c.ID] {
+			t.Fatalf("credential %s never selected across 30 new conversations", c.ID)
 		}
-	}
-	if len(got) != 3 {
-		t.Fatalf("RR did not spread across 3 credentials: %v", got)
-	}
-	// Fourth new conversation wraps around to the first credential.
-	c4, _, _ := p.Bind(ctx, "conv4")
-	if c4.ID != firstID {
-		t.Fatalf("RR did not wrap: c4=%s expected=%s", c4.ID, firstID)
 	}
 }
 
@@ -149,44 +144,8 @@ func TestAllLimitedFallback(t *testing.T) {
 	}
 }
 
-func TestExpandInterleaved(t *testing.T) {
-	cases := []struct {
-		name string
-		in   []weightedEntry
-		want []string
-	}{
-		{
-			name: "equal weights interleave",
-			in:   []weightedEntry{{"A", 5}, {"B", 5}},
-			want: []string{"A", "B", "A", "B", "A", "B", "A", "B", "A", "B"},
-		},
-		{
-			name: "unequal weights — heavier early then drained",
-			in:   []weightedEntry{{"A", 5}, {"B", 1}},
-			want: []string{"A", "B", "A", "A", "A", "A"},
-		},
-		{
-			name: "three creds mixed",
-			in:   []weightedEntry{{"A", 5}, {"B", 1}, {"C", 2}},
-			want: []string{"A", "B", "C", "A", "C", "A", "A", "A"},
-		},
-	}
-	for _, tc := range cases {
-		got := expandInterleaved(tc.in)
-		if len(got) != len(tc.want) {
-			t.Errorf("%s: len got=%d want=%d (%v)", tc.name, len(got), len(tc.want), got)
-			continue
-		}
-		for i := range got {
-			if got[i] != tc.want[i] {
-				t.Errorf("%s: slot %d got=%s want=%s (full=%v)", tc.name, i, got[i], tc.want[i], got)
-				break
-			}
-		}
-	}
-}
 
-func TestInterleavedRoundRobinAcrossClients(t *testing.T) {
+func TestSpreadAcrossTwoCreds(t *testing.T) {
 	dir := t.TempDir()
 	db, err := store.Open(dir + "/t.db")
 	if err != nil {
@@ -198,24 +157,22 @@ func TestInterleavedRoundRobinAcrossClients(t *testing.T) {
 	b, _ := creds.Insert(ctx, db, "B", "max", "sk-ant-oat-B", "rt-B", time.Now().Add(time.Hour), 5)
 
 	p := New(db)
-	got := []string{}
-	for i := 0; i < 4; i++ {
+	// Over 20 conversations both equal-weight creds must be hit.
+	// P(one cred never picked) = (1/2)^20 < 0.000001.
+	seen := map[string]bool{}
+	for i := 0; i < 20; i++ {
 		c, _, err := p.Bind(ctx, fmt.Sprintf("conv-%d", i))
 		if err != nil {
 			t.Fatal(err)
 		}
-		got = append(got, c.ID)
+		seen[c.ID] = true
 	}
-	// First four conversations across two equal-weight max creds must hit
-	// both creds within the first two picks (no long runs of the same one).
-	seen := map[string]bool{got[0]: true, got[1]: true}
 	if !seen[a.ID] || !seen[b.ID] {
-		t.Fatalf("first two new conversations did not interleave across creds: %v (a=%s b=%s)",
-			got, a.ID, b.ID)
+		t.Fatalf("one credential never selected across 20 picks (a=%s b=%s)", a.ID, b.ID)
 	}
 }
 
-func TestWeightedRoundRobin(t *testing.T) {
+func TestWeightedSelection(t *testing.T) {
 	dir := t.TempDir()
 	db, err := store.Open(dir + "/t.db")
 	if err != nil {
@@ -228,7 +185,7 @@ func TestWeightedRoundRobin(t *testing.T) {
 	light, _ := creds.Insert(ctx, db, "light", "pro", "sk-ant-oat-l", "rt-l", time.Now().Add(time.Hour), 1)
 
 	p := New(db)
-	const N = 600
+	const N = 1200
 	count := map[string]int{}
 	for i := 0; i < N; i++ {
 		c, _, err := p.Bind(ctx, fmt.Sprintf("conv-%d", i))
@@ -238,12 +195,60 @@ func TestWeightedRoundRobin(t *testing.T) {
 		count[c.ID]++
 	}
 
-	// heavy has weight 5, light weight 1 → heavy should get 5/6 of the new convs.
-	wantHeavy := N * 5 / 6
-	wantLight := N / 6
-	if count[heavy.ID] != wantHeavy || count[light.ID] != wantLight {
-		t.Fatalf("weighted RR off: heavy=%d (want %d), light=%d (want %d)",
-			count[heavy.ID], wantHeavy, count[light.ID], wantLight)
+	// heavy has weight 5, light weight 1 → expected ratio 5:1 (heavy≈83%, light≈17%).
+	// Allow ±5 percentage points to keep the test robust against randomness.
+	heavyPct := float64(count[heavy.ID]) / N * 100
+	lightPct := float64(count[light.ID]) / N * 100
+	if heavyPct < 78 || heavyPct > 88 {
+		t.Fatalf("heavy selection rate %.1f%% outside [78,88]%% (light=%.1f%%)", heavyPct, lightPct)
+	}
+}
+
+func TestUsageAwareScoring(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(dir + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	fresh, _ := creds.Insert(ctx, db, "fresh", "pro", "sk-ant-oat-f", "rt-f", time.Now().Add(time.Hour), 1)
+	busy, _ := creds.Insert(ctx, db, "busy", "pro", "sk-ant-oat-b", "rt-b", time.Now().Add(time.Hour), 1)
+
+	// Inject a fresh usage snapshot: "busy" is at 90% on both windows.
+	now := time.Now().Unix()
+	_, _ = db.ExecContext(ctx, `
+		INSERT INTO usage_history
+		  (credential_id, captured_at, five_hour_pct, five_hour_resets_at,
+		   seven_day_pct, seven_day_resets_at, seven_day_sonnet_pct, seven_day_sonnet_resets_at)
+		VALUES (?, ?, 90.0, NULL, 90.0, NULL, 0.0, NULL)`, busy.ID, now)
+	_, _ = db.ExecContext(ctx, `
+		INSERT INTO usage_history
+		  (credential_id, captured_at, five_hour_pct, five_hour_resets_at,
+		   seven_day_pct, seven_day_resets_at, seven_day_sonnet_pct, seven_day_sonnet_resets_at)
+		VALUES (?, ?, 5.0, NULL, 5.0, NULL, 0.0, NULL)`, fresh.ID, now)
+
+	// "fresh" score = 1 × (0.6×0.95 + 0.4×0.95)² = 1 × 0.95² ≈ 0.9025
+	// "busy"  score = 1 × (0.6×0.10 + 0.4×0.10)² = 1 × 0.10² = 0.01
+	// Expected selection ratio ≈ 99:1 in favour of "fresh".
+
+	p := New(db)
+	const N = 200
+	count := map[string]int{}
+	for i := range N {
+		c, _, err := p.Bind(ctx, fmt.Sprintf("u-%d", i))
+		if err != nil {
+			t.Fatalf("bind %d: %v", i, err)
+		}
+		count[c.ID]++
+	}
+
+	// fresh should dominate — at least 80% of picks despite equal configured weight.
+	freshPct := float64(count[fresh.ID]) / N * 100
+	if freshPct < 80 {
+		t.Fatalf("usage-aware scoring failed: fresh=%.1f%% (want ≥80%%) busy=%.1f%%",
+			freshPct, float64(count[busy.ID])/N*100)
 	}
 }
 
