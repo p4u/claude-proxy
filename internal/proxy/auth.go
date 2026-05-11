@@ -1,51 +1,82 @@
 package proxy
 
 import (
+	"context"
 	"crypto/subtle"
 	"net/http"
 	"strings"
+
+	"github.com/p4u/claude-proxy/internal/store"
+	"github.com/p4u/claude-proxy/internal/usertoken"
 )
 
-// AuthMiddleware enforces a shared-secret bearer token on incoming requests.
-// It accepts the token via:
-//   - Authorization: Bearer <token>
-//   - x-api-key: <token>   (Anthropic SDK default)
+// AuthMiddleware authenticates incoming requests.
 //
-// If token is empty the middleware is a no-op. /health is always allowed
-// through so container healthchecks keep working.
-func AuthMiddleware(token string, next http.Handler) http.Handler {
-	if token == "" {
-		return next
-	}
-	expected := []byte(token)
+// Priority order:
+//  1. /health — always public.
+//  2. adminToken match — admin identity, all routes allowed.
+//  3. user token DB match — user identity, /v1/* and /health only;
+//     /admin/* requests are rejected with 403.
+//  4. No auth configured (adminToken=="" and no user tokens) — passthrough.
+//  5. Otherwise — 401.
+func AuthMiddleware(adminToken string, db *store.DB, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		// Try both header forms.
-		got := bearerFromHeader(r.Header.Get("Authorization"))
-		if got == "" {
-			got = strings.TrimSpace(r.Header.Get("X-Api-Key"))
-		}
+		bearer := extractToken(r)
 
-		if got == "" || subtle.ConstantTimeCompare([]byte(got), expected) != 1 {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="claude-proxy"`)
-			http.Error(w,
-				`{"type":"error","error":{"type":"authentication_error","message":"proxy: invalid or missing bearer token"}}`,
-				http.StatusUnauthorized)
+		// Admin token check.
+		if adminToken != "" && subtle.ConstantTimeCompare([]byte(bearer), []byte(adminToken)) == 1 {
+			ctx := usertoken.WithIdentity(r.Context(), &usertoken.Identity{IsAdmin: true})
+			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
-		next.ServeHTTP(w, r)
+
+		// User token check.
+		if db != nil && bearer != "" {
+			ut, err := usertoken.LookupByToken(r.Context(), db, bearer)
+			if err == nil && ut.Status == usertoken.StatusActive {
+				if strings.HasPrefix(r.URL.Path, "/admin/") {
+					http.Error(w,
+						`{"type":"error","error":{"type":"authentication_error","message":"proxy: admin endpoints require the admin token"}}`,
+						http.StatusForbidden)
+					return
+				}
+				go usertoken.MarkUsed(context.Background(), db, ut.ID)
+				ctx := usertoken.WithIdentity(r.Context(), &usertoken.Identity{
+					UserTokenID: ut.ID,
+					UserName:    ut.Name,
+				})
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
+		}
+
+		// No auth configured → passthrough (backward compat).
+		if adminToken == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		w.Header().Set("WWW-Authenticate", `Bearer realm="claude-proxy"`)
+		http.Error(w,
+			`{"type":"error","error":{"type":"authentication_error","message":"proxy: invalid or missing bearer token"}}`,
+			http.StatusUnauthorized)
 	})
+}
+
+func extractToken(r *http.Request) string {
+	if got := bearerFromHeader(r.Header.Get("Authorization")); got != "" {
+		return got
+	}
+	return strings.TrimSpace(r.Header.Get("X-Api-Key"))
 }
 
 func bearerFromHeader(v string) string {
 	v = strings.TrimSpace(v)
-	if v == "" {
-		return ""
-	}
 	const p = "Bearer "
 	if len(v) > len(p) && strings.EqualFold(v[:len(p)], p) {
 		return strings.TrimSpace(v[len(p):])

@@ -27,12 +27,20 @@ import (
 	"github.com/p4u/claude-proxy/internal/proxy"
 	"github.com/p4u/claude-proxy/internal/store"
 	"github.com/p4u/claude-proxy/internal/usage"
+	"github.com/p4u/claude-proxy/internal/usertoken"
 )
 
 const helpText = `claude-proxy — sticky multi-subscription proxy for Claude Code
 
 Usage:
   claude-proxy serve [flags]
+  claude-proxy users create        --name NAME [--db PATH]
+  claude-proxy users list          [--db PATH]
+  claude-proxy users token <id>    [--db PATH]
+  claude-proxy users disable <id>  [--db PATH]
+  claude-proxy users enable <id>   [--db PATH]
+  claude-proxy users rm <id>       [--db PATH]
+  claude-proxy users refresh <id>  [--db PATH]
   claude-proxy creds import        --from FILE [--label NAME] [--weight N]
   claude-proxy creds export        [--db PATH]   # JSONL to stdout
   claude-proxy creds import-bulk   [--db PATH]   # JSONL from stdin
@@ -57,6 +65,8 @@ func main() {
 		runServe(os.Args[2:])
 	case "creds":
 		runCreds(os.Args[2:])
+	case "users":
+		runUsers(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(helpText)
 	default:
@@ -272,7 +282,7 @@ func runServe(args []string) {
 
 	srv := &http.Server{
 		Addr:    *addr,
-		Handler: proxy.AuthMiddleware(*authToken, mux),
+		Handler: proxy.AuthMiddleware(*authToken, db, mux),
 	}
 	go func() {
 		<-ctx.Done()
@@ -610,6 +620,166 @@ func printUsageBucket(label string, b *usage.Bucket) {
 		}
 	}
 	fmt.Printf("%s  %5.1f%%%s\n", label, *b.Utilization, resets)
+}
+
+func runUsers(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "users: missing subcommand (create|list|token|disable|enable|rm|refresh)")
+		os.Exit(2)
+	}
+	ctx := context.Background()
+	switch args[0] {
+	case "create":
+		usersCreate(ctx, args[1:])
+	case "list":
+		usersList(ctx, args[1:])
+	case "token":
+		usersToken(ctx, args[1:])
+	case "disable":
+		usersDisable(ctx, args[1:])
+	case "enable":
+		usersEnable(ctx, args[1:])
+	case "rm":
+		usersRm(ctx, args[1:])
+	case "refresh":
+		usersRefresh(ctx, args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "users: unknown subcommand %q\n", args[0])
+		os.Exit(2)
+	}
+}
+
+func usersCreate(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("users create", flag.ExitOnError)
+	name := fs.String("name", "", "user name (unique label)")
+	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
+	_ = fs.Parse(args)
+	if *name == "" {
+		fmt.Fprintln(os.Stderr, "--name is required")
+		os.Exit(2)
+	}
+	db := openDB(*dbPath)
+	defer db.Close()
+	ut, err := usertoken.Create(ctx, db, *name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "create: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("created %s  name=%q  token=%s\n", ut.ID, ut.Name, ut.Token)
+}
+
+func usersList(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("users list", flag.ExitOnError)
+	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
+	_ = fs.Parse(args)
+	db := openDB(*dbPath)
+	defer db.Close()
+	list, err := usertoken.List(ctx, db)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "list: %v\n", err)
+		os.Exit(1)
+	}
+	if len(list) == 0 {
+		fmt.Println("(no user tokens)")
+		return
+	}
+	fmt.Printf("%-22s  %-20s  %-8s  %-25s  %s\n", "ID", "NAME", "STATUS", "CREATED", "LAST_USED")
+	for _, ut := range list {
+		lastUsed := "-"
+		if ut.LastUsedAt != nil {
+			lastUsed = ut.LastUsedAt.Format(time.RFC3339)
+		}
+		fmt.Printf("%-22s  %-20s  %-8s  %-25s  %s\n",
+			ut.ID, ut.Name, string(ut.Status),
+			ut.CreatedAt.Format(time.RFC3339), lastUsed)
+	}
+}
+
+func usersToken(ctx context.Context, args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "users token <id>")
+		os.Exit(2)
+	}
+	fs := flag.NewFlagSet("users token", flag.ExitOnError)
+	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
+	_ = fs.Parse(args[1:])
+	db := openDB(*dbPath)
+	defer db.Close()
+	ut, err := usertoken.Get(ctx, db, args[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "token: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(ut.Token)
+}
+
+func usersDisable(ctx context.Context, args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "users disable <id>")
+		os.Exit(2)
+	}
+	fs := flag.NewFlagSet("users disable", flag.ExitOnError)
+	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
+	_ = fs.Parse(args[1:])
+	db := openDB(*dbPath)
+	defer db.Close()
+	if err := usertoken.SetStatus(ctx, db, args[0], usertoken.StatusDisabled); err != nil {
+		fmt.Fprintf(os.Stderr, "disable: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("disabled", args[0])
+}
+
+func usersEnable(ctx context.Context, args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "users enable <id>")
+		os.Exit(2)
+	}
+	fs := flag.NewFlagSet("users enable", flag.ExitOnError)
+	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
+	_ = fs.Parse(args[1:])
+	db := openDB(*dbPath)
+	defer db.Close()
+	if err := usertoken.SetStatus(ctx, db, args[0], usertoken.StatusActive); err != nil {
+		fmt.Fprintf(os.Stderr, "enable: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("enabled", args[0])
+}
+
+func usersRm(ctx context.Context, args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "users rm <id>")
+		os.Exit(2)
+	}
+	fs := flag.NewFlagSet("users rm", flag.ExitOnError)
+	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
+	_ = fs.Parse(args[1:])
+	db := openDB(*dbPath)
+	defer db.Close()
+	if err := usertoken.Delete(ctx, db, args[0]); err != nil {
+		fmt.Fprintf(os.Stderr, "rm: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("removed", args[0])
+}
+
+func usersRefresh(ctx context.Context, args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "users refresh <id>")
+		os.Exit(2)
+	}
+	fs := flag.NewFlagSet("users refresh", flag.ExitOnError)
+	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
+	_ = fs.Parse(args[1:])
+	db := openDB(*dbPath)
+	defer db.Close()
+	token, err := usertoken.Refresh(ctx, db, args[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "refresh: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("refreshed %s  token=%s\n", args[0], token)
 }
 
 // credsUsageHistory renders terminal charts from stored usage snapshots.

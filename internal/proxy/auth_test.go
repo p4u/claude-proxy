@@ -32,7 +32,7 @@ func TestAuthMiddleware(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			hit = false
-			h := AuthMiddleware(tc.token, inner)
+			h := AuthMiddleware(tc.token, nil, inner)
 			req := httptest.NewRequest("POST", "http://x"+tc.path, nil)
 			if tc.authHeader != "" {
 				req.Header.Set("Authorization", tc.authHeader)

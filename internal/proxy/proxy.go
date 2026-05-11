@@ -16,6 +16,7 @@ import (
 	"github.com/p4u/claude-proxy/internal/pool"
 	"github.com/p4u/claude-proxy/internal/router"
 	"github.com/p4u/claude-proxy/internal/store"
+	"github.com/p4u/claude-proxy/internal/usertoken"
 )
 
 const (
@@ -105,11 +106,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("counter bump", "err", err, "cred", cred.ID)
 	}
 
-	status := h.forward(w, r, body, cred, true)
+	status, rxBytes := h.forward(w, r, body, cred, true)
+	latency := time.Since(start)
 	h.log.Info("forwarded",
 		"cred", cred.ID, "label", cred.Label,
 		"conv", convID, "status", status,
-		"latency_ms", time.Since(start).Milliseconds())
+		"latency_ms", latency.Milliseconds(),
+		"bytes_sent", len(body), "bytes_received", rxBytes)
+
+	h.logRequest(r.Context(), r.URL.Path, convID, cred.ID, status, int64(len(body)), rxBytes, latency)
 }
 
 // decodeBodySnippet decompresses a body if it was sent gzip/deflate, then
@@ -197,17 +202,17 @@ func (h *Handler) pickAny(ctx context.Context) (*creds.Credential, error) {
 }
 
 // forward sends the request upstream and streams the response back. Returns the
-// upstream HTTP status (or -1 on local failure before any response was sent).
+// upstream HTTP status (or -1 on local failure) and bytes received from upstream.
 // If allowRetry is true and upstream returns 401, the proxy refreshes the
 // credential and retries once.
-func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, cred *creds.Credential, allowRetry bool) int {
+func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, cred *creds.Credential, allowRetry bool) (int, int64) {
 	upstreamURL := "https://" + UpstreamHost + r.URL.RequestURI()
 
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, bytes.NewReader(body))
 	if err != nil {
 		http.Error(w, "build upstream req", http.StatusBadGateway)
 		_ = creds.MarkError(r.Context(), h.db, cred.ID)
-		return -1
+		return -1, 0
 	}
 
 	copyHeaders(upstreamReq.Header, r.Header)
@@ -229,7 +234,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 		http.Error(w, "upstream: "+err.Error(), http.StatusBadGateway)
 		_ = creds.MarkError(r.Context(), h.db, cred.ID)
 		h.log.Error("upstream transport error", "cred", cred.ID, "err", err)
-		return -1
+		return -1, 0
 	}
 
 	h.log.Debug("upstream resp",
@@ -251,7 +256,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 			_ = creds.MarkError(r.Context(), h.db, cred.ID)
 			h.log.Error("refresh failed after 401; marked expired", "cred", cred.ID, "err", rerr)
 			http.Error(w, "proxy: credential expired", http.StatusBadGateway)
-			return 401
+			return 401, 0
 		}
 		h.log.Info("refresh succeeded; retrying upstream", "cred", cred.ID)
 		return h.forward(w, r, body, fresh, false)
@@ -297,29 +302,45 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
-	var streamed int64
+	var rxBytes int64
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil {
-				h.log.Warn("client write error", "err", werr, "cred", cred.ID, "streamed", streamed)
-				return resp.StatusCode
+				h.log.Warn("client write error", "err", werr, "cred", cred.ID, "streamed", rxBytes)
+				return resp.StatusCode, rxBytes
 			}
-			streamed += int64(n)
+			rxBytes += int64(n)
 			if flusher != nil {
 				flusher.Flush()
 			}
 		}
 		if rerr == io.EOF {
 			h.log.Debug("stream done",
-				"cred", cred.ID, "label", cred.Label, "status", resp.StatusCode, "bytes", streamed)
-			return resp.StatusCode
+				"cred", cred.ID, "label", cred.Label, "status", resp.StatusCode, "bytes", rxBytes)
+			return resp.StatusCode, rxBytes
 		}
 		if rerr != nil {
-			h.log.Warn("upstream stream error", "err", rerr, "cred", cred.ID, "streamed", streamed)
-			return resp.StatusCode
+			h.log.Warn("upstream stream error", "err", rerr, "cred", cred.ID, "streamed", rxBytes)
+			return resp.StatusCode, rxBytes
 		}
 	}
+}
+
+// logRequest inserts one row into request_log for dashboard aggregation.
+func (h *Handler) logRequest(ctx context.Context, path, convID, credID string, status int, txBytes, rxBytes int64, latency time.Duration) {
+	id := usertoken.FromContext(ctx)
+	var userTokenID *string
+	if id != nil && id.UserTokenID != "" {
+		userTokenID = &id.UserTokenID
+	}
+	_, _ = h.db.ExecContext(ctx, `
+		INSERT INTO request_log
+		  (user_token_id, credential_id, conv_id, ts, path, status_code,
+		   bytes_sent, bytes_received, latency_ms)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		userTokenID, credID, convID, time.Now().Unix(), path, status,
+		txBytes, rxBytes, latency.Milliseconds())
 }
 
 func copyHeaders(dst, src http.Header) {

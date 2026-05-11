@@ -44,6 +44,34 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
   total_cost_usd   REAL    NOT NULL DEFAULT 0
 );
 
+-- Named bearer tokens for multi-user authentication.
+CREATE TABLE IF NOT EXISTS user_tokens (
+  id           TEXT    PRIMARY KEY,
+  name         TEXT    NOT NULL UNIQUE,
+  token        TEXT    NOT NULL UNIQUE,
+  status       TEXT    NOT NULL DEFAULT 'active',
+  created_at   INTEGER NOT NULL,
+  last_used_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_user_tokens_token  ON user_tokens(token);
+CREATE INDEX IF NOT EXISTS idx_user_tokens_status ON user_tokens(status);
+
+-- One row per forwarded request for dashboard aggregation.
+CREATE TABLE IF NOT EXISTS request_log (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_token_id  TEXT    REFERENCES user_tokens(id) ON DELETE SET NULL,
+  credential_id  TEXT,
+  conv_id        TEXT    NOT NULL DEFAULT '',
+  ts             INTEGER NOT NULL,
+  path           TEXT    NOT NULL DEFAULT '',
+  status_code    INTEGER NOT NULL DEFAULT 0,
+  bytes_sent     INTEGER NOT NULL DEFAULT 0,
+  bytes_received INTEGER NOT NULL DEFAULT 0,
+  latency_ms     INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_request_log_user_ts ON request_log(user_token_id, ts);
+CREATE INDEX IF NOT EXISTS idx_request_log_ts      ON request_log(ts);
+
 CREATE TABLE IF NOT EXISTS usage_history (
   id                          INTEGER PRIMARY KEY AUTOINCREMENT,
   credential_id               TEXT    NOT NULL REFERENCES credentials(id) ON DELETE CASCADE,

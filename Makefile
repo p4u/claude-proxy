@@ -195,6 +195,41 @@ conversations: ## GET /admin/conversations.
 stats: ## GET /admin/stats.
 	@curl -s $(_AUTH) $(BASE)/admin/stats
 
+##@ User tokens
+
+# usage: make user-create NAME=alice
+user-create: ## Create a user token (NAME=alice).
+	@if [ -z "$(NAME)" ]; then echo "usage: make user-create NAME=alice"; exit 2; fi
+	$(RUN) users create --name "$(NAME)" --db $(DB)
+
+user-list: ## List all user tokens.
+	$(RUN) users list --db $(DB)
+
+# usage: make user-token ID=utok_xxx
+user-token: ## Print the bearer token for a user (ID=utok_xxx).
+	@if [ -z "$(ID)" ]; then echo "usage: make user-token ID=utok_xxx"; exit 2; fi
+	$(RUN) users token "$(ID)" --db $(DB)
+
+# usage: make user-disable ID=utok_xxx
+user-disable: ## Disable a user token (ID=utok_xxx).
+	@if [ -z "$(ID)" ]; then echo "usage: make user-disable ID=utok_xxx"; exit 2; fi
+	$(RUN) users disable "$(ID)" --db $(DB)
+
+# usage: make user-enable ID=utok_xxx
+user-enable: ## Re-enable a user token (ID=utok_xxx).
+	@if [ -z "$(ID)" ]; then echo "usage: make user-enable ID=utok_xxx"; exit 2; fi
+	$(RUN) users enable "$(ID)" --db $(DB)
+
+# usage: make user-rm ID=utok_xxx
+user-rm: ## Delete a user token (ID=utok_xxx).
+	@if [ -z "$(ID)" ]; then echo "usage: make user-rm ID=utok_xxx"; exit 2; fi
+	$(RUN) users rm "$(ID)" --db $(DB)
+
+# usage: make user-refresh ID=utok_xxx
+user-refresh: ## Rotate a user's bearer token (ID=utok_xxx).
+	@if [ -z "$(ID)" ]; then echo "usage: make user-refresh ID=utok_xxx"; exit 2; fi
+	$(RUN) users refresh "$(ID)" --db $(DB)
+
 ##@ Credential backup / restore
 
 export-credentials: ## Dump all credentials as JSONL to stdout.  Usage: make export-credentials > backup.jsonl
@@ -234,5 +269,6 @@ distclean: clean ## clean + remove built image and .env.
 .PHONY: help env token rotate-token fix-perms build pull up down restart logs logs-traefik tls-info ps lint lint-install \
         import list usage usage-history disable rm refresh weight \
         export-credentials import-credentials \
+        user-create user-list user-token user-disable user-enable user-rm user-refresh \
         health credentials conversations stats \
         test clean distclean
