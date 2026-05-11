@@ -205,6 +205,10 @@ user-create: ## Create a user token (NAME=alice).
 user-list: ## List all user tokens.
 	$(RUN) users list --db $(DB)
 
+# usage: make user-stats [ID=utok_xxx] [PERIOD=24h]
+user-stats: ## Show per-user request stats (optional ID=utok_xxx PERIOD=1h|6h|24h|7d|30d).
+	$(RUN) users stats $(if $(ID),"$(ID)",) $(if $(PERIOD),--period $(PERIOD),) --db $(DB)
+
 # usage: make user-token ID=utok_xxx
 user-token: ## Print the bearer token for a user (ID=utok_xxx).
 	@if [ -z "$(ID)" ]; then echo "usage: make user-token ID=utok_xxx"; exit 2; fi
@@ -269,6 +273,6 @@ distclean: clean ## clean + remove built image and .env.
 .PHONY: help env token rotate-token fix-perms build pull up down restart logs logs-traefik tls-info ps lint lint-install \
         import list usage usage-history disable rm refresh weight \
         export-credentials import-credentials \
-        user-create user-list user-token user-disable user-enable user-rm user-refresh \
+        user-create user-list user-stats user-token user-disable user-enable user-rm user-refresh \
         health credentials conversations stats \
         test clean distclean

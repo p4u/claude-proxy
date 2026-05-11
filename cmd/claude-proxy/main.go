@@ -34,13 +34,14 @@ const helpText = `claude-proxy — sticky multi-subscription proxy for Claude Co
 
 Usage:
   claude-proxy serve [flags]
-  claude-proxy users create        --name NAME [--db PATH]
-  claude-proxy users list          [--db PATH]
-  claude-proxy users token <id>    [--db PATH]
-  claude-proxy users disable <id>  [--db PATH]
-  claude-proxy users enable <id>   [--db PATH]
-  claude-proxy users rm <id>       [--db PATH]
-  claude-proxy users refresh <id>  [--db PATH]
+  claude-proxy users create           --name NAME [--db PATH]
+  claude-proxy users list             [--db PATH]
+  claude-proxy users stats [<id>]     [--period 1h|6h|24h|7d|30d] [--db PATH]
+  claude-proxy users token <id>       [--db PATH]
+  claude-proxy users disable <id>     [--db PATH]
+  claude-proxy users enable <id>      [--db PATH]
+  claude-proxy users rm <id>          [--db PATH]
+  claude-proxy users refresh <id>     [--db PATH]
   claude-proxy creds import        --from FILE [--label NAME] [--weight N]
   claude-proxy creds export        [--db PATH]   # JSONL to stdout
   claude-proxy creds import-bulk   [--db PATH]   # JSONL from stdin
@@ -624,7 +625,7 @@ func printUsageBucket(label string, b *usage.Bucket) {
 
 func runUsers(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "users: missing subcommand (create|list|token|disable|enable|rm|refresh)")
+		fmt.Fprintln(os.Stderr, "users: missing subcommand (create|list|stats|token|disable|enable|rm|refresh)")
 		os.Exit(2)
 	}
 	ctx := context.Background()
@@ -633,6 +634,8 @@ func runUsers(args []string) {
 		usersCreate(ctx, args[1:])
 	case "list":
 		usersList(ctx, args[1:])
+	case "stats":
+		usersStats(ctx, args[1:])
 	case "token":
 		usersToken(ctx, args[1:])
 	case "disable":
@@ -692,6 +695,100 @@ func usersList(ctx context.Context, args []string) {
 		fmt.Printf("%-22s  %-20s  %-8s  %-25s  %s\n",
 			ut.ID, ut.Name, string(ut.Status),
 			ut.CreatedAt.Format(time.RFC3339), lastUsed)
+	}
+}
+
+func usersStats(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("users stats", flag.ExitOnError)
+	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
+	period := fs.String("period", "24h", "time window: 1h, 6h, 24h, 7d, 30d")
+	_ = fs.Parse(args)
+
+	dur, err := usage.ParsePeriod(*period)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	since := time.Now().Add(-dur).Unix()
+
+	db := openDB(*dbPath)
+	defer db.Close()
+
+	// Optional: filter to a single user token (positional arg).
+	filterID := ""
+	if fs.NArg() > 0 {
+		filterID = fs.Arg(0)
+	}
+
+	list, err := usertoken.List(ctx, db)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "list: %v\n", err)
+		os.Exit(1)
+	}
+
+	type row struct {
+		Requests   int64
+		OK         int64
+		Errors     int64
+		BytesSent  int64
+		BytesRecv  int64
+		LatencySum int64
+		Convs      int64
+	}
+
+	fmt.Printf("Period: last %s\n\n", *period)
+	fmt.Printf("%-22s  %-20s  %8s  %6s  %6s  %10s  %10s  %9s  %6s\n",
+		"ID", "NAME", "REQUESTS", "OK", "ERR", "SENT", "RECEIVED", "AVG_LAT", "CONVS")
+
+	printed := 0
+	for _, ut := range list {
+		if filterID != "" && ut.ID != filterID {
+			continue
+		}
+		var r row
+		err := db.QueryRowContext(ctx, `
+			SELECT
+				COUNT(*),
+				SUM(CASE WHEN status_code=200 THEN 1 ELSE 0 END),
+				SUM(CASE WHEN status_code>=400 OR status_code=-1 THEN 1 ELSE 0 END),
+				COALESCE(SUM(bytes_sent),0),
+				COALESCE(SUM(bytes_received),0),
+				COALESCE(SUM(latency_ms),0),
+				COUNT(DISTINCT CASE WHEN conv_id!='' THEN conv_id END)
+			FROM request_log
+			WHERE user_token_id=? AND ts>=?`, ut.ID, since).
+			Scan(&r.Requests, &r.OK, &r.Errors, &r.BytesSent, &r.BytesRecv, &r.LatencySum, &r.Convs)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "query %s: %v\n", ut.ID, err)
+			continue
+		}
+		avgLat := "-"
+		if r.Requests > 0 {
+			avgLat = fmt.Sprintf("%dms", r.LatencySum/r.Requests)
+		}
+		fmt.Printf("%-22s  %-20s  %8d  %6d  %6d  %10s  %10s  %9s  %6d\n",
+			ut.ID, ut.Name,
+			r.Requests, r.OK, r.Errors,
+			fmtBytes(r.BytesSent), fmtBytes(r.BytesRecv),
+			avgLat, r.Convs)
+		printed++
+	}
+	if printed == 0 && filterID != "" {
+		fmt.Fprintf(os.Stderr, "no user token with id %q\n", filterID)
+		os.Exit(1)
+	}
+}
+
+func fmtBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.1fG", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1fM", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1fK", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%dB", n)
 	}
 }
 
