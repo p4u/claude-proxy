@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -14,8 +15,6 @@ import (
 	"strings"
 	"syscall"
 	"time"
-
-	"log/slog"
 
 	"github.com/p4u/claude-proxy/internal/admin"
 	"github.com/p4u/claude-proxy/internal/agent"

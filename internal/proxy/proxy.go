@@ -237,7 +237,8 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 		return -1, 0
 	}
 
-	h.log.Debug("upstream resp",
+	h.log.Debug(
+		"upstream resp",
 		"cred", cred.ID, "label", cred.Label, "status", resp.StatusCode,
 		"req_id", resp.Header.Get("Request-Id"),
 		"rl_tokens_remaining", resp.Header.Get("Anthropic-Ratelimit-Tokens-Remaining"),
@@ -276,7 +277,8 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 		}
 		_ = creds.MarkLimited(r.Context(), h.db, cred.ID, retryAt)
 		_ = creds.MarkError(r.Context(), h.db, cred.ID)
-		h.log.Warn("upstream 429; marked credential limited",
+		h.log.Warn(
+			"upstream 429; marked credential limited",
 			"cred", cred.ID,
 			"retry_in", retryIn.String(),
 			"retry_after", retryAt.Format(time.RFC3339),

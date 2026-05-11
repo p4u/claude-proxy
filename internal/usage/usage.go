@@ -33,11 +33,11 @@ type Response struct {
 
 // Snapshot is one stored measurement for a credential.
 type Snapshot struct {
-	CredentialID       string
-	CapturedAt         time.Time
-	FiveHourPct        float64
-	SevenDayPct        float64
-	SevenDaySonnetPct  float64
+	CredentialID      string
+	CapturedAt        time.Time
+	FiveHourPct       float64
+	SevenDayPct       float64
+	SevenDaySonnetPct float64
 }
 
 // Fetch calls GET https://api.anthropic.com/api/oauth/usage for one access token.

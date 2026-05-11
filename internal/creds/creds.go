@@ -80,7 +80,8 @@ func Insert(ctx context.Context, db *store.DB, label, subType, access, refresh s
 		Weight:           weight,
 		CreatedAt:        time.Now(),
 	}
-	_, err := db.ExecContext(ctx, `
+	_, err := db.ExecContext(
+		ctx, `
 		INSERT INTO credentials (id, label, subscription_type, access_token, refresh_token, expires_at, status, weight, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		c.ID, c.Label, c.SubscriptionType, c.AccessToken, c.RefreshToken, c.ExpiresAt.Unix(), string(c.Status), c.Weight, c.CreatedAt.Unix(),
@@ -114,7 +115,8 @@ const credSelectCols = `id, COALESCE(label,''), COALESCE(subscription_type,''),
 
 func scanCred(rs interface {
 	Scan(...any) error
-}) (*Credential, error) {
+},
+) (*Credential, error) {
 	c := &Credential{}
 	var exp, created int64
 	var ra, ls, l429, lreq sql.NullInt64
@@ -170,7 +172,8 @@ func List(ctx context.Context, db *store.DB) ([]*Credential, error) {
 // given refresh token. Used during import to detect duplicates.
 func HasRefreshToken(ctx context.Context, db *store.DB, refreshToken string) (bool, error) {
 	var n int
-	err := db.QueryRowContext(ctx,
+	err := db.QueryRowContext(
+		ctx,
 		`SELECT COUNT(*) FROM credentials WHERE refresh_token=?`, refreshToken,
 	).Scan(&n)
 	return n > 0, err
