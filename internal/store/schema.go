@@ -43,4 +43,12 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
   num_turns        INTEGER NOT NULL DEFAULT 0,
   total_cost_usd   REAL    NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS users (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  name         TEXT    NOT NULL UNIQUE,
+  token_sha256 TEXT    NOT NULL UNIQUE,
+  created_at   INTEGER NOT NULL,
+  last_used_at INTEGER
+);
 `

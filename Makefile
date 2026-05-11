@@ -38,7 +38,7 @@ endif
 help: ## Show this help.
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) }' $(MAKEFILE_LIST)
 
-env: ## Create or upgrade .env: sync UID/GID to host shell, add missing auth token.
+env: ## Create or upgrade .env: sync UID/GID to host shell.
 	@mkdir -p data creds data/letsencrypt
 	@if [ ! -f $(ENV_FILE) ]; then cp .env.example $(ENV_FILE); echo "wrote fresh $(ENV_FILE)"; fi
 	@HOST_UID=$$(id -u); HOST_GID=$$(id -g); \
@@ -49,23 +49,6 @@ env: ## Create or upgrade .env: sync UID/GID to host shell, add missing auth tok
 		sed -i.bak "s|^PROXY_GID=.*|PROXY_GID=$$HOST_GID|" $(ENV_FILE); \
 	 else echo "PROXY_GID=$$HOST_GID" >> $(ENV_FILE); fi; \
 	 rm -f $(ENV_FILE).bak
-	@if ! grep -q '^PROXY_AUTH_TOKEN=..*' $(ENV_FILE); then \
-		TOKEN=$$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | xxd -p -c 256); \
-		if grep -q '^PROXY_AUTH_TOKEN=' $(ENV_FILE); then \
-			sed -i.bak "s|^PROXY_AUTH_TOKEN=.*|PROXY_AUTH_TOKEN=$$TOKEN|" $(ENV_FILE) && rm -f $(ENV_FILE).bak; \
-		else \
-			echo "PROXY_AUTH_TOKEN=$$TOKEN" >> $(ENV_FILE); \
-		fi; \
-		echo "added PROXY_AUTH_TOKEN to $(ENV_FILE)"; \
-	fi
-
-token: ## Print the configured PROXY_AUTH_TOKEN (for setting ANTHROPIC_AUTH_TOKEN on clients).
-	@if [ ! -f $(ENV_FILE) ]; then echo "no $(ENV_FILE) yet — run 'make env'" >&2; exit 1; fi
-	@T=$$(grep -E '^PROXY_AUTH_TOKEN=' $(ENV_FILE) | tail -n1 | cut -d= -f2-); \
-	 if [ -z "$$T" ]; then \
-		echo "PROXY_AUTH_TOKEN is empty in $(ENV_FILE) — run 'make env' to generate one" >&2; exit 1; \
-	 fi; \
-	 echo "$$T"
 
 fix-perms: ## chown ./data and ./creds to PROXY_UID:PROXY_GID (your host UID).
 	@WANT="$$(id -u):$$(id -g)"; \
@@ -78,16 +61,6 @@ fix-perms: ## chown ./data and ./creds to PROXY_UID:PROXY_GID (your host UID).
 			echo "chowned $$d -> $$WANT"; \
 		fi; \
 	 done
-
-rotate-token: ## Generate a new PROXY_AUTH_TOKEN, write to .env, recreate the container.
-	@TOKEN=$$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | xxd -p -c 256); \
-	 if grep -q '^PROXY_AUTH_TOKEN=' $(ENV_FILE); then \
-		sed -i.bak "s|^PROXY_AUTH_TOKEN=.*|PROXY_AUTH_TOKEN=$$TOKEN|" $(ENV_FILE) && rm -f $(ENV_FILE).bak; \
-	 else \
-		echo "PROXY_AUTH_TOKEN=$$TOKEN" >> $(ENV_FILE); \
-	 fi; \
-	 echo "rotated to $$TOKEN"
-	@$(DC) up -d --force-recreate $(SERVICE) 2>/dev/null || true
 
 build: env ## Build the docker image locally (only needed for source-tree dev).
 	$(DC) build
@@ -175,20 +148,19 @@ weight: ## Set RR weight (ID=cred_xxx W=N).
 
 ##@ Inspection (curl the running service)
 
-# Read PROXY_AUTH_TOKEN from .env; pass as Bearer header when non-empty.
-_TOKEN := $(shell grep -E '^PROXY_AUTH_TOKEN=.+' $(ENV_FILE) 2>/dev/null | tail -n1 | cut -d= -f2-)
-_AUTH  := $(if $(_TOKEN),-H "Authorization: Bearer $(_TOKEN)",)
+# Pass your bearer token via: make credentials TOKEN=cp_...
+_AUTH := $(if $(TOKEN),-H "Authorization: Bearer $(TOKEN)",)
 
 health: ## GET /health.
 	@curl -sf $(BASE)/health && echo
 
-credentials: ## GET /admin/credentials (running service).
+credentials: ## GET /admin/credentials (TOKEN=cp_... required).
 	@curl -s $(_AUTH) $(BASE)/admin/credentials
 
-conversations: ## GET /admin/conversations.
+conversations: ## GET /admin/conversations (TOKEN=cp_... required).
 	@curl -s $(_AUTH) $(BASE)/admin/conversations
 
-stats: ## GET /admin/stats.
+stats: ## GET /admin/stats (TOKEN=cp_... required).
 	@curl -s $(_AUTH) $(BASE)/admin/stats
 
 ##@ Credential backup / restore
@@ -227,7 +199,7 @@ distclean: clean ## clean + remove built image and .env.
 	-docker rmi claude-proxy:latest
 	rm -f $(ENV_FILE)
 
-.PHONY: help env token rotate-token fix-perms build pull up down restart logs logs-traefik tls-info ps lint lint-install \
+.PHONY: help env fix-perms build pull up down restart logs logs-traefik tls-info ps lint lint-install \
         import list usage disable rm refresh weight \
         export-credentials import-credentials \
         health credentials conversations stats \

@@ -14,8 +14,6 @@ services:
     env_file:
       - .env
     environment:
-      # Auth token — read by the binary at startup. Empty disables auth.
-      CLAUDE_PROXY_AUTH_TOKEN: "${PROXY_AUTH_TOKEN:-}"
       # Agent bridge — only used when claude CLI is present in the image.
       ENABLE_API_BRIDGE: "${ENABLE_API_BRIDGE:-true}"
       AGENT_IDLE_TTL: "${AGENT_IDLE_TTL:-10m}"

@@ -27,12 +27,16 @@ import (
 	"github.com/p4u/claude-proxy/internal/prettylog"
 	"github.com/p4u/claude-proxy/internal/proxy"
 	"github.com/p4u/claude-proxy/internal/store"
+	"github.com/p4u/claude-proxy/internal/users"
 )
 
 const usage = `claude-proxy — sticky multi-subscription proxy for Claude Code
 
 Usage:
   claude-proxy serve [flags]
+  claude-proxy users add <name>    [--db PATH]
+  claude-proxy users list          [--db PATH]
+  claude-proxy users revoke <name-or-id> [--db PATH]
   claude-proxy creds import        --from FILE [--label NAME] [--weight N]
   claude-proxy creds export        [--db PATH]   # JSONL to stdout
   claude-proxy creds import-bulk   [--db PATH]   # JSONL from stdin
@@ -56,6 +60,8 @@ func main() {
 		runServe(os.Args[2:])
 	case "creds":
 		runCreds(os.Args[2:])
+	case "users":
+		runUsers(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	default:
@@ -95,8 +101,6 @@ func runServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := fs.String("addr", ":8787", "listen address")
 	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
-	authToken := fs.String("auth-token", os.Getenv("CLAUDE_PROXY_AUTH_TOKEN"),
-		"shared bearer token (env CLAUDE_PROXY_AUTH_TOKEN). empty disables auth.")
 	_ = fs.String("on-limited", "passthrough", "behavior when pinned credential is limited")
 	logLevel := fs.String("log-level", "info", "log level: debug|info|warn|error")
 	logFormat := fs.String("log-format", "auto", "log format: auto|pretty|text|json")
@@ -141,6 +145,11 @@ func runServe(args []string) {
 		"path to claude binary (default: auto-detect from PATH; env AGENT_CLAUDE_BIN)")
 	agentBaseURL := fs.String("agent-base-url", os.Getenv("AGENT_CLAUDE_BASE_URL"),
 		"ANTHROPIC_BASE_URL for agent self-loop (default: http://<listen-addr>; env AGENT_CLAUDE_BASE_URL)")
+
+	// Token the agent bridge subprocess uses to authenticate its self-loop calls
+	// back to the proxy. Create one with: claude-proxy users add <name>
+	agentAuthToken := fs.String("agent-auth-token", os.Getenv("AGENT_AUTH_TOKEN"),
+		"bearer token for the agent bridge self-loop (env AGENT_AUTH_TOKEN); create with: users add <name>")
 
 	_ = fs.Parse(args)
 
@@ -198,12 +207,17 @@ func runServe(args []string) {
 	p := pool.New(db)
 	go p.Janitor(ctx)
 
+	usersStore := users.NewStore(db)
+	authMW := func(h http.Handler) http.Handler {
+		return users.Middleware(usersStore, h)
+	}
+
 	proxyH := proxy.New(db, p, r, logger)
 	adminH := admin.New(db)
 
 	mux := http.NewServeMux()
-	mux.Handle("/v1/", proxyH)
-	mux.Handle("/admin/", adminH)
+	mux.Handle("/v1/", authMW(proxyH))
+	mux.Handle("/admin/", authMW(adminH))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
@@ -218,11 +232,11 @@ func runServe(args []string) {
 		if claudeBin == "" {
 			logger.Warn("claude binary not found on PATH; /api endpoints will return 503. " +
 				"Install @anthropic-ai/claude-code or set --agent-claude-bin.")
-			mux.HandleFunc("/api/", func(w http.ResponseWriter, _ *http.Request) {
+			mux.Handle("/api/", authMW(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				http.Error(w,
 					`{"type":"error","error":{"type":"api_error","message":"claude binary not found; agent disabled"}}`,
 					http.StatusServiceUnavailable)
-			})
+			})))
 		} else {
 			baseURL := *agentBaseURL
 			if baseURL == "" {
@@ -242,7 +256,7 @@ func runServe(args []string) {
 			agentCfg := agent.SessionConfig{
 				ClaudeBin:    claudeBin,
 				BaseURL:      baseURL,
-				AuthToken:    *authToken,
+				AuthToken:    *agentAuthToken,
 				AllowedTools: allowedTools,
 				WorkDir:      *agentWorkdir,
 			}
@@ -250,7 +264,7 @@ func runServe(args []string) {
 			go mgr.Janitor(ctx)
 
 			bridgeH := bridge.New(mgr, proxyH, db, logger)
-			mux.Handle("/api/", bridgeH)
+			mux.Handle("/api/", authMW(bridgeH))
 
 			logger.Info("agent bridge enabled",
 				"claude", claudeBin,
@@ -261,15 +275,11 @@ func runServe(args []string) {
 		}
 	}
 
-	if *authToken != "" {
-		logger.Info("downstream auth enabled (Authorization: Bearer / x-api-key)")
-	} else {
-		logger.Warn("downstream auth disabled — anyone reaching this proxy can use your credentials")
-	}
+	logger.Info("per-user auth enabled — manage users with 'claude-proxy users add|list|revoke'")
 
 	srv := &http.Server{
 		Addr:    *addr,
-		Handler: proxy.AuthMiddleware(*authToken, mux),
+		Handler: mux,
 	}
 	go func() {
 		<-ctx.Done()
@@ -284,6 +294,99 @@ func runServe(args []string) {
 		os.Exit(1)
 	}
 }
+
+// --- users subcommand ---
+
+func runUsers(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "users: missing subcommand (add|list|revoke)")
+		os.Exit(2)
+	}
+	ctx := context.Background()
+	switch args[0] {
+	case "add":
+		usersAdd(ctx, args[1:])
+	case "list":
+		usersList(ctx, args[1:])
+	case "revoke":
+		usersRevoke(ctx, args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "users: unknown subcommand %q\n", args[0])
+		os.Exit(2)
+	}
+}
+
+func usersAdd(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("users add", flag.ExitOnError)
+	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
+	_ = fs.Parse(args)
+	if fs.NArg() < 1 || strings.TrimSpace(fs.Arg(0)) == "" {
+		fmt.Fprintln(os.Stderr, "users add <name> [--db PATH]")
+		os.Exit(2)
+	}
+	name := strings.TrimSpace(fs.Arg(0))
+	db := openDB(*dbPath)
+	defer db.Close()
+	s := users.NewStore(db)
+	u, raw, err := s.Create(ctx, name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "users add: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("token: %s\n", raw)
+	fmt.Fprintf(os.Stderr, "user %q created (id=%d) — save this token, it will not be shown again\n", u.Name, u.ID)
+}
+
+func usersList(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("users list", flag.ExitOnError)
+	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
+	_ = fs.Parse(args)
+	db := openDB(*dbPath)
+	defer db.Close()
+	s := users.NewStore(db)
+	list, err := s.List(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "users list: %v\n", err)
+		os.Exit(1)
+	}
+	if len(list) == 0 {
+		fmt.Println("(no users)")
+		return
+	}
+	fmt.Printf("%-5s  %-20s  %-25s  %-25s  %s\n",
+		"ID", "NAME", "CREATED_AT", "LAST_USED_AT", "TOKEN_FP")
+	for _, u := range list {
+		lastUsed := "-"
+		if !u.LastUsedAt.IsZero() {
+			lastUsed = u.LastUsedAt.Format(time.RFC3339)
+		}
+		fmt.Printf("%-5d  %-20s  %-25s  %-25s  %s\n",
+			u.ID, u.Name,
+			u.CreatedAt.Format(time.RFC3339),
+			lastUsed,
+			users.TokenFingerprint(u.TokenSHA256))
+	}
+}
+
+func usersRevoke(ctx context.Context, args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "users revoke <name-or-id> [--db PATH]")
+		os.Exit(2)
+	}
+	fs := flag.NewFlagSet("users revoke", flag.ExitOnError)
+	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
+	_ = fs.Parse(args[1:])
+	db := openDB(*dbPath)
+	defer db.Close()
+	s := users.NewStore(db)
+	if err := s.Revoke(ctx, args[0]); err != nil {
+		fmt.Fprintf(os.Stderr, "users revoke: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("revoked", args[0])
+}
+
+// --- creds subcommand ---
 
 func runCreds(args []string) {
 	if len(args) == 0 {
