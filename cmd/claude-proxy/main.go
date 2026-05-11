@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -27,9 +26,10 @@ import (
 	"github.com/p4u/claude-proxy/internal/prettylog"
 	"github.com/p4u/claude-proxy/internal/proxy"
 	"github.com/p4u/claude-proxy/internal/store"
+	"github.com/p4u/claude-proxy/internal/usage"
 )
 
-const usage = `claude-proxy — sticky multi-subscription proxy for Claude Code
+const helpText = `claude-proxy — sticky multi-subscription proxy for Claude Code
 
 Usage:
   claude-proxy serve [flags]
@@ -38,6 +38,7 @@ Usage:
   claude-proxy creds import-bulk   [--db PATH]   # JSONL from stdin
   claude-proxy creds list
   claude-proxy creds usage [<id>]
+  claude-proxy creds usage-history [--period 1h|6h|24h|7d|30d] [<id>]
   claude-proxy creds disable <id>
   claude-proxy creds rm <id>
   claude-proxy creds refresh <id>
@@ -48,7 +49,7 @@ Run 'claude-proxy <cmd> -h' for flags.
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprint(os.Stderr, usage)
+		fmt.Fprint(os.Stderr, helpText)
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -57,9 +58,9 @@ func main() {
 	case "creds":
 		runCreds(os.Args[2:])
 	case "-h", "--help", "help":
-		fmt.Print(usage)
+		fmt.Print(helpText)
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n%s", os.Args[1], usage)
+		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n%s", os.Args[1], helpText)
 		os.Exit(2)
 	}
 }
@@ -198,6 +199,8 @@ func runServe(args []string) {
 	p := pool.New(db)
 	go p.Janitor(ctx)
 
+	go usage.NewPoller(db, logger).Loop(ctx)
+
 	proxyH := proxy.New(db, p, r, logger)
 	adminH := admin.New(db)
 
@@ -287,7 +290,7 @@ func runServe(args []string) {
 
 func runCreds(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "creds: missing subcommand (import|export|import-bulk|list|usage|disable|rm|refresh|set-weight)")
+		fmt.Fprintln(os.Stderr, "creds: missing subcommand (import|export|import-bulk|list|usage|usage-history|disable|rm|refresh|set-weight)")
 		os.Exit(2)
 	}
 	ctx := context.Background()
@@ -302,6 +305,8 @@ func runCreds(args []string) {
 		credsList(ctx, args[1:])
 	case "usage":
 		credsUsage(ctx, args[1:])
+	case "usage-history":
+		credsUsageHistory(ctx, args[1:])
 	case "disable":
 		credsDisable(ctx, args[1:])
 	case "rm":
@@ -550,8 +555,7 @@ func credsImportBulk(ctx context.Context, args []string) {
 	fmt.Printf("imported %d credential(s)\n", n)
 }
 
-// credsUsage fetches the 5-hour and 7-day usage percentages from Anthropic's
-// undocumented OAuth usage endpoint for each credential (or a single one).
+// credsUsage fetches live usage from Anthropic for each credential (or one).
 func credsUsage(ctx context.Context, args []string) {
 	fs := flag.NewFlagSet("creds usage", flag.ExitOnError)
 	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
@@ -564,8 +568,6 @@ func credsUsage(ctx context.Context, args []string) {
 		fmt.Fprintf(os.Stderr, "list: %v\n", err)
 		os.Exit(1)
 	}
-
-	// Filter to a single credential if an ID was given as a positional arg.
 	if fs.NArg() > 0 {
 		id := fs.Arg(0)
 		var filtered []*creds.Credential
@@ -583,7 +585,7 @@ func credsUsage(ctx context.Context, args []string) {
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	for _, c := range list {
-		u, fetchErr := fetchUsage(ctx, client, c.AccessToken)
+		u, fetchErr := usage.Fetch(ctx, client, c.AccessToken)
 		fmt.Printf("%s  %s  [%s]\n", c.ID, c.Label, string(c.Status))
 		if fetchErr != nil {
 			fmt.Printf("  error: %s\n", fetchErr.Error())
@@ -597,19 +599,7 @@ func credsUsage(ctx context.Context, args []string) {
 	}
 }
 
-type usageBucket struct {
-	Utilization *float64 `json:"utilization"`
-	ResetsAt    *string  `json:"resets_at"`
-}
-
-type usageResponse struct {
-	FiveHour       usageBucket  `json:"five_hour"`
-	SevenDay       usageBucket  `json:"seven_day"`
-	SevenDayOpus   *usageBucket `json:"seven_day_opus"`
-	SevenDaySonnet *usageBucket `json:"seven_day_sonnet"`
-}
-
-func printUsageBucket(label string, b *usageBucket) {
+func printUsageBucket(label string, b *usage.Bucket) {
 	if b == nil || b.Utilization == nil {
 		return
 	}
@@ -622,33 +612,53 @@ func printUsageBucket(label string, b *usageBucket) {
 	fmt.Printf("%s  %5.1f%%%s\n", label, *b.Utilization, resets)
 }
 
-// fetchUsage calls GET https://api.anthropic.com/api/oauth/usage.
-func fetchUsage(ctx context.Context, client *http.Client, accessToken string) (*usageResponse, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		"https://api.anthropic.com/api/oauth/usage", nil)
+// credsUsageHistory renders terminal charts from stored usage snapshots.
+func credsUsageHistory(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("creds usage-history", flag.ExitOnError)
+	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
+	period := fs.String("period", "24h", "time window: 1h, 6h, 24h, 7d, 30d")
+	_ = fs.Parse(args)
+
+	dur, err := usage.ParsePeriod(*period)
 	if err != nil {
-		return nil, err
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
 	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
 
-	resp, err := client.Do(req)
+	db := openDB(*dbPath)
+	defer db.Close()
+
+	since := time.Now().Add(-dur)
+
+	list, err := creds.List(ctx, db)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, fmt.Errorf("rate limited (429)")
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		fmt.Fprintf(os.Stderr, "list: %v\n", err)
+		os.Exit(1)
 	}
 
-	var result usageResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("parse response: %w", err)
+	// Optional: filter to a single credential.
+	if fs.NArg() > 0 {
+		id := fs.Arg(0)
+		var filtered []*creds.Credential
+		for _, c := range list {
+			if c.ID == id {
+				filtered = append(filtered, c)
+			}
+		}
+		if len(filtered) == 0 {
+			fmt.Fprintf(os.Stderr, "no credential with id %q\n", id)
+			os.Exit(1)
+		}
+		list = filtered
 	}
-	return &result, nil
+
+	for _, c := range list {
+		snaps, err := usage.History(ctx, db, c.ID, since)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "history %s: %v\n", c.ID, err)
+			continue
+		}
+		fmt.Printf("%s  %s  [%s]\n", c.ID, c.Label, string(c.Status))
+		fmt.Println(usage.Chart(snaps, c.Label, *period))
+	}
 }

@@ -150,8 +150,12 @@ list: ## List all credentials in the pool.
 	$(RUN) creds list --db $(DB)
 
 # usage: make usage [ID=cred_xxx]
-usage: ## Show 5h/7d usage % for all credentials (or ID=cred_xxx for one).
+usage: ## Show live 5h/7d usage % for all credentials (or ID=cred_xxx for one).
 	$(RUN) creds usage $(if $(ID),"$(ID)",) --db $(DB)
+
+# usage: make usage-history [PERIOD=24h] [ID=cred_xxx]
+usage-history: ## Chart usage history (PERIOD=1h|6h|24h|7d|30d, optional ID=cred_xxx).
+	$(RUN) creds usage-history $(if $(ID),"$(ID)",) $(if $(PERIOD),--period $(PERIOD),) --db $(DB)
 
 # usage: make disable ID=cred_xxx
 disable: ## Mark a credential disabled (ID=cred_xxx).
@@ -228,7 +232,7 @@ distclean: clean ## clean + remove built image and .env.
 	rm -f $(ENV_FILE)
 
 .PHONY: help env token rotate-token fix-perms build pull up down restart logs logs-traefik tls-info ps lint lint-install \
-        import list usage disable rm refresh weight \
+        import list usage usage-history disable rm refresh weight \
         export-credentials import-credentials \
         health credentials conversations stats \
         test clean distclean

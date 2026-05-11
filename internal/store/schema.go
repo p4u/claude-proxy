@@ -43,4 +43,18 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
   num_turns        INTEGER NOT NULL DEFAULT 0,
   total_cost_usd   REAL    NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS usage_history (
+  id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+  credential_id               TEXT    NOT NULL REFERENCES credentials(id) ON DELETE CASCADE,
+  captured_at                 INTEGER NOT NULL,
+  five_hour_pct               REAL    NOT NULL DEFAULT 0,
+  five_hour_resets_at         INTEGER,
+  seven_day_pct               REAL    NOT NULL DEFAULT 0,
+  seven_day_resets_at         INTEGER,
+  seven_day_sonnet_pct        REAL    NOT NULL DEFAULT 0,
+  seven_day_sonnet_resets_at  INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_usage_history_cred_time
+  ON usage_history(credential_id, captured_at);
 `
