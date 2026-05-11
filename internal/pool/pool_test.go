@@ -144,7 +144,6 @@ func TestAllLimitedFallback(t *testing.T) {
 	}
 }
 
-
 func TestSpreadAcrossTwoCreds(t *testing.T) {
 	dir := t.TempDir()
 	db, err := store.Open(dir + "/t.db")

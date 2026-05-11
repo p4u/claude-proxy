@@ -206,7 +206,7 @@ func runServe(args []string) {
 	r := creds.NewRefresher(db)
 	go r.Loop(ctx)
 
-	p := pool.New(db)
+	p := pool.NewWithLogger(db, logger)
 	go p.Janitor(ctx)
 
 	go usage.NewPoller(db, logger).Loop(ctx)

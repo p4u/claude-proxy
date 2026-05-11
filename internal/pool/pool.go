@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"log/slog"
 	"math"
 	"math/rand"
 	"sync"
@@ -19,11 +21,18 @@ var (
 )
 
 type Pool struct {
-	db *store.DB
-	mu sync.Mutex // guards round-robin cursor + selection atomicity
+	db  *store.DB
+	log *slog.Logger
+	mu  sync.Mutex // guards selection atomicity
 }
 
-func New(db *store.DB) *Pool { return &Pool{db: db} }
+func New(db *store.DB) *Pool {
+	return &Pool{db: db, log: slog.Default()}
+}
+
+func NewWithLogger(db *store.DB, log *slog.Logger) *Pool {
+	return &Pool{db: db, log: log}
+}
 
 // Bind returns the credential to use for this conversation, creating the
 // sticky binding on first sight. It also bumps last_seen_at + request_count.
@@ -122,10 +131,11 @@ func (p *Pool) Bind(ctx context.Context, convID string) (*creds.Credential, bool
 // blend creates a convex penalty that strongly avoids near-saturated
 // credentials without hard-excluding them until they actually hit 100 %.
 //
-// Usage data older than 30 minutes is treated as stale; stale or absent
-// data falls back to weight-only scoring (blend = 1). When all computed
-// scores are zero, the credential with the highest configured weight is
-// chosen so traffic always has somewhere to go.
+// The most recent usage snapshot is always used regardless of age; blend=1
+// (full availability) is the fallback only when no snapshot exists at all
+// (e.g. newly imported credentials). When all computed scores are zero, the
+// credential with the highest configured weight is chosen so traffic always
+// has somewhere to go.
 func (p *Pool) pickActiveLocked(ctx context.Context, tx *sql.Tx) (string, error) {
 	now := time.Now()
 	rows, err := tx.QueryContext(ctx, `
@@ -184,7 +194,7 @@ func (p *Pool) pickActiveLocked(ctx context.Context, tx *sql.Tx) (string, error)
 		return "", ErrNoCredentials
 	}
 
-	return weightedRandPick(ctx, tx, candidates, now)
+	return p.weightedRandPick(ctx, tx, candidates)
 }
 
 type weightedEntry struct {
@@ -192,33 +202,49 @@ type weightedEntry struct {
 	weight int
 }
 
-const usageStaleness = 30 * time.Minute
-
 // weightedRandPick computes a usage-aware effective score for each candidate
 // and returns one chosen by weighted-random selection.
-func weightedRandPick(ctx context.Context, tx *sql.Tx, candidates []weightedEntry, now time.Time) (string, error) {
-	staleThreshold := now.Add(-usageStaleness).Unix()
+//
+// Score formula: weight × blend²   where blend = 0.6×room_5h + 0.4×room_7d
+//
+// The most recent usage snapshot is used regardless of age. blend=1.0 is
+// used only when no snapshot exists for a credential (newly imported).
+func (p *Pool) weightedRandPick(ctx context.Context, tx *sql.Tx, candidates []weightedEntry) (string, error) {
+	type scored struct {
+		id     string
+		weight int
+		fhPct  float64
+		sdPct  float64
+		blend  float64
+		score  float64
+	}
 
-	scores := make([]float64, len(candidates))
+	entries := make([]scored, len(candidates))
 	bestWeight := 0
 	bestIdx := 0
 	for i, e := range candidates {
-		var fhPct, sdPct float64
+		s := scored{id: e.id, weight: e.weight, blend: 1.0}
+
 		var capturedAt int64
 		err := tx.QueryRowContext(ctx, `
 			SELECT five_hour_pct, seven_day_pct, captured_at
 			FROM usage_history
 			WHERE credential_id=?
 			ORDER BY captured_at DESC LIMIT 1`, e.id).
-			Scan(&fhPct, &sdPct, &capturedAt)
+			Scan(&s.fhPct, &s.sdPct, &capturedAt)
 
-		blend := 1.0 // default: full score when data absent or stale
-		if err == nil && capturedAt >= staleThreshold {
-			roomFH := math.Max(0, 1-fhPct/100)
-			roomSD := math.Max(0, 1-sdPct/100)
-			blend = 0.6*roomFH + 0.4*roomSD
+		if err == nil {
+			// Always use the most recent snapshot, regardless of age.
+			// Stale data beats assuming 0% usage: if a cred was at 80%
+			// thirty minutes ago it is likely still near 80%, not 0%.
+			roomFH := math.Max(0, 1-s.fhPct/100)
+			roomSD := math.Max(0, 1-s.sdPct/100)
+			s.blend = 0.6*roomFH + 0.4*roomSD
 		}
-		scores[i] = float64(e.weight) * blend * blend
+		// err == sql.ErrNoRows → no snapshot yet; keep blend=1.0 (bootstrap)
+
+		s.score = float64(e.weight) * s.blend * s.blend
+		entries[i] = s
 
 		if e.weight > bestWeight {
 			bestWeight = e.weight
@@ -227,23 +253,45 @@ func weightedRandPick(ctx context.Context, tx *sql.Tx, candidates []weightedEntr
 	}
 
 	total := 0.0
-	for _, s := range scores {
-		total += s
+	for _, s := range entries {
+		total += s.score
 	}
+
+	// Log scores at debug level so operators can see why a cred was chosen.
+	if p.log.Enabled(ctx, slog.LevelDebug) {
+		for _, s := range entries {
+			pct := 0.0
+			if total > 0 {
+				pct = s.score / total * 100
+			}
+			p.log.Debug(
+				"pool score",
+				"cred", s.id,
+				"weight", s.weight,
+				"fh_pct", s.fhPct,
+				"7d_pct", s.sdPct,
+				"blend", fmt.Sprintf("%.4f", s.blend),
+				"score", fmt.Sprintf("%.4f", s.score),
+				"select_pct", fmt.Sprintf("%.1f", pct),
+			)
+		}
+	}
+
 	if total <= 0 {
-		// All credentials are near 100 % — pick highest configured weight.
+		// All credentials are at 100% on both windows. Pick highest weight
+		// so traffic still has a destination (will likely get a real 429).
 		return candidates[bestIdx].id, nil
 	}
 
 	r := rand.Float64() * total
 	cumulative := 0.0
-	for i, s := range scores {
-		cumulative += s
+	for _, s := range entries {
+		cumulative += s.score
 		if r < cumulative {
-			return candidates[i].id, nil
+			return s.id, nil
 		}
 	}
-	return candidates[len(candidates)-1].id, nil
+	return entries[len(entries)-1].id, nil
 }
 
 func getCredTx(ctx context.Context, tx *sql.Tx, id string) (*creds.Credential, error) {
