@@ -1,8 +1,6 @@
 # syntax=docker/dockerfile:1.7
 #
-# Full image: Go proxy + Node.js runtime + claude CLI.
-# Use this when you want the /api bridge endpoint (agent mode).
-# See Dockerfile.proxy-only for a pure-forwarder image without Node/claude.
+# Pure credential-forwarding proxy. Small static image (~10 MB) on distroless.
 
 FROM golang:1.26-alpine AS build
 WORKDIR /src
@@ -16,26 +14,15 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
         -o /out/claude-proxy ./cmd/claude-proxy
 
-FROM node:22-bookworm-slim AS runtime
-
-# Install system deps and claude CLI in one layer.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates tini \
- && rm -rf /var/lib/apt/lists/* \
- && npm install -g @anthropic-ai/claude-code@latest \
- && useradd -u 65532 -m -s /bin/sh claude
-
+FROM gcr.io/distroless/static-debian12:nonroot
+WORKDIR /app
 COPY --from=build /out/claude-proxy /usr/local/bin/claude-proxy
 
 # /data holds proxy.db (sticky bindings, credentials)
 # /creds is where the operator mounts .credentials.json files for import
-# /home/claude/.claude persists claude CLI session state across container restarts
 VOLUME ["/data"]
 
 EXPOSE 8787
 
-USER claude
-WORKDIR /home/claude
-
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/claude-proxy"]
+ENTRYPOINT ["/usr/local/bin/claude-proxy"]
 CMD ["serve", "--addr", "0.0.0.0:8787", "--db", "/data/proxy.db"]

@@ -228,9 +228,9 @@ func TestUsageAwareScoring(t *testing.T) {
 		   seven_day_pct, seven_day_resets_at, seven_day_sonnet_pct, seven_day_sonnet_resets_at)
 		VALUES (?, ?, 5.0, NULL, 5.0, NULL, 0.0, NULL)`, fresh.ID, now)
 
-	// "fresh" score = 1 × (0.6×0.95 + 0.4×0.95)² = 1 × 0.95² ≈ 0.9025
-	// "busy"  score = 1 × (0.6×0.10 + 0.4×0.10)² = 1 × 0.10² = 0.01
-	// Expected selection ratio ≈ 99:1 in favour of "fresh".
+	// "fresh" score = 1 × 0.95 × 0.95^1.5 ≈ 0.880
+	// "busy"  score = 1 × 0.10 × 0.10^1.5 ≈ 0.00316
+	// Expected selection ratio ≈ 278:1 in favour of "fresh".
 
 	p := New(db)
 	const N = 200
@@ -248,6 +248,131 @@ func TestUsageAwareScoring(t *testing.T) {
 	if freshPct < 80 {
 		t.Fatalf("usage-aware scoring failed: fresh=%.1f%% (want ≥80%%) busy=%.1f%%",
 			freshPct, float64(count[busy.ID])/N*100)
+	}
+}
+
+// TestSevenDayExhaustedAvoided guards the bottleneck fix: a credential whose
+// weekly quota is spent (7d=100%) must not be picked just because its 5h
+// window looks free. The old additive blend scored it 0.6×room_5h and kept
+// routing to it; the multiplicative model drives its headroom to zero.
+func TestSevenDayExhaustedAvoided(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(dir + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	exhausted, _ := creds.Insert(ctx, db, "exhausted", "max", "sk-ant-oat-e", "rt-e", time.Now().Add(time.Hour), 5)
+	healthy, _ := creds.Insert(ctx, db, "healthy", "pro", "sk-ant-oat-h", "rt-h", time.Now().Add(time.Hour), 1)
+
+	now := time.Now().Unix()
+	// "exhausted": 5h wide open but 7-day quota fully spent. Higher weight too,
+	// so the old additive model would have strongly preferred it.
+	_, _ = db.ExecContext(ctx, `
+		INSERT INTO usage_history
+		  (credential_id, captured_at, five_hour_pct, five_hour_resets_at,
+		   seven_day_pct, seven_day_resets_at, seven_day_sonnet_pct, seven_day_sonnet_resets_at)
+		VALUES (?, ?, 0.0, NULL, 100.0, NULL, 0.0, NULL)`, exhausted.ID, now)
+	// "healthy": balanced, modest usage, lower weight.
+	_, _ = db.ExecContext(ctx, `
+		INSERT INTO usage_history
+		  (credential_id, captured_at, five_hour_pct, five_hour_resets_at,
+		   seven_day_pct, seven_day_resets_at, seven_day_sonnet_pct, seven_day_sonnet_resets_at)
+		VALUES (?, ?, 40.0, NULL, 40.0, NULL, 0.0, NULL)`, healthy.ID, now)
+
+	p := New(db)
+	const N = 200
+	count := map[string]int{}
+	for i := range N {
+		c, _, err := p.Bind(ctx, fmt.Sprintf("e-%d", i))
+		if err != nil {
+			t.Fatalf("bind %d: %v", i, err)
+		}
+		count[c.ID]++
+	}
+
+	// The 7d-exhausted cred has headroom 0 → score 0 → must never win, despite
+	// its open 5h window and higher weight.
+	if count[exhausted.ID] > N/20 {
+		t.Fatalf("7d-exhausted credential picked %d/%d times (want ~0); healthy=%d",
+			count[exhausted.ID], N, count[healthy.ID])
+	}
+}
+
+// TestSaturatedCredsHardExcluded verifies the ≥100% cutoff: a credential maxed
+// on EITHER window is never selected for a new conversation, even with the
+// highest weight, as long as a non-saturated credential exists.
+func TestSaturatedCredsHardExcluded(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(dir + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	full5h, _ := creds.Insert(ctx, db, "full5h", "max", "sk-ant-oat-5", "rt-5", time.Now().Add(time.Hour), 5)
+	full7d, _ := creds.Insert(ctx, db, "full7d", "max", "sk-ant-oat-7", "rt-7", time.Now().Add(time.Hour), 5)
+	ok, _ := creds.Insert(ctx, db, "ok", "pro", "sk-ant-oat-o", "rt-o", time.Now().Add(time.Hour), 1)
+
+	now := time.Now().Unix()
+	ins := func(id string, fh, sd float64) {
+		_, _ = db.ExecContext(ctx, `INSERT INTO usage_history
+			(credential_id, captured_at, five_hour_pct, five_hour_resets_at,
+			 seven_day_pct, seven_day_resets_at, seven_day_sonnet_pct, seven_day_sonnet_resets_at)
+			VALUES (?, ?, ?, NULL, ?, NULL, 0.0, NULL)`, id, now, fh, sd)
+	}
+	ins(full5h.ID, 100.0, 5.0) // 5h window maxed
+	ins(full7d.ID, 5.0, 100.0) // 7d window maxed
+	ins(ok.ID, 30.0, 30.0)     // healthy, lowest weight
+
+	p := New(db)
+	const N = 100
+	count := map[string]int{}
+	for i := range N {
+		c, _, err := p.Bind(ctx, fmt.Sprintf("s-%d", i))
+		if err != nil {
+			t.Fatalf("bind %d: %v", i, err)
+		}
+		count[c.ID]++
+	}
+	if count[full5h.ID] != 0 || count[full7d.ID] != 0 {
+		t.Fatalf("saturated creds were selected: 5h-maxed=%d 7d-maxed=%d (want 0/0); ok=%d",
+			count[full5h.ID], count[full7d.ID], count[ok.ID])
+	}
+	if count[ok.ID] != N {
+		t.Fatalf("healthy cred should take all %d binds, got %d", N, count[ok.ID])
+	}
+}
+
+// TestAllSaturatedNoActive verifies that when every active credential is maxed
+// out (and none are status='limited'), binding reports ErrNoCredentials rather
+// than routing to a saturated subscription.
+func TestAllSaturatedNoActive(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(dir + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	a, _ := creds.Insert(ctx, db, "a", "max", "sk-ant-oat-a", "rt-a", time.Now().Add(time.Hour), 5)
+	b, _ := creds.Insert(ctx, db, "b", "max", "sk-ant-oat-b", "rt-b", time.Now().Add(time.Hour), 5)
+
+	now := time.Now().Unix()
+	for _, id := range []string{a.ID, b.ID} {
+		_, _ = db.ExecContext(ctx, `INSERT INTO usage_history
+			(credential_id, captured_at, five_hour_pct, five_hour_resets_at,
+			 seven_day_pct, seven_day_resets_at, seven_day_sonnet_pct, seven_day_sonnet_resets_at)
+			VALUES (?, ?, 100.0, NULL, 100.0, NULL, 0.0, NULL)`, id, now)
+	}
+
+	p := New(db)
+	if _, _, err := p.Bind(ctx, "x"); err != ErrNoCredentials {
+		t.Fatalf("expected ErrNoCredentials when all active creds are saturated, got %v", err)
 	}
 }
 

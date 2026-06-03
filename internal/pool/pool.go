@@ -122,27 +122,44 @@ func (p *Pool) Bind(ctx context.Context, convID string) (*creds.Credential, bool
 //
 // Effective score per credential:
 //
-//	score = weight × blend²
-//	blend = 0.6×room_5h + 0.4×room_7d
-//	room_X = max(0, 1 − utilization_pct/100)
+//	score   = weight × headroom
+//	headroom = room_5h × room_7d^sevenDayExp
+//	room_X   = max(0, 1 − utilization_pct/100)
 //
-// The blend weights the short-term 5 h window more heavily (immediate
-// capacity) while still accounting for long-term 7 d quota. Squaring the
-// blend creates a convex penalty that strongly avoids near-saturated
-// credentials without hard-excluding them until they actually hit 100 %.
+// The two windows are independent ceilings — a request is rejected the moment
+// it hits EITHER limit — so their remaining room is multiplied, not averaged.
+// Multiplying means a credential that is saturated on one window scores near
+// zero even if the other window is wide open, which the old additive blend
+// failed to capture (it would keep routing to a credential whose 7 d quota was
+// already spent). Raising room_7d to a power >1 penalises consumption of the
+// slow-resetting weekly quota harder than the cheap 5 h window.
 //
-// The most recent usage snapshot is always used regardless of age; blend=1
+// The most recent usage snapshot is always used regardless of age; headroom=1
 // (full availability) is the fallback only when no snapshot exists at all
 // (e.g. newly imported credentials). When all computed scores are zero, the
 // credential with the highest configured weight is chosen so traffic always
 // has somewhere to go.
+//
+// Hard saturation cutoff: a credential whose most recent snapshot reports
+// EITHER window at ≥100 % utilization is excluded from the active set entirely,
+// before scoring — a maxed-out subscription is never selected for a new
+// conversation. Only the limited fallback below can still reach a saturated
+// credential, and only as the last resort to obtain a real 429 + Retry-After.
 func (p *Pool) pickActiveLocked(ctx context.Context, tx *sql.Tx) (string, error) {
 	now := time.Now()
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, weight FROM credentials
-		WHERE status='active'
-		  AND (retry_after IS NULL OR retry_after < ?)
-		ORDER BY id`, now.Unix())
+		SELECT c.id, c.weight FROM credentials c
+		WHERE c.status='active'
+		  AND (c.retry_after IS NULL OR c.retry_after < ?)
+		  AND NOT EXISTS (
+		    SELECT 1 FROM usage_history u
+		    WHERE u.credential_id = c.id
+		      AND u.captured_at = (
+		        SELECT MAX(captured_at) FROM usage_history WHERE credential_id = c.id
+		      )
+		      AND (u.five_hour_pct >= 100 OR u.seven_day_pct >= 100)
+		  )
+		ORDER BY c.id`, now.Unix())
 	if err != nil {
 		return "", err
 	}
@@ -202,12 +219,21 @@ type weightedEntry struct {
 	weight int
 }
 
+// sevenDayExp controls how hard the slow-resetting 7-day quota is protected
+// relative to the 5-hour window. >1 makes a low 7d room shrink the score
+// faster, so the pool prefers to spend the cheap 5h window (which resets in
+// hours) over the expensive weekly one (which resets slowly).
+const sevenDayExp = 1.5
+
 // weightedRandPick computes a usage-aware effective score for each candidate
 // and returns one chosen by weighted-random selection.
 //
-// Score formula: weight × blend²   where blend = 0.6×room_5h + 0.4×room_7d
+// Score formula: weight × room_5h × room_7d^sevenDayExp   (room = 1 − util).
+// The two windows are independent ceilings, so their remaining room is
+// multiplied rather than averaged: saturation on either window drives the
+// score toward zero. See pickActiveLocked for the full rationale.
 //
-// The most recent usage snapshot is used regardless of age. blend=1.0 is
+// The most recent usage snapshot is used regardless of age. headroom=1.0 is
 // used only when no snapshot exists for a credential (newly imported).
 func (p *Pool) weightedRandPick(ctx context.Context, tx *sql.Tx, candidates []weightedEntry) (string, error) {
 	type scored struct {
@@ -215,7 +241,7 @@ func (p *Pool) weightedRandPick(ctx context.Context, tx *sql.Tx, candidates []we
 		weight int
 		fhPct  float64
 		sdPct  float64
-		blend  float64
+		head   float64
 		score  float64
 	}
 
@@ -223,7 +249,7 @@ func (p *Pool) weightedRandPick(ctx context.Context, tx *sql.Tx, candidates []we
 	bestWeight := 0
 	bestIdx := 0
 	for i, e := range candidates {
-		s := scored{id: e.id, weight: e.weight, blend: 1.0}
+		s := scored{id: e.id, weight: e.weight, head: 1.0}
 
 		var capturedAt int64
 		err := tx.QueryRowContext(ctx, `
@@ -237,13 +263,16 @@ func (p *Pool) weightedRandPick(ctx context.Context, tx *sql.Tx, candidates []we
 			// Always use the most recent snapshot, regardless of age.
 			// Stale data beats assuming 0% usage: if a cred was at 80%
 			// thirty minutes ago it is likely still near 80%, not 0%.
+			//
+			// Multiply the two windows' remaining room (independent ceilings)
+			// and penalise low 7d room harder via the exponent.
 			roomFH := math.Max(0, 1-s.fhPct/100)
 			roomSD := math.Max(0, 1-s.sdPct/100)
-			s.blend = 0.6*roomFH + 0.4*roomSD
+			s.head = roomFH * math.Pow(roomSD, sevenDayExp)
 		}
-		// err == sql.ErrNoRows → no snapshot yet; keep blend=1.0 (bootstrap)
+		// err == sql.ErrNoRows → no snapshot yet; keep head=1.0 (bootstrap)
 
-		s.score = float64(e.weight) * s.blend * s.blend
+		s.score = float64(e.weight) * s.head
 		entries[i] = s
 
 		if e.weight > bestWeight {
@@ -270,7 +299,7 @@ func (p *Pool) weightedRandPick(ctx context.Context, tx *sql.Tx, candidates []we
 				"weight", s.weight,
 				"fh_pct", s.fhPct,
 				"7d_pct", s.sdPct,
-				"blend", fmt.Sprintf("%.4f", s.blend),
+				"headroom", fmt.Sprintf("%.4f", s.head),
 				"score", fmt.Sprintf("%.4f", s.score),
 				"select_pct", fmt.Sprintf("%.1f", pct),
 			)

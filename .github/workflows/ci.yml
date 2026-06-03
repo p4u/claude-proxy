@@ -93,7 +93,7 @@ jobs:
   # skipped to avoid leaking the registry token to forks.
   # ----------------------------------------------------------------------------
   build:
-    name: Build ${{ matrix.variant }} (${{ matrix.platform }})
+    name: Build (${{ matrix.platform }})
     needs: [lint, test]
     if: github.event_name == 'push'
     runs-on: ${{ matrix.runner }}
@@ -125,37 +125,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & push full image (by digest)
-        id: build-full
+      - name: Build & push image (by digest)
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=full-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=full-${{ matrix.arch }}
+          cache-from: type=gha,scope=image-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=image-${{ matrix.arch }}
           provenance: false
 
-      - name: Build & push proxy-only image (by digest)
-        id: build-proxy-only
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: ./Dockerfile.proxy-only
-          platforms: ${{ matrix.platform }}
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=proxy-only-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=proxy-only-${{ matrix.arch }}
-          provenance: false
-
-      - name: Export digests
+      - name: Export digest
         run: |
           mkdir -p /tmp/digests
-          full="${{ steps.build-full.outputs.digest }}"
-          proxy="${{ steps.build-proxy-only.outputs.digest }}"
-          touch "/tmp/digests/full-${full#sha256:}"
-          touch "/tmp/digests/proxy-only-${proxy#sha256:}"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digests
         uses: actions/upload-artifact@v7
@@ -197,7 +183,7 @@ jobs:
           pattern: digests-*
           merge-multiple: true
 
-      - name: Compute image metadata (full)
+      - name: Compute image metadata
         id: meta
         uses: docker/metadata-action@v6
         with:
@@ -212,46 +198,20 @@ jobs:
             org.opencontainers.image.description=Sticky multi-subscription HTTP proxy for Claude Code
             org.opencontainers.image.licenses=AGPL-3.0-only
 
-      - name: Compute image metadata (proxy-only)
-        id: meta-proxy-only
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.IMAGE }}
-          tags: |
-            type=ref,event=branch,suffix=-proxy-only
-            type=ref,event=tag,suffix=-proxy-only
-            type=sha,format=short,suffix=-proxy-only
-            type=raw,value=proxy-only,enable={{is_default_branch}}
-          labels: |
-            org.opencontainers.image.title=claude-proxy-proxy-only
-            org.opencontainers.image.description=Sticky multi-subscription HTTP proxy for Claude Code (forward-only, no agent)
-            org.opencontainers.image.licenses=AGPL-3.0-only
-
-      - name: Create manifest list (full)
+      - name: Create manifest list
         working-directory: /tmp/digests
         run: |
           tags=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< '${{ steps.meta.outputs.json }}')
-          sources=$(ls full-* | sed "s|^full-|${IMAGE}@sha256:|")
-          docker buildx imagetools create $tags $sources
-
-      - name: Create manifest list (proxy-only)
-        working-directory: /tmp/digests
-        run: |
-          tags=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< '${{ steps.meta-proxy-only.outputs.json }}')
-          sources=$(ls proxy-only-* | sed "s|^proxy-only-|${IMAGE}@sha256:|")
+          sources=$(ls | sed "s|^|${IMAGE}@sha256:|")
           docker buildx imagetools create $tags $sources
 
       - name: Image summary
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
-          PROXY_ONLY_TAGS: ${{ steps.meta-proxy-only.outputs.tags }}
         run: |
           {
             echo "## Published images"
             while IFS= read -r t; do
               [ -n "$t" ] && echo "- \`$t\`"
             done <<< "$TAGS"
-            while IFS= read -r t; do
-              [ -n "$t" ] && echo "- \`$t\` (proxy-only, no agent)"
-            done <<< "$PROXY_ONLY_TAGS"
           } >> "$GITHUB_STEP_SUMMARY"

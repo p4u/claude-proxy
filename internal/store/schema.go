@@ -35,15 +35,6 @@ CREATE INDEX IF NOT EXISTS idx_creds_status   ON credentials(status);
 CREATE TABLE IF NOT EXISTS rr_cursor (k INTEGER PRIMARY KEY, idx INTEGER NOT NULL);
 INSERT OR IGNORE INTO rr_cursor (k, idx) VALUES (0, 0);
 
-CREATE TABLE IF NOT EXISTS agent_sessions (
-  conversation_key TEXT PRIMARY KEY,
-  session_uuid     TEXT NOT NULL,
-  created_at       INTEGER NOT NULL,
-  last_used_at     INTEGER NOT NULL,
-  num_turns        INTEGER NOT NULL DEFAULT 0,
-  total_cost_usd   REAL    NOT NULL DEFAULT 0
-);
-
 -- Named bearer tokens for multi-user authentication.
 CREATE TABLE IF NOT EXISTS user_tokens (
   id           TEXT    PRIMARY KEY,

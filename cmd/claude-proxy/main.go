@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -17,8 +16,6 @@ import (
 	"time"
 
 	"github.com/p4u/claude-proxy/internal/admin"
-	"github.com/p4u/claude-proxy/internal/agent"
-	"github.com/p4u/claude-proxy/internal/bridge"
 	"github.com/p4u/claude-proxy/internal/creds"
 	"github.com/p4u/claude-proxy/internal/ingest"
 	"github.com/p4u/claude-proxy/internal/pool"
@@ -95,13 +92,6 @@ func openDB(path string) *store.DB {
 	return db
 }
 
-func findClaude() string {
-	if p, err := exec.LookPath("claude"); err == nil {
-		return p
-	}
-	return ""
-}
-
 func runServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := fs.String("addr", ":8787", "listen address")
@@ -112,46 +102,6 @@ func runServe(args []string) {
 	logLevel := fs.String("log-level", "info", "log level: debug|info|warn|error")
 	logFormat := fs.String("log-format", "auto", "log format: auto|pretty|text|json")
 	logColor := fs.String("log-color", "auto", "log color: auto|always|never")
-
-	// Agent / bridge flags (all overridable via env vars for docker-compose use).
-	agentEnableDefault := true
-	if v := os.Getenv("ENABLE_API_BRIDGE"); v == "false" || v == "0" {
-		agentEnableDefault = false
-	}
-	enableAgent := fs.Bool("enable-agent", agentEnableDefault,
-		"serve /api/v1/* via claude CLI agent (requires claude on PATH; env ENABLE_API_BRIDGE)")
-
-	agentIdleTTLDefault := 10 * time.Minute
-	if v := os.Getenv("AGENT_IDLE_TTL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			agentIdleTTLDefault = d
-		}
-	}
-	agentIdleTTL := fs.Duration("agent-idle-ttl", agentIdleTTLDefault,
-		"kill idle agent sessions after this duration (env AGENT_IDLE_TTL)")
-
-	agentMaxSessionsDefault := 32
-	if v := os.Getenv("AGENT_MAX_SESSIONS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			agentMaxSessionsDefault = n
-		}
-	}
-	agentMaxSessions := fs.Int("agent-max-sessions", agentMaxSessionsDefault,
-		"max concurrent claude subprocesses (env AGENT_MAX_SESSIONS)")
-
-	agentToolsDefault := "Read,Grep,Glob,WebFetch"
-	if v := os.Getenv("AGENT_TOOLS"); v != "" {
-		agentToolsDefault = v
-	}
-	agentTools := fs.String("agent-tools", agentToolsDefault,
-		"comma-separated built-in tools allowed for the agent (env AGENT_TOOLS)")
-
-	agentWorkdir := fs.String("agent-workdir", os.Getenv("AGENT_WORKDIR"),
-		"directory to mount as --add-dir for the agent (read-only; env AGENT_WORKDIR)")
-	agentClaudeBin := fs.String("agent-claude-bin", os.Getenv("AGENT_CLAUDE_BIN"),
-		"path to claude binary (default: auto-detect from PATH; env AGENT_CLAUDE_BIN)")
-	agentBaseURL := fs.String("agent-base-url", os.Getenv("AGENT_CLAUDE_BASE_URL"),
-		"ANTHROPIC_BASE_URL for agent self-loop (default: http://<listen-addr>; env AGENT_CLAUDE_BASE_URL)")
 
 	_ = fs.Parse(args)
 
@@ -221,58 +171,6 @@ func runServe(args []string) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
-
-	// --- agent bridge ---
-	if *enableAgent {
-		claudeBin := *agentClaudeBin
-		if claudeBin == "" {
-			claudeBin = findClaude()
-		}
-		if claudeBin == "" {
-			logger.Warn("claude binary not found on PATH; /api endpoints will return 503. " +
-				"Install @anthropic-ai/claude-code or set --agent-claude-bin.")
-			mux.HandleFunc("/api/", func(w http.ResponseWriter, _ *http.Request) {
-				http.Error(w,
-					`{"type":"error","error":{"type":"api_error","message":"claude binary not found; agent disabled"}}`,
-					http.StatusServiceUnavailable)
-			})
-		} else {
-			baseURL := *agentBaseURL
-			if baseURL == "" {
-				// Self-loop: use the proxy's own listen address.
-				listenAddr := *addr
-				if strings.HasPrefix(listenAddr, ":") {
-					listenAddr = "127.0.0.1" + listenAddr
-				}
-				baseURL = "http://" + listenAddr
-			}
-
-			allowedTools := strings.Split(*agentTools, ",")
-			for i, t := range allowedTools {
-				allowedTools[i] = strings.TrimSpace(t)
-			}
-
-			agentCfg := agent.SessionConfig{
-				ClaudeBin:    claudeBin,
-				BaseURL:      baseURL,
-				AuthToken:    *authToken,
-				AllowedTools: allowedTools,
-				WorkDir:      *agentWorkdir,
-			}
-			mgr := agent.New(db, agentCfg, *agentIdleTTL, *agentMaxSessions)
-			go mgr.Janitor(ctx)
-
-			bridgeH := bridge.New(mgr, proxyH, db, logger)
-			mux.Handle("/api/", bridgeH)
-
-			logger.Info("agent bridge enabled",
-				"claude", claudeBin,
-				"base_url", baseURL,
-				"tools", *agentTools,
-				"idle_ttl", agentIdleTTL.String(),
-				"max_sessions", *agentMaxSessions)
-		}
-	}
 
 	if *authToken != "" {
 		logger.Info("downstream auth enabled (Authorization: Bearer / x-api-key)")
