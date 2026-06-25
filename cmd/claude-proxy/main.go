@@ -17,6 +17,7 @@ import (
 
 	"github.com/p4u/claude-proxy/internal/admin"
 	"github.com/p4u/claude-proxy/internal/creds"
+	"github.com/p4u/claude-proxy/internal/healthz"
 	"github.com/p4u/claude-proxy/internal/ingest"
 	"github.com/p4u/claude-proxy/internal/pool"
 	"github.com/p4u/claude-proxy/internal/prettylog"
@@ -183,9 +184,14 @@ func runServe(args []string) {
 		logger.Warn("downstream auth disabled — anyone reaching this proxy can use your credentials")
 	}
 
+	// /healthz is served outside the auth middleware — no token required.
+	outer := http.NewServeMux()
+	outer.HandleFunc("/healthz", healthz.Handler)
+	outer.Handle("/", proxy.AuthMiddleware(*authToken, db, mux))
+
 	srv := &http.Server{
 		Addr:    *addr,
-		Handler: proxy.AuthMiddleware(*authToken, db, mux),
+		Handler: outer,
 	}
 	go func() {
 		<-ctx.Done()
