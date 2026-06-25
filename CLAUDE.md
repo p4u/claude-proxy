@@ -63,7 +63,8 @@ Claude Code (ANTHROPIC_BASE_URL → proxy)
 
 | Package | Role |
 |---|---|
-| `cmd/claude-proxy/` | CLI entry point; `serve`, `creds`, and `users` subcommands |
+| `cmd/claude-proxy/` | CLI entry point; `serve`, `tui`, `creds`, and `users` subcommands |
+| `internal/tui/` | Interactive Bubble Tea management UI (credentials + users tabs) for `claude-proxy tui` |
 | `internal/proxy/` | Proxy-mode HTTP handler + `AuthMiddleware` (two-tier auth, request logging) |
 | `internal/pool/` | Usage-aware weighted-random selection + sticky conversation→credential binding |
 | `internal/creds/` | Credential model, status management, proactive/reactive token refresh |
@@ -91,7 +92,7 @@ Claude Code (ANTHROPIC_BASE_URL → proxy)
 
 ### Storage Schema (SQLite)
 
-Five tables (`internal/store/schema.go`): `credentials`, `conversations`, `rr_cursor` (legacy round-robin state), `user_tokens` (named bearer tokens), `request_log` (one row per forwarded request, for per-user stats), `usage_history` (utilization snapshots driving selection). Single dependency: `modernc.org/sqlite` (pure Go, no CGO required).
+Six tables (`internal/store/schema.go`): `credentials`, `conversations`, `rr_cursor` (legacy round-robin state), `user_tokens` (named bearer tokens), `request_log` (one row per forwarded request, for per-user stats), `usage_history` (utilization snapshots driving selection). Deleting a credential cascades to `usage_history` (`ON DELETE CASCADE`); `conversations` bindings are cleared inside `creds.Delete`'s transaction, since older DBs created that FK without a cascade clause. Core dependency: `modernc.org/sqlite` (pure Go, no CGO required); `guptarohit/asciigraph` for usage charts and `charmbracelet/bubbletea`+`lipgloss`+`bubbles` for the management TUI.
 
 ## Configuration
 
@@ -110,8 +111,22 @@ All runtime config comes from `.env` (copy from `.env.example`). Key variables:
 
 ## Credential Management
 
+For interactive management, prefer the TUI over individual Makefile targets:
+
+```bash
+make tui                         # Bubble Tea UI: credentials + users (needs a TTY)
+# or, locally without docker:
+go run ./cmd/claude-proxy tui --db ./data/proxy.db
+```
+
+TUI keys — Credentials tab: `r` refresh token, `u` update token from a fresh login file,
+`w` set weight, `d` disable/enable, `x` delete, `i` import from file, `p` paste a
+`.credentials.json` directly (multi-line; `ctrl+s` to import). Users tab: `c` create,
+`R` rotate token, `d` disable/enable, `x` delete. `tab` switches tabs, `q` quits.
+
 ```bash
 make import FROM=path/to/.credentials.json LABEL=myaccount [WEIGHT=5]
+make update ID=cred_xxx FROM=path/to/new.credentials.json  # replace tokens from a fresh login
 make list                        # Show all credentials with status/counters
 make usage                       # Fetch live 5h/7d usage % from Anthropic for all creds
 make usage ID=cred_xxx           # Usage % for one credential

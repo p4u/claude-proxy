@@ -321,6 +321,42 @@ Override the weight at import time or at runtime:
 make weight ID=cred_xxx W=8
 ```
 
+## Interactive management (TUI)
+
+Everything below can be driven one command at a time, but the easiest way to
+manage the pool is the full-screen TUI. It runs **entirely inside the Docker
+image** — the host only needs `docker`, `make`, and `bash`; no Go toolchain.
+
+```bash
+make tui
+```
+
+`make tui` is smart about where it runs:
+
+- If the proxy container is **already running** (`make up`), it attaches with
+  `docker compose exec` — the TUI runs as a second process inside the live
+  container, against the same `/data/proxy.db`.
+- If the proxy is **stopped**, it starts a throwaway one-off container
+  (`docker compose run --rm`) that mounts the same `./data` volume, so you can
+  manage credentials without the proxy being up.
+
+It needs an interactive terminal (a TTY); it won't start from a pipe or CI job.
+
+**Keys**
+
+| Context | Keys |
+|---|---|
+| Global | `tab` switch Credentials/Users · `↑`/`↓` move · `q` quit |
+| Credentials | `r` refresh token · `u` update token from a file · `w` weight · `d` disable/enable · `x` delete · `i` import from file · `p` **paste** a `.credentials.json` |
+| Users | `c` create · `R` rotate token · `d` disable/enable · `x` delete |
+
+The `p` (paste) action opens a multi-line box — paste the raw contents of a
+`.credentials.json` and press `ctrl+s` to import. This avoids having to copy the
+file into the `./creds` bind mount first.
+
+Prefer to run it without Docker (e.g. a dev box with Go)? `go run
+./cmd/claude-proxy tui --db ./data/proxy.db` works too.
+
 ## Operator workflow with `make`
 
 ```
@@ -342,16 +378,32 @@ Service lifecycle
   make tls-info             Show TLS / Traefik status + ACME storage info
   make ps                   Container status
 
+Interactive management (recommended)
+  make tui                  Full-screen TUI to manage credentials + users.
+                              Attaches to the running proxy container if one is
+                              up (docker compose exec), otherwise starts a
+                              one-off container sharing the same /data volume.
+                              No Go on the host — runs entirely in the image.
+
 Credentials
   make import FROM=foo.json LABEL=acct-A [WEIGHT=N]
                             Import a credential from ./creds/foo.json
+  make update ID=cred_xxx FROM=new.json
+                            Replace a credential's tokens from a fresh login
   make list                 List credentials with status, weight, counters
   make usage                Fetch 5h/7d usage % for all credentials from Anthropic
   make usage ID=cred_xxx    Fetch usage % for a single credential
-  make disable ID=cred_xxx  Mark a credential disabled (excluded from RR)
+  make disable ID=cred_xxx  Mark a credential disabled (excluded from selection)
   make rm ID=cred_xxx       Remove a credential row
   make refresh ID=cred_xxx  Force-refresh a credential's tokens
-  make weight ID=... W=...  Set the round-robin weight
+  make weight ID=... W=...  Set the selection weight
+
+User tokens (per-user bearer auth)
+  make user-create NAME=alice   Create a user token (prints the bearer token)
+  make user-list                List all user tokens
+  make user-stats [ID=...] [PERIOD=24h]   Per-user request stats
+  make user-token ID=utok_xxx   Print a user's bearer token
+  make user-disable / user-enable / user-rm / user-refresh ID=utok_xxx
 
 Credential backup / restore
   make export-credentials   Dump all credentials (with current tokens) to stdout
@@ -381,15 +433,25 @@ claude-proxy serve [--addr :8787] [--db ./proxy.db]
                    [--log-format auto|pretty|text|json]
                    [--log-color  auto|always|never]
 
+claude-proxy tui                 [--db PATH]   # interactive management UI
+
 claude-proxy creds import        --from FILE [--label NAME] [--weight N]
+claude-proxy creds update        <id> --from FILE   # replace tokens from a fresh login
 claude-proxy creds export        [--db PATH]   # JSONL to stdout
 claude-proxy creds import-bulk   [--db PATH]   # JSONL from stdin
 claude-proxy creds list
 claude-proxy creds usage         [<id>]
+claude-proxy creds usage-history [--period 1h|6h|24h|7d|30d] [<id>]
 claude-proxy creds disable       <id>
 claude-proxy creds rm            <id>
 claude-proxy creds refresh       <id>
 claude-proxy creds set-weight    <id> <weight>
+
+claude-proxy users create        --name NAME
+claude-proxy users list
+claude-proxy users stats         [<id>] [--period 1h|6h|24h|7d|30d]
+claude-proxy users token         <id>
+claude-proxy users disable|enable|rm|refresh  <id>
 ```
 
 `--auth-token` falls back to `CLAUDE_PROXY_AUTH_TOKEN` env var. All `creds`

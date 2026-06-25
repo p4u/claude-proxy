@@ -132,6 +132,17 @@ tls-info: ## Show TLS / Traefik status.
 ps: ## Show container status.
 	$(DC) ps
 
+##@ Interactive management
+
+tui: env ## Launch the interactive management TUI (credentials + users). Attaches to the running proxy if up, else starts a one-off container. Needs an interactive terminal.
+	@if [ -n "$$($(DC) ps -q $(SERVICE) 2>/dev/null)" ]; then \
+		echo "attaching TUI to the running $(SERVICE) container…"; \
+		$(DC) exec $(SERVICE) /usr/local/bin/claude-proxy tui --db $(DB); \
+	else \
+		echo "$(SERVICE) is not running — starting a one-off TUI container (shares the same /data volume)…"; \
+		$(DC) run --rm --no-deps $(SERVICE) tui --db $(DB); \
+	fi
+
 ##@ Credentials
 
 # usage: make import FROM=acct-A.json LABEL=acct-A [WEIGHT=5]
@@ -145,6 +156,14 @@ import: env ## Import a .credentials.json (FROM=acct-A.json LABEL=acct-A [WEIGHT
 		--from /creds/$(FROM) --label "$(LABEL)" \
 		$(if $(WEIGHT),--weight $(WEIGHT),) \
 		--db $(DB)
+
+# usage: make update ID=cred_xxx FROM=acct-A.json
+update: env ## Replace a credential's tokens from a fresh login (ID=cred_xxx FROM=acct-A.json).
+	@if [ -z "$(ID)" ] || [ -z "$(FROM)" ]; then \
+		echo "usage: make update ID=cred_xxx FROM=acct-A.json"; exit 2; fi
+	@if [ ! -f "creds/$(FROM)" ]; then \
+		echo "creds/$(FROM) not found — drop the fresh .credentials.json into ./creds first"; exit 1; fi
+	$(RUN) creds update "$(ID)" --from /creds/$(FROM) --db $(DB)
 
 list: ## List all credentials in the pool.
 	$(RUN) creds list --db $(DB)
@@ -271,7 +290,7 @@ distclean: clean ## clean + remove built image and .env.
 	rm -f $(ENV_FILE)
 
 .PHONY: help env token rotate-token fix-perms build pull up down restart logs logs-traefik tls-info ps lint lint-install \
-        import list usage usage-history disable rm refresh weight \
+        tui import update list usage usage-history disable rm refresh weight \
         export-credentials import-credentials \
         user-create user-list user-stats user-token user-disable user-enable user-rm user-refresh \
         health credentials conversations stats \

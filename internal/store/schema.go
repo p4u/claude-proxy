@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS credentials (
 
 CREATE TABLE IF NOT EXISTS conversations (
   id              TEXT PRIMARY KEY,
-  credential_id   TEXT NOT NULL REFERENCES credentials(id),
+  credential_id   TEXT NOT NULL REFERENCES credentials(id) ON DELETE CASCADE,
   created_at      INTEGER NOT NULL,
   last_seen_at    INTEGER NOT NULL,
   request_count   INTEGER NOT NULL DEFAULT 0,

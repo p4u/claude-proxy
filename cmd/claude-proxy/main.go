@@ -22,6 +22,7 @@ import (
 	"github.com/p4u/claude-proxy/internal/prettylog"
 	"github.com/p4u/claude-proxy/internal/proxy"
 	"github.com/p4u/claude-proxy/internal/store"
+	"github.com/p4u/claude-proxy/internal/tui"
 	"github.com/p4u/claude-proxy/internal/usage"
 	"github.com/p4u/claude-proxy/internal/usertoken"
 )
@@ -38,7 +39,9 @@ Usage:
   claude-proxy users enable <id>      [--db PATH]
   claude-proxy users rm <id>          [--db PATH]
   claude-proxy users refresh <id>     [--db PATH]
+  claude-proxy tui                 [--db PATH]   # interactive management UI
   claude-proxy creds import        --from FILE [--label NAME] [--weight N]
+  claude-proxy creds update <id>   --from FILE   # replace tokens from a fresh login
   claude-proxy creds export        [--db PATH]   # JSONL to stdout
   claude-proxy creds import-bulk   [--db PATH]   # JSONL from stdin
   claude-proxy creds list
@@ -60,6 +63,8 @@ func main() {
 	switch os.Args[1] {
 	case "serve":
 		runServe(os.Args[2:])
+	case "tui":
+		runTUI(os.Args[2:])
 	case "creds":
 		runCreds(os.Args[2:])
 	case "users":
@@ -196,15 +201,30 @@ func runServe(args []string) {
 	}
 }
 
+func runTUI(args []string) {
+	fs := flag.NewFlagSet("tui", flag.ExitOnError)
+	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
+	_ = fs.Parse(args)
+	db := openDB(*dbPath)
+	defer db.Close()
+	r := creds.NewRefresher(db)
+	if err := tui.Run(db, r); err != nil {
+		fmt.Fprintf(os.Stderr, "tui: %v\n", err)
+		os.Exit(1)
+	}
+}
+
 func runCreds(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "creds: missing subcommand (import|export|import-bulk|list|usage|usage-history|disable|rm|refresh|set-weight)")
+		fmt.Fprintln(os.Stderr, "creds: missing subcommand (import|update|export|import-bulk|list|usage|usage-history|disable|rm|refresh|set-weight)")
 		os.Exit(2)
 	}
 	ctx := context.Background()
 	switch args[0] {
 	case "import":
 		credsImport(ctx, args[1:])
+	case "update":
+		credsUpdate(ctx, args[1:])
 	case "export":
 		credsExport(ctx, args[1:])
 	case "import-bulk":
@@ -249,6 +269,31 @@ func credsImport(ctx context.Context, args []string) {
 	}
 	fmt.Printf("imported %s  label=%q  sub=%s  weight=%d  expires=%s\n",
 		c.ID, c.Label, c.SubscriptionType, c.Weight, c.ExpiresAt.Format(time.RFC3339))
+}
+
+func credsUpdate(ctx context.Context, args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "creds update <id> --from FILE")
+		os.Exit(2)
+	}
+	id := args[0]
+	fs := flag.NewFlagSet("creds update", flag.ExitOnError)
+	from := fs.String("from", "", "path to a fresh .credentials.json (Claude Code re-login)")
+	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
+	_ = fs.Parse(args[1:])
+	if *from == "" {
+		fmt.Fprintln(os.Stderr, "--from is required")
+		os.Exit(2)
+	}
+	db := openDB(*dbPath)
+	defer db.Close()
+	c, err := ingest.UpdateFromFile(ctx, db, id, *from)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "update: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("updated %s  label=%q  sub=%s  status=%s  expires=%s\n",
+		c.ID, c.Label, c.SubscriptionType, string(c.Status), c.ExpiresAt.Format(time.RFC3339))
 }
 
 func credsList(ctx context.Context, args []string) {

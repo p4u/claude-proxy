@@ -191,16 +191,31 @@ func Get(ctx context.Context, db *store.DB, id string) (*Credential, error) {
 	return scanCred(rows)
 }
 
+// Delete removes a credential and its dependent rows. The conversations table
+// references credentials(id) without ON DELETE CASCADE (older databases were
+// created that way and SQLite cannot alter a constraint in place), so we clear
+// its sticky bindings inside a transaction before deleting the credential —
+// otherwise the delete fails with FOREIGN KEY constraint failed (787).
+// usage_history rows are removed automatically by its ON DELETE CASCADE;
+// request_log keeps its historical credential_id (no FK) for stats.
 func Delete(ctx context.Context, db *store.DB, id string) error {
-	res, err := db.ExecContext(ctx, `DELETE FROM credentials WHERE id=?`, id)
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM conversations WHERE credential_id=?`, id); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM credentials WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
 	}
-	return nil
+	return tx.Commit()
 }
 
 func SetStatus(ctx context.Context, db *store.DB, id string, s Status) error {
