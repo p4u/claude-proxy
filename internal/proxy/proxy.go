@@ -30,6 +30,12 @@ type Handler struct {
 	refresher *creds.Refresher
 	log       *slog.Logger
 	client    *http.Client
+
+	// Augment1M appends "[1m]" variant entries to GET /v1/models responses so
+	// Claude Code's gateway model discovery can offer the 1M-context models
+	// (see models1m.go). Enabled by default; disable via CLAUDE_PROXY_MODELS_1M=0.
+	Augment1M   bool
+	modelsCache modelsCache
 }
 
 func New(db *store.DB, p *pool.Pool, r *creds.Refresher, log *slog.Logger) *Handler {
@@ -41,6 +47,7 @@ func New(db *store.DB, p *pool.Pool, r *creds.Refresher, log *slog.Logger) *Hand
 		client: &http.Client{
 			Timeout: 0, // streaming responses; rely on context
 		},
+		Augment1M: true,
 	}
 }
 
@@ -60,6 +67,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(body) > maxBodyBytes {
 		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	if h.Augment1M && r.Method == http.MethodGet && r.URL.Path == "/v1/models" {
+		h.serveModels(w, r, start)
 		return
 	}
 	h.log.Debug("request",

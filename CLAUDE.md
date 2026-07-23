@@ -46,6 +46,8 @@ Claude Code (ANTHROPIC_BASE_URL → proxy)
       → router.Derive(): compute stable conversation key (4-priority algorithm)
       → pool.Bind(): get/create sticky credential for this conversation
       → forward to api.anthropic.com with swapped Authorization header
+      → GET /v1/models: response augmented with "[1m]" variants + cached 5min
+        (internal/proxy/models1m.go) for Claude Code gateway model discovery
       → on 401: creds refresher triggers token refresh → retry
       → on 429: mark credential "limited", synthesize Retry-After if missing → pass 429 to client
       → on 200: heal "limited" → "active" immediately
@@ -109,6 +111,7 @@ All runtime config comes from `.env` (copy from `.env.example`). Key variables:
 | `LOG_FORMAT` | `auto` | `pretty\|text\|json\|auto` |
 | `LOG_COLOR` | `auto` | `auto\|always\|never` |
 | `UI_PASSWORD` | _(empty)_ | Web UI password (`CLAUDE_PROXY_UI_PASSWORD`); empty = UI disabled. UI is served at `/` (old `/ui/*` paths 308-redirect); API prefixes `/v1/`, `/admin/`, `/api/`, `/health` are reserved |
+| `MODELS_1M` | _(enabled)_ | Append `[1m]` model variants to `GET /v1/models` for Claude Code gateway model discovery (`CLAUDE_PROXY_MODELS_1M`); set `0` to disable |
 | `UI_SECURE_COOKIES` | _(empty)_ | Force `Secure` UI session cookies (`CLAUDE_PROXY_UI_SECURE_COOKIES`); auto-detected behind Traefik via `X-Forwarded-Proto` |
 | `TLS_DOMAIN` | _(empty)_ | Set (with `TLS_EMAIL`) to enable Traefik + Let's Encrypt |
 | `CLAUDE_PROXY_IMAGE` | `ghcr.io/p4u/claude-proxy:latest` | Override to use local build |

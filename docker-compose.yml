@@ -23,6 +23,7 @@ services:
       # Force Secure session cookies for the UI. Usually left empty — TLS via
       # traefik is auto-detected from X-Forwarded-Proto.
       CLAUDE_PROXY_UI_SECURE_COOKIES: "${UI_SECURE_COOKIES:-}"
+      CLAUDE_PROXY_MODELS_1M: "${MODELS_1M:-}"
     ports:
       # When traefik is active (profile=tls), keep this on 127.0.0.1 — traefik
       # reaches the container over the docker network, no host port needed.

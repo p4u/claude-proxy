@@ -179,6 +179,10 @@ func runServe(args []string) {
 	go usage.NewPoller(db, logger).Loop(ctx)
 
 	proxyH := proxy.New(db, p, r, logger)
+	// [1m] model-discovery augmentation is on by default; CLAUDE_PROXY_MODELS_1M=0 disables it.
+	if v, ok := os.LookupEnv("CLAUDE_PROXY_MODELS_1M"); ok {
+		proxyH.Augment1M = isTruthy(v)
+	}
 	adminH := admin.New(db)
 
 	mux := http.NewServeMux()

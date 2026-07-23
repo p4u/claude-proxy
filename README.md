@@ -158,6 +158,22 @@ ANTHROPIC_AUTH_TOKEN=$(make token) \
 claude
 ```
 
+To make the 1M-context model variants show up in Claude Code's `/model`
+picker, enable gateway model discovery on the client:
+
+```bash
+CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+```
+
+Claude Code then fetches `GET /v1/models` from the proxy at startup, and the
+proxy augments Anthropic's response with `[1m]` variants (e.g.
+`claude-fable-5[1m]`, `claude-opus-4-8[1m]`) for every 1M-capable model.
+Discovery only populates the picker — the *default* model is still resolved
+client-side, so keep `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL` exports
+(or a `model` entry in `settings.json`) if you want clients to start on a
+`[1m]` variant without picking it once via `/model`. Set `MODELS_1M=0` in
+`.env` to turn the augmentation off.
+
 Open a second `claude` in another terminal — it will be assigned a different
 credential. Watch what's happening live:
 
