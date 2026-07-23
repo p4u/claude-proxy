@@ -58,6 +58,15 @@ env: ## Create or upgrade .env: sync UID/GID to host shell, add missing auth tok
 		fi; \
 		echo "added PROXY_AUTH_TOKEN to $(ENV_FILE)"; \
 	fi
+	@if ! grep -q '^UI_PASSWORD=..*' $(ENV_FILE); then \
+		PASS=$$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | xxd -p -c 256); \
+		if grep -q '^UI_PASSWORD=' $(ENV_FILE); then \
+			sed -i.bak "s|^UI_PASSWORD=.*|UI_PASSWORD=$$PASS|" $(ENV_FILE) && rm -f $(ENV_FILE).bak; \
+		else \
+			echo "UI_PASSWORD=$$PASS" >> $(ENV_FILE); \
+		fi; \
+		echo "added UI_PASSWORD to $(ENV_FILE)"; \
+	fi
 
 token: ## Print the configured PROXY_AUTH_TOKEN (for setting ANTHROPIC_AUTH_TOKEN on clients).
 	@if [ ! -f $(ENV_FILE) ]; then echo "no $(ENV_FILE) yet — run 'make env'" >&2; exit 1; fi
@@ -214,6 +223,16 @@ conversations: ## GET /admin/conversations.
 stats: ## GET /admin/stats.
 	@curl -s $(_AUTH) $(BASE)/admin/stats
 
+_UI_PASS := $(shell grep -E '^UI_PASSWORD=.+' $(ENV_FILE) 2>/dev/null | tail -n1 | cut -d= -f2-)
+
+ui: ## Print the web UI URL and whether UI_PASSWORD is set.
+	@echo "UI URL: $(BASE)/ui"
+	@if [ -n "$(_UI_PASS)" ]; then \
+		echo "UI_PASSWORD: set"; \
+	else \
+		echo "UI_PASSWORD: not set — the UI is disabled. Run 'make env' to generate one."; \
+	fi
+
 ##@ User tokens
 
 # usage: make user-create NAME=alice
@@ -293,5 +312,5 @@ distclean: clean ## clean + remove built image and .env.
         tui import update list usage usage-history disable rm refresh weight \
         export-credentials import-credentials \
         user-create user-list user-stats user-token user-disable user-enable user-rm user-refresh \
-        health credentials conversations stats \
+        health credentials conversations stats ui \
         test clean distclean

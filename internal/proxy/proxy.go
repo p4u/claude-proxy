@@ -106,15 +106,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("counter bump", "err", err, "cred", cred.ID)
 	}
 
-	status, rxBytes := h.forward(w, r, body, cred, true)
+	status, rxBytes, usage := h.forward(w, r, body, cred, true)
 	latency := time.Since(start)
 	h.log.Info("forwarded",
 		"cred", cred.ID, "label", cred.Label,
 		"conv", convID, "status", status,
 		"latency_ms", latency.Milliseconds(),
-		"bytes_sent", len(body), "bytes_received", rxBytes)
+		"bytes_sent", len(body), "bytes_received", rxBytes,
+		"model", usage.Model,
+		"tokens_in", usage.InputTokens, "tokens_out", usage.OutputTokens)
 
-	h.logRequest(r.Context(), r.URL.Path, convID, cred.ID, status, int64(len(body)), rxBytes, latency)
+	h.logRequest(r.Context(), r.URL.Path, convID, cred.ID, status, int64(len(body)), rxBytes, latency, usage)
 }
 
 // decodeBodySnippet decompresses a body if it was sent gzip/deflate, then
@@ -205,14 +207,14 @@ func (h *Handler) pickAny(ctx context.Context) (*creds.Credential, error) {
 // upstream HTTP status (or -1 on local failure) and bytes received from upstream.
 // If allowRetry is true and upstream returns 401, the proxy refreshes the
 // credential and retries once.
-func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, cred *creds.Credential, allowRetry bool) (int, int64) {
+func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, cred *creds.Credential, allowRetry bool) (int, int64, tokenUsage) {
 	upstreamURL := "https://" + UpstreamHost + r.URL.RequestURI()
 
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, bytes.NewReader(body))
 	if err != nil {
 		http.Error(w, "build upstream req", http.StatusBadGateway)
 		_ = creds.MarkError(r.Context(), h.db, cred.ID)
-		return -1, 0
+		return -1, 0, tokenUsage{}
 	}
 
 	copyHeaders(upstreamReq.Header, r.Header)
@@ -234,7 +236,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 		http.Error(w, "upstream: "+err.Error(), http.StatusBadGateway)
 		_ = creds.MarkError(r.Context(), h.db, cred.ID)
 		h.log.Error("upstream transport error", "cred", cred.ID, "err", err)
-		return -1, 0
+		return -1, 0, tokenUsage{}
 	}
 
 	h.log.Debug(
@@ -257,7 +259,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 			_ = creds.MarkError(r.Context(), h.db, cred.ID)
 			h.log.Error("refresh failed after 401; marked expired", "cred", cred.ID, "err", rerr)
 			http.Error(w, "proxy: credential expired", http.StatusBadGateway)
-			return 401, 0
+			return 401, 0, tokenUsage{}
 		}
 		h.log.Info("refresh succeeded; retrying upstream", "cred", cred.ID)
 		return h.forward(w, r, body, fresh, false)
@@ -302,6 +304,13 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 	}
 	w.WriteHeader(resp.StatusCode)
 
+	// Tee the response body into a usage parser only for successful message
+	// responses; other statuses carry no billable usage worth parsing.
+	var cap *usageCapture
+	if resp.StatusCode == http.StatusOK {
+		cap = newUsageCapture(resp.Header.Get("Content-Type"), resp.Header.Get("Content-Encoding"))
+	}
+
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
 	var rxBytes int64
@@ -310,7 +319,10 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				h.log.Warn("client write error", "err", werr, "cred", cred.ID, "streamed", rxBytes)
-				return resp.StatusCode, rxBytes
+				return resp.StatusCode, rxBytes, closeUsage(cap)
+			}
+			if cap != nil {
+				cap.Write(buf[:n])
 			}
 			rxBytes += int64(n)
 			if flusher != nil {
@@ -320,17 +332,25 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 		if rerr == io.EOF {
 			h.log.Debug("stream done",
 				"cred", cred.ID, "label", cred.Label, "status", resp.StatusCode, "bytes", rxBytes)
-			return resp.StatusCode, rxBytes
+			return resp.StatusCode, rxBytes, closeUsage(cap)
 		}
 		if rerr != nil {
 			h.log.Warn("upstream stream error", "err", rerr, "cred", cred.ID, "streamed", rxBytes)
-			return resp.StatusCode, rxBytes
+			return resp.StatusCode, rxBytes, closeUsage(cap)
 		}
 	}
 }
 
+// closeUsage finalizes a capture (nil-safe) and returns the parsed usage.
+func closeUsage(c *usageCapture) tokenUsage {
+	if c == nil {
+		return tokenUsage{}
+	}
+	return c.Close()
+}
+
 // logRequest inserts one row into request_log for dashboard aggregation.
-func (h *Handler) logRequest(ctx context.Context, path, convID, credID string, status int, txBytes, rxBytes int64, latency time.Duration) {
+func (h *Handler) logRequest(ctx context.Context, path, convID, credID string, status int, txBytes, rxBytes int64, latency time.Duration, usage tokenUsage) {
 	id := usertoken.FromContext(ctx)
 	var userTokenID *string
 	if id != nil && id.UserTokenID != "" {
@@ -339,10 +359,13 @@ func (h *Handler) logRequest(ctx context.Context, path, convID, credID string, s
 	_, _ = h.db.ExecContext(ctx, `
 		INSERT INTO request_log
 		  (user_token_id, credential_id, conv_id, ts, path, status_code,
-		   bytes_sent, bytes_received, latency_ms)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		   bytes_sent, bytes_received, latency_ms,
+		   model, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		userTokenID, credID, convID, time.Now().Unix(), path, status,
-		txBytes, rxBytes, latency.Milliseconds())
+		txBytes, rxBytes, latency.Milliseconds(),
+		usage.Model, usage.InputTokens, usage.OutputTokens,
+		usage.CacheCreationTokens, usage.CacheReadTokens)
 }
 
 func copyHeaders(dst, src http.Header) {

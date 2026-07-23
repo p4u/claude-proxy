@@ -32,6 +32,11 @@ func Open(path string) (*DB, error) {
 		`ALTER TABLE credentials ADD COLUMN success_count INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE credentials ADD COLUMN error_count INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE credentials ADD COLUMN weight INTEGER NOT NULL DEFAULT 1`,
+		`ALTER TABLE request_log ADD COLUMN model TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE request_log ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE request_log ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE request_log ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE request_log ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := sdb.Exec(alter); err != nil && !isDuplicateColumn(err) {
 			_ = sdb.Close()

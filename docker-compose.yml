@@ -16,6 +16,13 @@ services:
     environment:
       # Auth token — read by the binary at startup. Empty disables auth.
       CLAUDE_PROXY_AUTH_TOKEN: "${PROXY_AUTH_TOKEN:-}"
+      # Web UI password — read by the binary at startup. Empty disables the
+      # UI (/ui/* returns 404). Served on the same port; traefik/TLS above
+      # covers it automatically.
+      CLAUDE_PROXY_UI_PASSWORD: "${UI_PASSWORD:-}"
+      # Force Secure session cookies for the UI. Usually left empty — TLS via
+      # traefik is auto-detected from X-Forwarded-Proto.
+      CLAUDE_PROXY_UI_SECURE_COOKIES: "${UI_SECURE_COOKIES:-}"
     ports:
       # When traefik is active (profile=tls), keep this on 127.0.0.1 — traefik
       # reaches the container over the docker network, no host port needed.

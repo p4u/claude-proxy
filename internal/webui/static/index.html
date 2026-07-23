@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="dark light" />
+  <title>claude-proxy · control tower</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23121d21'/%3E%3Cg fill='%2334c6c0'%3E%3Crect x='7' y='16' width='3.5' height='9' rx='1.5'/%3E%3Crect x='12.5' y='9' width='3.5' height='16' rx='1.5'/%3E%3Crect x='18' y='19' width='3.5' height='6' rx='1.5'/%3E%3Crect x='23.5' y='13' width='3.5' height='12' rx='1.5'/%3E%3C/g%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="./vendor/uPlot.min.css" />
+  <link rel="stylesheet" href="./css/base.css" />
+  <link rel="stylesheet" href="./css/charts.css" />
+</head>
+<body>
+  <div id="app">
+    <div class="loading" style="min-height:100vh"><span class="loading__ring"></span><span>Starting…</span></div>
+  </div>
+  <script src="./vendor/uPlot.iife.min.js"></script>
+  <script type="module">
+    if (new URLSearchParams(location.search).has("mock")) {
+      await import("./js/mock.js");
+    }
+    await import("./js/app.js");
+  </script>
+</body>
+</html>

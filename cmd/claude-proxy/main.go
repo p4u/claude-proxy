@@ -25,6 +25,7 @@ import (
 	"github.com/p4u/claude-proxy/internal/tui"
 	"github.com/p4u/claude-proxy/internal/usage"
 	"github.com/p4u/claude-proxy/internal/usertoken"
+	"github.com/p4u/claude-proxy/internal/webui"
 )
 
 const helpText = `claude-proxy — sticky multi-subscription proxy for Claude Code
@@ -77,6 +78,15 @@ func main() {
 	}
 }
 
+// isTruthy reports whether an env-style string means "on".
+func isTruthy(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
 func isTerminal(f *os.File) bool {
 	if f == nil {
 		return false
@@ -103,6 +113,8 @@ func runServe(args []string) {
 	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
 	authToken := fs.String("auth-token", os.Getenv("CLAUDE_PROXY_AUTH_TOKEN"),
 		"shared bearer token (env CLAUDE_PROXY_AUTH_TOKEN). empty disables auth.")
+	uiPassword := fs.String("ui-password", os.Getenv("CLAUDE_PROXY_UI_PASSWORD"),
+		"web UI password (env CLAUDE_PROXY_UI_PASSWORD). empty disables the UI.")
 	_ = fs.String("on-limited", "passthrough", "behavior when pinned credential is limited")
 	logLevel := fs.String("log-level", "info", "log level: debug|info|warn|error")
 	logFormat := fs.String("log-format", "auto", "log format: auto|pretty|text|json")
@@ -176,6 +188,14 @@ func runServe(args []string) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
+
+	if *uiPassword != "" {
+		secureCookies := isTruthy(os.Getenv("CLAUDE_PROXY_UI_SECURE_COOKIES"))
+		uiH := webui.New(db, r, *uiPassword, secureCookies)
+		mux.Handle("/ui/", uiH)
+		mux.Handle("/ui", uiH)
+		logger.Info("web UI enabled", "path", "/ui/", "secure_cookies", secureCookies)
+	}
 
 	if *authToken != "" {
 		logger.Info("downstream auth enabled (Authorization: Bearer / x-api-key)")
@@ -662,60 +682,28 @@ func usersStats(ctx context.Context, args []string) {
 		filterID = fs.Arg(0)
 	}
 
-	list, err := usertoken.List(ctx, db)
+	stats, err := usertoken.Stats(ctx, db, time.Unix(since, 0), filterID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "list: %v\n", err)
+		fmt.Fprintf(os.Stderr, "stats: %v\n", err)
 		os.Exit(1)
-	}
-
-	type row struct {
-		Requests   int64
-		OK         int64
-		Errors     int64
-		BytesSent  int64
-		BytesRecv  int64
-		LatencySum int64
-		Convs      int64
 	}
 
 	fmt.Printf("Period: last %s\n\n", *period)
 	fmt.Printf("%-22s  %-20s  %8s  %6s  %6s  %10s  %10s  %9s  %6s\n",
 		"ID", "NAME", "REQUESTS", "OK", "ERR", "SENT", "RECEIVED", "AVG_LAT", "CONVS")
 
-	printed := 0
-	for _, ut := range list {
-		if filterID != "" && ut.ID != filterID {
-			continue
-		}
-		var r row
-		err := db.QueryRowContext(ctx, `
-			SELECT
-				COUNT(*),
-				SUM(CASE WHEN status_code=200 THEN 1 ELSE 0 END),
-				SUM(CASE WHEN status_code>=400 OR status_code=-1 THEN 1 ELSE 0 END),
-				COALESCE(SUM(bytes_sent),0),
-				COALESCE(SUM(bytes_received),0),
-				COALESCE(SUM(latency_ms),0),
-				COUNT(DISTINCT CASE WHEN conv_id!='' THEN conv_id END)
-			FROM request_log
-			WHERE user_token_id=? AND ts>=?`, ut.ID, since).
-			Scan(&r.Requests, &r.OK, &r.Errors, &r.BytesSent, &r.BytesRecv, &r.LatencySum, &r.Convs)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "query %s: %v\n", ut.ID, err)
-			continue
-		}
+	for _, s := range stats {
 		avgLat := "-"
-		if r.Requests > 0 {
-			avgLat = fmt.Sprintf("%dms", r.LatencySum/r.Requests)
+		if s.Requests > 0 {
+			avgLat = fmt.Sprintf("%dms", s.AvgLatencyMs)
 		}
 		fmt.Printf("%-22s  %-20s  %8d  %6d  %6d  %10s  %10s  %9s  %6d\n",
-			ut.ID, ut.Name,
-			r.Requests, r.OK, r.Errors,
-			fmtBytes(r.BytesSent), fmtBytes(r.BytesRecv),
-			avgLat, r.Convs)
-		printed++
+			s.ID, s.Name,
+			s.Requests, s.OK, s.Errors,
+			fmtBytes(s.BytesSent), fmtBytes(s.BytesReceived),
+			avgLat, s.Conversations)
 	}
-	if printed == 0 && filterID != "" {
+	if len(stats) == 0 && filterID != "" {
 		fmt.Fprintf(os.Stderr, "no user token with id %q\n", filterID)
 		os.Exit(1)
 	}

@@ -113,11 +113,27 @@ func ImportFromJSON(ctx context.Context, db *store.DB, raw []byte, label string,
 // legitimately re-uses its own lineage, and the file may even carry the same
 // refresh token that is already stored.
 func UpdateFromFile(ctx context.Context, db *store.DB, id, path string) (*creds.Credential, error) {
-	if _, err := creds.Get(ctx, db, id); err != nil {
-		return nil, err
-	}
 	o, err := parseCredFile(path)
 	if err != nil {
+		return nil, err
+	}
+	return updateVerified(ctx, db, id, o)
+}
+
+// UpdateFromJSON is the pasted/JSON-body counterpart to UpdateFromFile. It
+// re-points an existing credential at the tokens in the raw .credentials.json.
+func UpdateFromJSON(ctx context.Context, db *store.DB, id string, raw []byte) (*creds.Credential, error) {
+	o, err := parseCredBytes(raw, "pasted credentials")
+	if err != nil {
+		return nil, err
+	}
+	return updateVerified(ctx, db, id, o)
+}
+
+// updateVerified is the shared liveness-check + token-write path for the
+// UpdateFrom{File,JSON} helpers.
+func updateVerified(ctx context.Context, db *store.DB, id string, o oauthBlock) (*creds.Credential, error) {
+	if _, err := creds.Get(ctx, db, id); err != nil {
 		return nil, err
 	}
 	fmt.Fprintf(os.Stderr, "verifying credential with Anthropic...\n")

@@ -13,6 +13,7 @@ It serves `/v1/*` as a transparent pass-through to `api.anthropic.com`, swapping
 ```bash
 # Run tests (host Go toolchain required)
 make test           # go test -race ./...
+go test -race -run TestName ./internal/pool/   # single test in one package
 make lint           # gofmt + go vet + golangci-lint
 
 # Install golangci-lint v2 (CI version)
@@ -65,6 +66,7 @@ Claude Code (ANTHROPIC_BASE_URL → proxy)
 |---|---|
 | `cmd/claude-proxy/` | CLI entry point; `serve`, `tui`, `creds`, and `users` subcommands |
 | `internal/tui/` | Interactive Bubble Tea management UI (credentials + users tabs) for `claude-proxy tui` |
+| `internal/webui/` | Embedded browser dashboard (`go:embed`), mounted at `/ui` when `CLAUDE_PROXY_UI_PASSWORD` is set; cookie-authenticated JSON API under `/ui/api` (contract: `docs/WEBUI.md`) |
 | `internal/proxy/` | Proxy-mode HTTP handler + `AuthMiddleware` (two-tier auth, request logging) |
 | `internal/pool/` | Usage-aware weighted-random selection + sticky conversation→credential binding |
 | `internal/creds/` | Credential model, status management, proactive/reactive token refresh |
@@ -92,7 +94,7 @@ Claude Code (ANTHROPIC_BASE_URL → proxy)
 
 ### Storage Schema (SQLite)
 
-Six tables (`internal/store/schema.go`): `credentials`, `conversations`, `rr_cursor` (legacy round-robin state), `user_tokens` (named bearer tokens), `request_log` (one row per forwarded request, for per-user stats), `usage_history` (utilization snapshots driving selection). Deleting a credential cascades to `usage_history` (`ON DELETE CASCADE`); `conversations` bindings are cleared inside `creds.Delete`'s transaction, since older DBs created that FK without a cascade clause. Core dependency: `modernc.org/sqlite` (pure Go, no CGO required); `guptarohit/asciigraph` for usage charts and `charmbracelet/bubbletea`+`lipgloss`+`bubbles` for the management TUI.
+Six tables (`internal/store/schema.go`): `credentials`, `conversations`, `rr_cursor` (legacy round-robin state), `user_tokens` (named bearer tokens), `request_log` (one row per forwarded request, for per-user stats), `usage_history` (utilization snapshots driving selection). Deleting a credential cascades to `usage_history` (`ON DELETE CASCADE`); `conversations` bindings are cleared inside `creds.Delete`'s transaction, since older DBs created that FK without a cascade clause. `request_log` additionally carries per-request token usage columns (`model`, `input_tokens`, `output_tokens`, `cache_creation_tokens`, `cache_read_tokens`), added via the existing swallow-duplicate `ALTER TABLE` migration mechanism and populated by `internal/proxy/usagecapture.go` from the tee'd response stream (SSE and non-streaming JSON) — this feeds the web UI's token stats and never affects what the client receives. Core dependency: `modernc.org/sqlite` (pure Go, no CGO required); `guptarohit/asciigraph` for usage charts and `charmbracelet/bubbletea`+`lipgloss`+`bubbles` for the management TUI.
 
 ## Configuration
 
@@ -106,6 +108,8 @@ All runtime config comes from `.env` (copy from `.env.example`). Key variables:
 | `LOG_LEVEL` | `info` | `debug\|info\|warn\|error` |
 | `LOG_FORMAT` | `auto` | `pretty\|text\|json\|auto` |
 | `LOG_COLOR` | `auto` | `auto\|always\|never` |
+| `UI_PASSWORD` | _(empty)_ | Web UI password (`CLAUDE_PROXY_UI_PASSWORD`); empty = UI disabled, `/ui/*` 404s |
+| `UI_SECURE_COOKIES` | _(empty)_ | Force `Secure` UI session cookies (`CLAUDE_PROXY_UI_SECURE_COOKIES`); auto-detected behind Traefik via `X-Forwarded-Proto` |
 | `TLS_DOMAIN` | _(empty)_ | Set (with `TLS_EMAIL`) to enable Traefik + Let's Encrypt |
 | `CLAUDE_PROXY_IMAGE` | `ghcr.io/p4u/claude-proxy:latest` | Override to use local build |
 
@@ -165,6 +169,10 @@ CLI equivalents live under `claude-proxy users <create|list|stats|token|disable|
 - `GET /admin/stats` — aggregate counters
 - `POST /admin/credentials/:id/disable` — disable a credential
 - `DELETE /admin/credentials/:id` — delete credential
+
+A separate, cookie-authenticated API backs the web UI at `/ui/api/*` (password
+login, not `PROXY_AUTH_TOKEN`/user tokens); see [`docs/WEBUI.md`](./docs/WEBUI.md)
+for the full contract (auth model, endpoints, response shapes).
 
 ## CI/CD
 

@@ -58,7 +58,12 @@ CREATE TABLE IF NOT EXISTS request_log (
   status_code    INTEGER NOT NULL DEFAULT 0,
   bytes_sent     INTEGER NOT NULL DEFAULT 0,
   bytes_received INTEGER NOT NULL DEFAULT 0,
-  latency_ms     INTEGER NOT NULL DEFAULT 0
+  latency_ms     INTEGER NOT NULL DEFAULT 0,
+  model                 TEXT    NOT NULL DEFAULT '',
+  input_tokens          INTEGER NOT NULL DEFAULT 0,
+  output_tokens         INTEGER NOT NULL DEFAULT 0,
+  cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_request_log_user_ts ON request_log(user_token_id, ts);
 CREATE INDEX IF NOT EXISTS idx_request_log_ts      ON request_log(ts);

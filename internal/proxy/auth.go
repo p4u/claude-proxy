@@ -26,6 +26,12 @@ func AuthMiddleware(adminToken string, db *store.DB, next http.Handler) http.Han
 			return
 		}
 
+		// The web UI authenticates itself with its own session cookie.
+		if r.URL.Path == "/ui" || strings.HasPrefix(r.URL.Path, "/ui/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		bearer := extractToken(r)
 
 		// Admin token check.
