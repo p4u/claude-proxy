@@ -92,13 +92,14 @@ type usageSeries struct {
 }
 
 func (s *Server) handleUsageHistory(w http.ResponseWriter, r *http.Request) {
-	from, _, _, err := periodBounds(r)
+	from, to, _, err := parseWindow(r)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	ctx := r.Context()
 	since := time.Unix(from, 0)
+	until := time.Unix(to, 0)
 
 	list, err := creds.List(ctx, s.db)
 	if err != nil {
@@ -116,7 +117,7 @@ func (s *Server) handleUsageHistory(w http.ResponseWriter, r *http.Request) {
 		if filter != "" && c.ID != filter {
 			continue
 		}
-		points, err := s.usageHistoryPoints(ctx, c.ID, since)
+		points, err := s.usageHistoryPoints(ctx, c.ID, since, until)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
@@ -126,12 +127,12 @@ func (s *Server) handleUsageHistory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"series": out})
 }
 
-func (s *Server) usageHistoryPoints(ctx context.Context, credID string, since time.Time) ([]usagePoint, error) {
+func (s *Server) usageHistoryPoints(ctx context.Context, credID string, since, until time.Time) ([]usagePoint, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT captured_at, five_hour_pct, seven_day_pct, seven_day_sonnet_pct
 		FROM usage_history
-		WHERE credential_id = ? AND captured_at >= ?
-		ORDER BY captured_at ASC`, credID, since.Unix())
+		WHERE credential_id = ? AND captured_at >= ? AND captured_at < ?
+		ORDER BY captured_at ASC`, credID, since.Unix(), until.Unix())
 	if err != nil {
 		return nil, err
 	}

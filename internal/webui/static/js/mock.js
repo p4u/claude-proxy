@@ -1,4 +1,4 @@
-// Dev mock: intercepts fetch for /ui/api/* and returns realistic sample data.
+// Dev mock: intercepts fetch for /api/* and returns realistic sample data.
 // Activated only when the page URL contains ?mock=1. No effect in production.
 
 import { API_BASE } from "./api.js";
@@ -27,11 +27,25 @@ function periodSpan(p) {
   return { "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800, "30d": 2592000 }[p] || 86400;
 }
 
-function buckets(period, n) {
-  const span = periodSpan(period);
-  const step = span / n;
-  const start = now - span;
-  return Array.from({ length: n }, (_, i) => Math.round(start + step * (i + 1)));
+// Resolve the requested window from query params: a custom from/to range (unix
+// seconds) overrides the preset period, mirroring the real backend contract.
+function resolveWindow(q) {
+  const from = q.get("from");
+  const to = q.get("to");
+  if (from != null && to != null) {
+    const f = Number(from);
+    const t = Number(to);
+    const valid = !(isNaN(f) || isNaN(t) || f >= t || t - f > 90 * 86400);
+    return { start: f, end: t, span: Math.max(1, t - f), custom: true, valid };
+  }
+  const span = periodSpan(q.get("period") || "24h");
+  return { start: now - span, end: now, span, custom: false, valid: true };
+}
+
+function buckets(q, n) {
+  const w = resolveWindow(q);
+  const step = w.span / n;
+  return Array.from({ length: n }, (_, i) => Math.round(w.start + step * (i + 1)));
 }
 
 function wave(n, base, amp, seed, floor = 0) {
@@ -41,9 +55,9 @@ function wave(n, base, amp, seed, floor = 0) {
   });
 }
 
-function groupSeries(period, group, kind) {
+function groupSeries(q, group) {
   const n = 60;
-  const b = buckets(period, n);
+  const b = buckets(q, n);
   const src = group === "user" ? USERS.filter((u) => u.status === "active") : CREDS.filter((c) => c.status === "active");
   const series = src.map((s, i) => {
     const reqs = wave(n, 20 - i * 3, 40, i + 1, 0);
@@ -71,29 +85,28 @@ const DB = {
     avg_latency_ms_24h: 842,
     error_rate_24h: 0.021,
   }),
-  "/stats/requests": (q) => {
-    const g = q.get("group_by") || "user";
-    return groupSeries(q.get("period") || "24h", g);
-  },
-  "/stats/tokens": (q) => {
-    const g = q.get("group_by") || "user";
-    return groupSeries(q.get("period") || "24h", g);
-  },
+  "/stats/requests": (q) => groupSeries(q, q.get("group_by") || "user"),
+  "/stats/tokens": (q) => groupSeries(q, q.get("group_by") || "user"),
   "/stats/latency": (q) => {
     const n = 60;
-    const b = buckets(q.get("period") || "24h", n);
+    const b = buckets(q, n);
     const avg = wave(n, 700, 500, 3, 120);
     return { buckets: b, avg_ms: avg, p95_ms: avg.map((v) => Math.round(v * 1.9 + 200)) };
   },
-  "/stats/users": () =>
-    USERS.map((u, i) => ({
-      id: u.id, name: u.name, requests: [8200, 5400, 1200, 3600][i], ok: [8050, 5310, 1180, 3550][i],
-      errors: [150, 90, 20, 50][i], tokens_in: [19_000_000, 12_000_000, 2_400_000, 8_900_000][i],
-      tokens_out: [4_200_000, 2_800_000, 600_000, 1_900_000][i], cache_read: [40e6, 26e6, 5e6, 18e6][i],
-      cache_creation: [1.1e6, 0.7e6, 0.2e6, 0.5e6][i], bytes_sent: [22e6, 14e6, 3e6, 9e6][i],
-      bytes_received: [180e6, 120e6, 22e6, 78e6][i], avg_latency_ms: [812, 903, 640, 1120][i],
+  "/stats/users": (q) => {
+    // Scale scalar totals by the selected window vs a 24h baseline so custom
+    // ranges and presets visibly move the numbers.
+    const scale = Math.max(0.15, resolveWindow(q).span / 86400);
+    const k = (v) => Math.round(v * scale);
+    return USERS.map((u, i) => ({
+      id: u.id, name: u.name, requests: k([8200, 5400, 1200, 3600][i]), ok: k([8050, 5310, 1180, 3550][i]),
+      errors: k([150, 90, 20, 50][i]), tokens_in: k([19_000_000, 12_000_000, 2_400_000, 8_900_000][i]),
+      tokens_out: k([4_200_000, 2_800_000, 600_000, 1_900_000][i]), cache_read: k([40e6, 26e6, 5e6, 18e6][i]),
+      cache_creation: k([1.1e6, 0.7e6, 0.2e6, 0.5e6][i]), bytes_sent: k([22e6, 14e6, 3e6, 9e6][i]),
+      bytes_received: k([180e6, 120e6, 22e6, 78e6][i]), avg_latency_ms: [812, 903, 640, 1120][i],
       conversations: [12, 9, 3, 7][i],
-    })),
+    }));
+  },
   "/usage/current": () =>
     CREDS.map((c, i) => {
       const five = [72, 41, 100, 18, 0][i];
@@ -109,7 +122,7 @@ const DB = {
     }),
   "/usage/history": (q) => {
     const n = 48;
-    const b = buckets(q.get("period") || "24h", n);
+    const b = buckets(q, n);
     const series = CREDS.filter((c) => c.status !== "disabled").map((c, i) => ({
       credential_id: c.id, label: c.label,
       points: b.map((ts, j) => ({
@@ -165,9 +178,15 @@ window.fetch = async (input, init = {}) => {
     return json({ ok: true });
   }
 
+  // Mirror the backend's 400 on invalid custom windows (from>=to or span >90d).
+  if (u.searchParams.has("from") && u.searchParams.has("to")) {
+    const w = resolveWindow(u.searchParams);
+    if (!w.valid) return json({ error: "invalid range: from must be before to and span ≤ 90 days" }, 400);
+  }
+
   const handler = DB[path];
   if (handler) return json(handler(u.searchParams));
   return json({ error: "mock: no route for " + path }, 404);
 };
 
-console.info("[claude-proxy] mock mode active — /ui/api/* served from sample data");
+console.info("[claude-proxy] mock mode active — /api/* served from sample data");

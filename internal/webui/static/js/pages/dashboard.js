@@ -1,7 +1,7 @@
 import { api } from "../api.js";
 import { el, clear, spinner, errorState, emptyState } from "../ui.js";
-import { statTile, segmented, chartFrame, legend, sectionHead } from "../components.js";
-import { getPeriod, setPeriod, PERIODS } from "../store.js";
+import { statTile, segmented, chartFrame, periodControl, sectionHead } from "../components.js";
+import { getWindow, setWindowPeriod, setWindowCustom } from "../store.js";
 import { timeChart } from "../charts.js";
 import { compactNum, fullNum, ms, pct } from "../format.js";
 
@@ -10,15 +10,21 @@ const GROUP_OPTS = [
   { value: "credential", label: "By credential" },
 ];
 
+function onWindowChange(root, sel) {
+  if (sel.mode === "custom") setWindowCustom(sel.from, sel.to);
+  else setWindowPeriod(sel.period);
+  render(root);
+}
+
 export async function render(root) {
   clear(root);
-  const period = getPeriod();
+  const win = getWindow();
 
   const tilesWrap = el("div", { class: "tiles" }, spinner("Loading overview…"));
   const head = sectionHead(
     "Control room",
     "Live traffic across every multiplexed subscription.",
-    [segmented(PERIODS, period, (p) => { setPeriod(p); render(root); }, "Time period")]
+    [periodControl(win, (sel) => onWindowChange(root, sel))]
   );
   const chartsWrap = el("div", { class: "grid grid--charts" });
   root.append(head, tilesWrap, chartsWrap);
@@ -54,9 +60,9 @@ export async function render(root) {
   }
 
   // Charts
-  requestsChart(chartsWrap, period);
-  tokensChart(chartsWrap, period);
-  latencyChart(chartsWrap, period);
+  requestsChart(chartsWrap, win);
+  tokensChart(chartsWrap, win);
+  latencyChart(chartsWrap, win);
 }
 
 function mountChart(frame, buckets, series, mode, fmt, yRange) {
@@ -65,10 +71,10 @@ function mountChart(frame, buckets, series, mode, fmt, yRange) {
     return;
   }
   const ch = timeChart(frame.plot, { buckets, series, mode, fmt, height: 240, yRange });
-  frame.legendSlot.append(legend(ch.legendItems));
+  frame.legendSlot.append(ch.legendEl);
 }
 
-async function requestsChart(wrap, period) {
+async function requestsChart(wrap, win) {
   let group = "user";
   const frame = chartFrame({
     eyebrow: "throughput",
@@ -81,7 +87,7 @@ async function requestsChart(wrap, period) {
     clear(frame.legendSlot);
     frame.plot.append(spinner());
     try {
-      const d = await api.statsRequests(period, 60, group);
+      const d = await api.statsRequests(win, 60, group);
       clear(frame.plot);
       const series = (d.series || []).map((s) => ({ label: s.label, values: s.requests }));
       mountChart(frame, d.buckets, series, "stack", compactNum);
@@ -92,7 +98,7 @@ async function requestsChart(wrap, period) {
   draw();
 }
 
-async function tokensChart(wrap, period) {
+async function tokensChart(wrap, win) {
   let group = "user";
   const frame = chartFrame({
     eyebrow: "consumption",
@@ -105,7 +111,7 @@ async function tokensChart(wrap, period) {
     clear(frame.legendSlot);
     frame.plot.append(spinner());
     try {
-      const d = await api.statsTokens(period, 60, group);
+      const d = await api.statsTokens(win, 60, group);
       clear(frame.plot);
       const series = (d.series || []).map((s) => ({
         label: s.label,
@@ -119,7 +125,7 @@ async function tokensChart(wrap, period) {
   draw();
 }
 
-async function latencyChart(wrap, period) {
+async function latencyChart(wrap, win) {
   const frame = chartFrame({ eyebrow: "responsiveness", title: "Latency (avg / p95)" });
   frame.root.classList.add("chart--wide");
   wrap.append(frame.root);
@@ -128,7 +134,7 @@ async function latencyChart(wrap, period) {
     clear(frame.legendSlot);
     frame.plot.append(spinner());
     try {
-      const d = await api.statsLatency(period, 60);
+      const d = await api.statsLatency(win, 60);
       clear(frame.plot);
       if (!d.buckets || !d.buckets.length) {
         frame.plot.append(emptyState("No data yet", "Latency is recorded per forwarded request."));
@@ -139,7 +145,7 @@ async function latencyChart(wrap, period) {
         { label: "p95", values: d.p95_ms, dash: [5, 4] },
       ];
       const ch = timeChart(frame.plot, { buckets: d.buckets, series, mode: "line", fmt: ms, fill: false, height: 240 });
-      frame.legendSlot.append(legend(ch.legendItems));
+      frame.legendSlot.append(ch.legendEl);
     } catch (e) {
       clear(frame.plot).append(errorState(e.message, draw));
     }

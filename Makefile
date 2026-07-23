@@ -226,7 +226,7 @@ stats: ## GET /admin/stats.
 _UI_PASS := $(shell grep -E '^UI_PASSWORD=.+' $(ENV_FILE) 2>/dev/null | tail -n1 | cut -d= -f2-)
 
 ui: ## Print the web UI URL and whether UI_PASSWORD is set.
-	@echo "UI URL: $(BASE)/ui"
+	@echo "UI URL: $(BASE)/"
 	@if [ -n "$(_UI_PASS)" ]; then \
 		echo "UI_PASSWORD: set"; \
 	else \

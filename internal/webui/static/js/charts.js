@@ -3,6 +3,7 @@
 // the dataviz validator (both modes PASS).
 
 import { axisTime, compactNum } from "./format.js";
+import { el } from "./ui.js";
 
 const SERIES_LIGHT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"];
 const SERIES_DARK = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767"];
@@ -121,6 +122,11 @@ export function timeChart(container, spec) {
 
   let data, uSeries;
   const legendItems = [];
+  // uidx[originalSeriesIndex] = column index within uPlot data/series.
+  const uidx = [];
+  // For stacked charts we keep each series' raw (non-cumulative) contribution so
+  // solo can swap in the true per-series values instead of the cumulative band.
+  const rawByItem = [];
 
   if (spec.mode === "stack") {
     // Cumulative arrays; draw top→bottom so lower series paint on top (solid fill to 0).
@@ -138,6 +144,8 @@ export function timeChart(container, spec) {
     const order = spec.series.map((_, i) => i).reverse();
     for (const i of order) {
       data.push(cum[i]);
+      uidx[i] = data.length - 1;
+      rawByItem[i] = spec.series[i].values;
       const col = colors[i % colors.length];
       uSeries.push({
         label: spec.series[i].label,
@@ -156,6 +164,7 @@ export function timeChart(container, spec) {
     spec.series.forEach((s, i) => {
       const col = s.color || colors[i % colors.length];
       data.push(s.values);
+      uidx[i] = data.length - 1;
       uSeries.push({
         label: s.label,
         _color: col,
@@ -236,5 +245,65 @@ export function timeChart(container, spec) {
     u.setSize({ width: container.clientWidth, height: spec.height || 240 });
   });
   ro.observe(container);
-  return { u, legendItems, destroy: () => { ro.disconnect(); u.destroy(); } };
+
+  const legendEl = buildInteractiveLegend(u, {
+    items: legendItems,
+    uidx,
+    stack: spec.mode === "stack",
+    fullData: data,
+    rawByItem,
+  });
+
+  return { u, legendItems, legendEl, destroy: () => { ro.disconnect(); u.destroy(); } };
+}
+
+// Interactive legend with keyboard-accessible solo behavior. Clicking a series
+// solos it (hides the rest); clicking the soloed series again restores all;
+// clicking a different series switches the solo target. Other entries dim while
+// soloed. For stacked charts, soloing swaps in the series' raw (per-bucket)
+// values so a single band reads its own contribution, not the cumulative total.
+function buildInteractiveLegend(u, cfg) {
+  const { items, uidx, stack, fullData, rawByItem } = cfg;
+  const root = el("div", { class: "legend legend--interactive" });
+  const btns = [];
+  let soloed = null;
+
+  const apply = () => {
+    if (stack) {
+      if (soloed == null) {
+        u.setData(fullData);
+      } else {
+        const d = fullData.slice();
+        d[uidx[soloed]] = rawByItem[soloed];
+        u.setData(d);
+      }
+    }
+    items.forEach((_, k) => {
+      const show = soloed == null || soloed === k;
+      u.setSeries(uidx[k], { show });
+      const dim = soloed != null && soloed !== k;
+      btns[k].classList.toggle("is-dim", dim);
+      btns[k].classList.toggle("is-solo", soloed === k);
+      btns[k].setAttribute("aria-pressed", soloed === k ? "true" : "false");
+    });
+  };
+
+  items.forEach((it, k) => {
+    const b = el("button", {
+      class: "legend__item",
+      type: "button",
+      "aria-pressed": "false",
+      title: `Solo ${it.label}`,
+    }, [
+      el("span", { class: "legend__sw" + (it.dash ? " legend__sw--dash" : ""), style: `--sw:${it.color}` }),
+      el("span", { class: "legend__lbl", text: it.label }),
+    ]);
+    b.addEventListener("click", () => {
+      soloed = soloed === k ? null : k;
+      apply();
+    });
+    btns.push(b);
+    root.append(b);
+  });
+  return root;
 }

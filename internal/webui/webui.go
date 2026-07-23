@@ -1,6 +1,7 @@
 // Package webui serves the management/monitoring dashboard (cookie-authenticated
-// REST API + embedded SPA) under /ui/. It is mounted by the serve command only
-// when a UI password is configured.
+// REST API under /api/ + embedded SPA) at the root "/". It is mounted by the
+// serve command only when a UI password is configured. Legacy /ui* paths
+// permanently redirect to the root.
 package webui
 
 import (
@@ -53,16 +54,25 @@ func New(db *store.DB, refresher *creds.Refresher, password string, secureCookie
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	switch {
-	case path == "/ui":
-		http.Redirect(w, r, "/ui/", http.StatusMovedPermanently)
-	case strings.HasPrefix(path, "/ui/api/"):
-		s.serveAPI(w, r, strings.TrimPrefix(path, "/ui/api"))
+	case path == "/ui" || strings.HasPrefix(path, "/ui/"):
+		// Legacy /ui* paths permanently redirect to the root, stripping the
+		// /ui prefix but preserving the remainder and query string.
+		target := strings.TrimPrefix(path, "/ui")
+		if target == "" {
+			target = "/"
+		}
+		if r.URL.RawQuery != "" {
+			target += "?" + r.URL.RawQuery
+		}
+		http.Redirect(w, r, target, http.StatusPermanentRedirect)
+	case path == "/api" || strings.HasPrefix(path, "/api/"):
+		s.serveAPI(w, r, strings.TrimPrefix(path, "/api"))
 	default:
 		s.serveStatic(w, r)
 	}
 }
 
-// serveAPI dispatches the REST API. `rest` is the path after /ui/api (e.g.
+// serveAPI dispatches the REST API. `rest` is the path after /api (e.g.
 // "/login", "/stats/requests"). Unauthenticated endpoints are handled first;
 // everything else requires a valid session cookie.
 func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, rest string) {
@@ -111,15 +121,15 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, rest string) {
 	}
 }
 
-// serveStatic serves embedded assets under /ui/, with SPA fallback: any unknown
-// path that is not an API route returns index.html so client-side hash routing
-// works on hard refresh.
+// serveStatic serves embedded assets from the root, with SPA fallback: any
+// non-file path (deep link like /dashboard, or a directory) returns index.html
+// so client-side hash routing works on hard refresh.
 func (s *Server) serveStatic(w http.ResponseWriter, r *http.Request) {
-	rel := strings.TrimPrefix(r.URL.Path, "/ui/")
+	rel := strings.TrimPrefix(r.URL.Path, "/")
 	if rel == "" {
-		rel = "index.html"
+		s.serveFile(w, r, "index.html")
+		return
 	}
-	rel = strings.TrimPrefix(rel, "/")
 
 	f, err := s.static.Open(rel)
 	if err != nil {
@@ -127,7 +137,13 @@ func (s *Server) serveStatic(w http.ResponseWriter, r *http.Request) {
 		s.serveFile(w, r, "index.html")
 		return
 	}
+	st, serr := f.Stat()
 	f.Close()
+	if serr != nil || st.IsDir() {
+		// Directories aren't files → fall back to the SPA entrypoint.
+		s.serveFile(w, r, "index.html")
+		return
+	}
 	s.serveFile(w, r, rel)
 }
 

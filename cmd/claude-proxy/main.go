@@ -189,12 +189,16 @@ func runServe(args []string) {
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
 
-	if *uiPassword != "" {
+	uiEnabled := *uiPassword != ""
+	if uiEnabled {
 		secureCookies := isTruthy(os.Getenv("CLAUDE_PROXY_UI_SECURE_COOKIES"))
 		uiH := webui.New(db, r, *uiPassword, secureCookies)
-		mux.Handle("/ui/", uiH)
-		mux.Handle("/ui", uiH)
-		logger.Info("web UI enabled", "path", "/ui/", "secure_cookies", secureCookies)
+		// The UI owns the root: reserved prefixes (/v1/, /admin/, /health) are
+		// registered above and win by ServeMux's longest-match rule; everything
+		// else (static assets, SPA deep links, /api/*, legacy /ui redirect)
+		// falls through to the web UI handler.
+		mux.Handle("/", uiH)
+		logger.Info("web UI enabled", "path", "/", "secure_cookies", secureCookies)
 	}
 
 	if *authToken != "" {
@@ -205,7 +209,7 @@ func runServe(args []string) {
 
 	srv := &http.Server{
 		Addr:    *addr,
-		Handler: proxy.AuthMiddleware(*authToken, db, mux),
+		Handler: proxy.AuthMiddleware(*authToken, db, uiEnabled, mux),
 	}
 	go func() {
 		<-ctx.Done()

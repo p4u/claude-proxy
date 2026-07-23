@@ -2,22 +2,26 @@ import { api } from "../api.js";
 import {
   el, clear, spinner, errorState, emptyState, statusBadge, toast, modal, confirmDialog, button, copyText,
 } from "../ui.js";
-import { segmented, sectionHead } from "../components.js";
-import { getPeriod, setPeriod, PERIODS } from "../store.js";
+import { periodControl, sectionHead } from "../components.js";
+import { getWindow, setWindowPeriod, setWindowCustom } from "../store.js";
 import { compactNum, fullNum, ms, relTime } from "../format.js";
 
 export async function render(root) {
   clear(root);
-  const period = getPeriod();
+  const win = getWindow();
   const head = sectionHead("Users", "Per-user bearer tokens and their traffic attribution.", [
-    segmented(PERIODS, period, (p) => { setPeriod(p); render(root); }, "Stats period"),
+    periodControl(win, (sel) => {
+      if (sel.mode === "custom") setWindowCustom(sel.from, sel.to);
+      else setWindowPeriod(sel.period);
+      render(root);
+    }),
     button("Create user", { kind: "primary", onClick: () => createModal(root) }),
   ]);
   const body = el("div", { class: "card table-card" }, spinner("Loading users…"));
   root.append(head, body);
 
   try {
-    const [users, stats] = await Promise.all([api.users(), api.statsUsers(period).catch(() => [])]);
+    const [users, stats] = await Promise.all([api.users(), api.statsUsers(win).catch(() => [])]);
     clear(body);
     if (!users || !users.length) {
       body.append(emptyState("No users yet", 'Create a user to mint a bearer token. Each request it makes is attributed here.'));

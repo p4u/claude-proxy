@@ -1,17 +1,21 @@
 import { api } from "../api.js";
 import { el, clear, spinner, errorState, emptyState, statusBadge } from "../ui.js";
-import { meter, chartFrame, legend, segmented, sectionHead } from "../components.js";
-import { getPeriod, setPeriod, PERIODS } from "../store.js";
+import { meter, chartFrame, periodControl, segmented, sectionHead } from "../components.js";
+import { getWindow, setWindowPeriod, setWindowCustom } from "../store.js";
 import { timeChart, seriesColors } from "../charts.js";
 import { pct, relTime, countdown } from "../format.js";
 
 export async function render(root) {
   clear(root);
-  const period = getPeriod();
+  const win = getWindow();
   const head = sectionHead(
     "Subscriptions",
     "Remote 5-hour and weekly quota utilization per credential. 100% is a hard ceiling — requests 429 on whichever window fills first.",
-    [segmented(PERIODS, period, (p) => { setPeriod(p); render(root); }, "History period")]
+    [periodControl(win, (sel) => {
+      if (sel.mode === "custom") setWindowCustom(sel.from, sel.to);
+      else setWindowPeriod(sel.period);
+      render(root);
+    })]
   );
   const cards = el("div", { class: "grid grid--cards" }, spinner("Reading utilization…"));
   const histWrap = el("div", { class: "hist-wrap" });
@@ -29,7 +33,7 @@ export async function render(root) {
     clear(cards).append(errorState(e.message, () => render(root)));
   }
 
-  historyChart(histWrap, period);
+  historyChart(histWrap, win);
 }
 
 function subCard(r) {
@@ -59,7 +63,7 @@ function tsOf(v) {
   return isNaN(t) ? 0 : t / 1000;
 }
 
-async function historyChart(wrap, period) {
+async function historyChart(wrap, win) {
   clear(wrap);
   let metric = "five_hour_pct";
   const metricOpts = [
@@ -80,7 +84,7 @@ async function historyChart(wrap, period) {
     clear(frame.legendSlot);
     frame.plot.append(spinner());
     try {
-      const d = await api.usageHistory(period);
+      const d = await api.usageHistory(win);
       clear(frame.plot);
       const seriesRaw = d.series || [];
       if (!seriesRaw.length || !seriesRaw.some((s) => (s.points || []).length)) {
@@ -106,7 +110,7 @@ async function historyChart(wrap, period) {
       });
       // Mark the 100% ceiling.
       markCeiling(frame.plot, ch.u);
-      frame.legendSlot.append(legend(ch.legendItems));
+      frame.legendSlot.append(ch.legendEl);
     } catch (e) {
       clear(frame.plot).append(errorState(e.message, draw));
     }

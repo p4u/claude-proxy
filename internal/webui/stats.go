@@ -2,6 +2,7 @@ package webui
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sort"
 	"strconv"
@@ -14,11 +15,38 @@ import (
 const (
 	defaultBuckets = 60
 	maxBuckets     = 200
+
+	// maxWindowSeconds caps a custom from/to window at 90 days.
+	maxWindowSeconds = 90 * 24 * 60 * 60
 )
 
-// periodBounds parses ?period into an absolute [from, now] window in unix secs.
-func periodBounds(r *http.Request) (from, now, dur int64, err error) {
-	p := r.URL.Query().Get("period")
+// parseWindow resolves the query window as an absolute [from, to) range in unix
+// seconds, returning its duration. A custom window is requested via `from`+`to`
+// (unix seconds) and overrides `period`; it must satisfy from<to and span no
+// more than 90 days, otherwise a validation error is returned (surfaced as 400).
+// Absent from/to, `period` (default 24h) is resolved to [now-period, now).
+func parseWindow(r *http.Request) (from, to, dur int64, err error) {
+	q := r.URL.Query()
+	fromStr, toStr := q.Get("from"), q.Get("to")
+	if fromStr != "" || toStr != "" {
+		from, err = strconv.ParseInt(fromStr, 10, 64)
+		if err != nil {
+			return 0, 0, 0, errors.New("invalid 'from': want unix seconds")
+		}
+		to, err = strconv.ParseInt(toStr, 10, 64)
+		if err != nil {
+			return 0, 0, 0, errors.New("invalid 'to': want unix seconds")
+		}
+		if from >= to {
+			return 0, 0, 0, errors.New("'from' must be before 'to'")
+		}
+		if to-from > maxWindowSeconds {
+			return 0, 0, 0, errors.New("window too large: max span is 90 days")
+		}
+		return from, to, to - from, nil
+	}
+
+	p := q.Get("period")
 	if p == "" {
 		p = "24h"
 	}
@@ -26,10 +54,13 @@ func periodBounds(r *http.Request) (from, now, dur int64, err error) {
 	if perr != nil {
 		return 0, 0, 0, perr
 	}
-	now = time.Now().Unix()
+	now := time.Now().Unix()
 	dur = int64(d.Seconds())
 	from = now - dur
-	return from, now, dur, nil
+	// Half-open upper bound one second past `now` so rows logged in the current
+	// second are included; bucketing still spans exactly `dur` from `from`.
+	to = now + 1
+	return from, to, dur, nil
 }
 
 func bucketCount(r *http.Request) int {
@@ -91,7 +122,7 @@ func newSeriesRow(id, label string, n int) *seriesRow {
 // handleStatsSeries powers both /stats/requests and /stats/tokens: they share
 // the same {buckets, series} shape; the frontend reads the fields it needs.
 func (s *Server) handleStatsSeries(w http.ResponseWriter, r *http.Request, _ string) {
-	from, now, dur, err := periodBounds(r)
+	from, to, dur, err := parseWindow(r)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -112,7 +143,7 @@ func (s *Server) handleStatsSeries(w http.ResponseWriter, r *http.Request, _ str
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT ts, COALESCE(user_token_id,''), COALESCE(credential_id,''),
 		       status_code, input_tokens, output_tokens
-		FROM request_log WHERE ts >= ? AND ts <= ?`, from, now)
+		FROM request_log WHERE ts >= ? AND ts < ?`, from, to)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -211,12 +242,12 @@ func (s *Server) labelMap(ctx context.Context, groupBy string) (map[string]strin
 }
 
 func (s *Server) handleStatsUsers(w http.ResponseWriter, r *http.Request) {
-	from, _, _, err := periodBounds(r)
+	from, to, _, err := parseWindow(r)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	stats, err := usertoken.Stats(r.Context(), s.db, time.Unix(from, 0), "")
+	stats, err := usertoken.StatsRange(r.Context(), s.db, time.Unix(from, 0), time.Unix(to, 0), "")
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -228,7 +259,7 @@ func (s *Server) handleStatsUsers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStatsLatency(w http.ResponseWriter, r *http.Request) {
-	from, now, dur, err := periodBounds(r)
+	from, to, dur, err := parseWindow(r)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -236,7 +267,7 @@ func (s *Server) handleStatsLatency(w http.ResponseWriter, r *http.Request) {
 	n := bucketCount(r)
 
 	rows, err := s.db.QueryContext(r.Context(), `
-		SELECT ts, latency_ms FROM request_log WHERE ts >= ? AND ts <= ?`, from, now)
+		SELECT ts, latency_ms FROM request_log WHERE ts >= ? AND ts < ?`, from, to)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return

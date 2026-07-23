@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -47,7 +48,7 @@ func do(t *testing.T, h http.Handler, method, path, body string, cookie *http.Co
 
 func loginCookie(t *testing.T, h http.Handler) *http.Cookie {
 	t.Helper()
-	w := do(t, h, http.MethodPost, "/ui/api/login", `{"password":"`+testPassword+`"}`, nil)
+	w := do(t, h, http.MethodPost, "/api/login", `{"password":"`+testPassword+`"}`, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("login failed: %d %s", w.Code, w.Body.String())
 	}
@@ -62,7 +63,7 @@ func loginCookie(t *testing.T, h http.Handler) *http.Cookie {
 
 func TestSessionUnauthenticated(t *testing.T) {
 	_, h := newTestServer(t)
-	w := do(t, h, http.MethodGet, "/ui/api/session", "", nil)
+	w := do(t, h, http.MethodGet, "/api/session", "", nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("session code = %d", w.Code)
 	}
@@ -77,7 +78,7 @@ func TestSessionUnauthenticated(t *testing.T) {
 
 func TestProtectedRequires401(t *testing.T) {
 	_, h := newTestServer(t)
-	w := do(t, h, http.MethodGet, "/ui/api/overview", "", nil)
+	w := do(t, h, http.MethodGet, "/api/overview", "", nil)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("overview without cookie = %d, want 401", w.Code)
 	}
@@ -87,26 +88,26 @@ func TestLoginSessionFlow(t *testing.T) {
 	_, h := newTestServer(t)
 
 	// Wrong password.
-	if w := do(t, h, http.MethodPost, "/ui/api/login", `{"password":"nope"}`, nil); w.Code != http.StatusUnauthorized {
+	if w := do(t, h, http.MethodPost, "/api/login", `{"password":"nope"}`, nil); w.Code != http.StatusUnauthorized {
 		t.Fatalf("bad login = %d, want 401", w.Code)
 	}
 
 	cookie := loginCookie(t, h)
 
 	// Session now authenticated.
-	w := do(t, h, http.MethodGet, "/ui/api/session", "", cookie)
+	w := do(t, h, http.MethodGet, "/api/session", "", cookie)
 	if !strings.Contains(w.Body.String(), "true") {
 		t.Errorf("session not authenticated: %s", w.Body.String())
 	}
 
 	// Protected endpoint works with cookie.
-	if w := do(t, h, http.MethodGet, "/ui/api/overview", "", cookie); w.Code != http.StatusOK {
+	if w := do(t, h, http.MethodGet, "/api/overview", "", cookie); w.Code != http.StatusOK {
 		t.Fatalf("overview with cookie = %d: %s", w.Code, w.Body.String())
 	}
 
 	// Tampered cookie rejected.
 	bad := &http.Cookie{Name: sessionCookie, Value: cookie.Value + "x"}
-	if w := do(t, h, http.MethodGet, "/ui/api/overview", "", bad); w.Code != http.StatusUnauthorized {
+	if w := do(t, h, http.MethodGet, "/api/overview", "", bad); w.Code != http.StatusUnauthorized {
 		t.Fatalf("tampered cookie = %d, want 401", w.Code)
 	}
 }
@@ -115,12 +116,12 @@ func TestLoginRateLimit(t *testing.T) {
 	_, h := newTestServer(t)
 	// 5 failed attempts allowed, 6th is rate-limited.
 	for i := 0; i < loginMaxFails; i++ {
-		w := do(t, h, http.MethodPost, "/ui/api/login", `{"password":"wrong"}`, nil)
+		w := do(t, h, http.MethodPost, "/api/login", `{"password":"wrong"}`, nil)
 		if w.Code != http.StatusUnauthorized {
 			t.Fatalf("attempt %d = %d, want 401", i+1, w.Code)
 		}
 	}
-	w := do(t, h, http.MethodPost, "/ui/api/login", `{"password":"wrong"}`, nil)
+	w := do(t, h, http.MethodPost, "/api/login", `{"password":"wrong"}`, nil)
 	if w.Code != http.StatusTooManyRequests {
 		t.Fatalf("6th attempt = %d, want 429", w.Code)
 	}
@@ -153,7 +154,7 @@ func TestStatsUsersEndpoint(t *testing.T) {
 	seed(429, 0, 0, 0, "conv-b")
 
 	cookie := loginCookie(t, h)
-	w := do(t, h, http.MethodGet, "/ui/api/stats/users?period=24h", "", cookie)
+	w := do(t, h, http.MethodGet, "/api/stats/users?period=24h", "", cookie)
 	if w.Code != http.StatusOK {
 		t.Fatalf("stats/users = %d: %s", w.Code, w.Body.String())
 	}
@@ -197,7 +198,7 @@ func TestStatsRequestsSeries(t *testing.T) {
 		}
 	}
 	cookie := loginCookie(t, h)
-	w := do(t, h, http.MethodGet, "/ui/api/stats/requests?period=1h&buckets=10&group_by=user", "", cookie)
+	w := do(t, h, http.MethodGet, "/api/stats/requests?period=1h&buckets=10&group_by=user", "", cookie)
 	if w.Code != http.StatusOK {
 		t.Fatalf("stats/requests = %d: %s", w.Code, w.Body.String())
 	}
@@ -234,9 +235,106 @@ func TestStatsRequestsSeries(t *testing.T) {
 
 func TestStaticSPAFallback(t *testing.T) {
 	_, h := newTestServer(t)
-	// Unknown non-api path should serve index.html (SPA fallback), not 404.
-	w := do(t, h, http.MethodGet, "/ui/dashboard", "", nil)
+	// Unknown non-api deep link at root should serve index.html (SPA fallback),
+	// not 404, so client-side routing survives a hard refresh.
+	w := do(t, h, http.MethodGet, "/dashboard", "", nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("SPA fallback = %d, want 200", w.Code)
+	}
+}
+
+func TestRootServesIndex(t *testing.T) {
+	_, h := newTestServer(t)
+	w := do(t, h, http.MethodGet, "/", "", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("root = %d, want 200", w.Code)
+	}
+}
+
+func TestUILegacyRedirect(t *testing.T) {
+	_, h := newTestServer(t)
+	cases := map[string]string{
+		"/ui":                      "/",
+		"/ui/":                     "/",
+		"/ui/credentials":          "/credentials",
+		"/ui/dashboard?tab=tokens": "/dashboard?tab=tokens",
+	}
+	for path, want := range cases {
+		w := do(t, h, http.MethodGet, path, "", nil)
+		if w.Code != http.StatusPermanentRedirect {
+			t.Fatalf("%s: code = %d, want 308", path, w.Code)
+		}
+		if got := w.Header().Get("Location"); got != want {
+			t.Fatalf("%s: Location = %q, want %q", path, got, want)
+		}
+	}
+}
+
+func TestStatsRequestsCustomWindow(t *testing.T) {
+	db, h := newTestServer(t)
+	ctx := context.Background()
+	ut, _ := usertoken.Create(ctx, db, "carol")
+	now := time.Now().Unix()
+	// Three rows inside the window, one well outside (older than `from`).
+	for _, ts := range []int64{now - 100, now - 200, now - 300, now - 100000} {
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO request_log
+			  (user_token_id, credential_id, conv_id, ts, path, status_code,
+			   bytes_sent, bytes_received, latency_ms,
+			   model, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens)
+			VALUES (?, 'cred_1', 'c', ?, '/v1/messages', 200, 0, 0, 5, 'm', 10, 5, 0, 0)`,
+			ut.ID, ts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cookie := loginCookie(t, h)
+	from := now - 1000
+	to := now
+	url := "/api/stats/requests?buckets=10&group_by=user" +
+		"&from=" + strconv.FormatInt(from, 10) + "&to=" + strconv.FormatInt(to, 10)
+	w := do(t, h, http.MethodGet, url, "", cookie)
+	if w.Code != http.StatusOK {
+		t.Fatalf("custom window = %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Buckets []int64 `json:"buckets"`
+		Series  []struct {
+			Requests []int64 `json:"requests"`
+		} `json:"series"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Buckets) != 10 || resp.Buckets[0] != from {
+		t.Fatalf("buckets = %v (len %d), want 10 starting at %d", resp.Buckets, len(resp.Buckets), from)
+	}
+	var total int64
+	for _, v := range resp.Series[0].Requests {
+		total += v
+	}
+	if total != 3 {
+		t.Fatalf("requests in window = %d, want 3 (the 4th row is outside)", total)
+	}
+}
+
+func TestStatsWindowValidation(t *testing.T) {
+	_, h := newTestServer(t)
+	cookie := loginCookie(t, h)
+	now := time.Now().Unix()
+	cases := []string{
+		"/api/stats/requests?from=200&to=100", // from >= to
+		"/api/stats/requests?from=" + strconv.FormatInt(now, 10) + "&to=" + strconv.FormatInt(now, 10), // equal
+		"/api/stats/requests?from=0&to=" + strconv.FormatInt(int64(91*24*3600), 10),                    // span > 90d
+		"/api/stats/requests?from=abc&to=100",                                                          // unparseable
+		"/api/stats/requests?from=100",                                                                 // missing to
+	}
+	for _, url := range cases {
+		w := do(t, h, http.MethodGet, url, "", cookie)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("%s: code = %d, want 400 (body %s)", url, w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), `"error"`) {
+			t.Fatalf("%s: body missing error field: %s", url, w.Body.String())
+		}
 	}
 }

@@ -7,14 +7,14 @@ vendored chart library, committed to the repo under `internal/webui/static/`.
 ## Auth model
 
 - Env var `CLAUDE_PROXY_UI_PASSWORD` (compose maps `.env` `UI_PASSWORD`). Empty ⇒ UI disabled
-  (`/ui/*` returns 404; nothing mounted).
-- `POST /ui/api/login` `{"password":"..."}` → constant-time compare → on success sets
-  `HttpOnly; SameSite=Strict; Path=/ui` session cookie (`cpui_session`), HMAC-SHA256-signed
+  (root serves nothing; pre-UI behavior).
+- `POST /api/login` `{"password":"..."}` → constant-time compare → on success sets
+  `HttpOnly; SameSite=Strict; Path=/` session cookie (`cpui_session`), HMAC-SHA256-signed
   value `expiry|nonce|mac`, key derived at startup: `HMAC(SHA256(password), random-boot-salt)`.
   Sessions last 24h. 429 after 5 failed attempts per IP per minute.
-- `POST /ui/api/logout` clears the cookie. `GET /ui/api/session` → `{"authenticated":bool}`.
-- All other `/ui/api/*` require a valid cookie → 401 otherwise.
-- `proxy.AuthMiddleware` passes `/ui/` through untouched (webui does its own auth);
+- `POST /api/logout` clears the cookie. `GET /api/session` → `{"authenticated":bool}`.
+- All other `/api/*` require a valid cookie → 401 otherwise.
+- **Routing:** the UI is served at the root `/`. Reserved prefixes `/v1/`, `/admin/`, `/health`, `/api/` route to their handlers; every other path serves the SPA (deep-link fallback to index.html). `/ui` and `/ui/*` permanently redirect to `/`. `proxy.AuthMiddleware` passes non-`/v1/` non-`/admin/` paths through untouched when the UI is enabled (webui does its own cookie auth); with the UI disabled, unknown paths keep the pre-UI 401/404 behavior;
   same-origin only, no CORS headers needed.
 - If `TLS_DOMAIN` is set the cookie gets `Secure`. (Detected via `X-Forwarded-Proto: https`
   from traefik, or new optional env `CLAUDE_PROXY_UI_SECURE_COOKIES=1`.)
@@ -34,58 +34,60 @@ NULL DEFAULT 0`, `cache_read_tokens INTEGER NOT NULL DEFAULT 0`.
   receives original bytes verbatim). Parse failures are silent (usage stays 0) and must
   never affect the client stream.
 
-## REST API (all JSON, cookie-auth, prefix `/ui/api`)
+## REST API (all JSON, cookie-auth, prefix `/api`)
 
-Periods: `1h|6h|24h|7d|30d` (reuse `usage.ParsePeriod`). Timeseries endpoints take
-`period` + optional `buckets` (default 60, max 200); server buckets rows by
-`(now-period, now]` into equal intervals.
+Periods: `1h|6h|24h|7d|30d` (reuse `usage.ParsePeriod`), **or a custom window via
+`from`+`to` (unix seconds, `from<to`, span ≤ 90d), which overrides `period`**. This
+applies to every endpoint taking `period` (stats/*, usage/history). Timeseries
+endpoints take optional `buckets` (default 60, max 200); server buckets rows over
+the selected window into equal intervals.
 
 ### Overview
-- `GET /ui/api/overview` → totals for header tiles:
+- `GET /api/overview` → totals for header tiles:
   `{requests_24h, tokens_24h:{input,output,cache_read,cache_creation}, active_conversations,
     credentials:{total,active,limited,errored}, users_total, avg_latency_ms_24h,
     error_rate_24h}`.
 
 ### Statistics
-- `GET /ui/api/stats/requests?period&buckets&group_by=user|credential|none` →
+- `GET /api/stats/requests?period&buckets&group_by=user|credential|none` →
   `{buckets:[ts...], series:[{id,label,requests,errors,tokens_in,tokens_out}...]}`
   (per bucket arrays; aggregated over `request_log`).
-- `GET /ui/api/stats/tokens?period&buckets&group_by=user|credential` → same shape,
+- `GET /api/stats/tokens?period&buckets&group_by=user|credential` → same shape,
   values = token sums.
-- `GET /ui/api/stats/users?period` → per-user scalar table (lift the CLI query from
+- `GET /api/stats/users?period` → per-user scalar table (lift the CLI query from
   `cmd/claude-proxy/main.go` `usersStats` into a reusable func):
   `[{id,name,requests,ok,errors,tokens_in,tokens_out,cache_read,cache_creation,
      bytes_sent,bytes_received,avg_latency_ms,conversations}]`.
-- `GET /ui/api/stats/latency?period&buckets` → `{buckets:[...], avg_ms:[...], p95_ms:[...]}`.
+- `GET /api/stats/latency?period&buckets` → `{buckets:[...], avg_ms:[...], p95_ms:[...]}`.
 
 ### Subscription usage (remote limits)
-- `GET /ui/api/usage/current` → per credential, latest snapshot + live counters:
+- `GET /api/usage/current` → per credential, latest snapshot + live counters:
   `[{credential_id,label,subscription_type,status,weight,five_hour:{pct,resets_at},
      seven_day:{pct,resets_at},seven_day_sonnet:{pct,resets_at},captured_at}]`
   (from `usage_history` latest row per cred; include resets_at).
-- `GET /ui/api/usage/history?period&credential_id?` → time series of pct values per
+- `GET /api/usage/history?period&credential_id?` → time series of pct values per
   credential for charts: `{series:[{credential_id,label,points:[{ts,five_hour_pct,
   seven_day_pct,seven_day_sonnet_pct}]}]}`.
 
 ### Credential management (wraps `internal/creds`, `internal/ingest`)
-- `GET /ui/api/credentials` → extended `credView` (reuse fields from `internal/admin`).
-- `POST /ui/api/credentials` `{credentials_json, label, weight?}` → import pasted
+- `GET /api/credentials` → extended `credView` (reuse fields from `internal/admin`).
+- `POST /api/credentials` `{credentials_json, label, weight?}` → import pasted
   `.credentials.json` (use `ingest.ImportFromJSON`; verifies liveness, rejects dupes).
-- `POST /ui/api/credentials/{id}/disable` | `/enable` (SetStatus disabled/active)
-- `POST /ui/api/credentials/{id}/refresh` → force OAuth token refresh (`Refresher.RefreshNow`)
-- `POST /ui/api/credentials/{id}/weight` `{weight}` (creds.SetWeight)
-- `PUT  /ui/api/credentials/{id}/tokens` `{credentials_json}` → `ingest.UpdateFromFile` logic
-- `DELETE /ui/api/credentials/{id}` (creds.Delete)
+- `POST /api/credentials/{id}/disable` | `/enable` (SetStatus disabled/active)
+- `POST /api/credentials/{id}/refresh` → force OAuth token refresh (`Refresher.RefreshNow`)
+- `POST /api/credentials/{id}/weight` `{weight}` (creds.SetWeight)
+- `PUT  /api/credentials/{id}/tokens` `{credentials_json}` → `ingest.UpdateFromFile` logic
+- `DELETE /api/credentials/{id}` (creds.Delete)
 
 ### Proxy user management (wraps `internal/usertoken`)
-- `GET /ui/api/users` → list incl. status, created_at, last_used_at.
-- `POST /ui/api/users` `{name}` → `{id,name,token}` (token shown once).
-- `POST /ui/api/users/{id}/disable` | `/enable`
-- `POST /ui/api/users/{id}/rotate` → `{token}`
-- `DELETE /ui/api/users/{id}`
+- `GET /api/users` → list incl. status, created_at, last_used_at.
+- `POST /api/users` `{name}` → `{id,name,token}` (token shown once).
+- `POST /api/users/{id}/disable` | `/enable`
+- `POST /api/users/{id}/rotate` → `{token}`
+- `DELETE /api/users/{id}`
 
 ### Conversations
-- `GET /ui/api/conversations?limit=100` → recent bindings (reuse admin listConvs query).
+- `GET /api/conversations?limit=100` → recent bindings (reuse admin listConvs query).
 
 Errors: non-2xx with `{"error":"message"}`. All handlers take context from request;
 queries must use the indexes on `request_log(ts)` / `usage_history(credential_id,captured_at)`.
@@ -106,5 +108,12 @@ queries must use the indexes on `request_log(ts)` / `usage_history(credential_id
 ## Env / compose
 
 - `.env.example` + compose: `UI_PASSWORD=` → container env `CLAUDE_PROXY_UI_PASSWORD`.
-- Served on the same port 8787 ⇒ existing traefik labels/TLS cover `/ui` automatically.
+- Served on the same port 8787 at `/` ⇒ existing traefik labels/TLS cover it automatically.
 - Makefile: `make ui-url` prints the UI address (uses BASE), README + CLAUDE.md sections.
+
+## Chart interactions
+
+- Legend/series click on any multi-series chart **solos** that series (click again to
+  restore all); a second series click while soloed switches the solo target.
+- The period selector offers the presets plus **Custom** (from/to datetime-local
+  inputs), driving all charts via `from`/`to` params.

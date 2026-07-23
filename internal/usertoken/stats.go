@@ -29,11 +29,39 @@ type UserStat struct {
 // filterID is non-empty only that user is returned. Every listed user is
 // included even with zero activity in the window.
 func Stats(ctx context.Context, db *store.DB, since time.Time, filterID string) ([]UserStat, error) {
+	return StatsRange(ctx, db, since, time.Time{}, filterID)
+}
+
+// StatsRange is Stats bounded to the half-open window [since, until). A zero
+// `until` means no upper bound (open-ended, as Stats). When filterID is
+// non-empty only that user is returned.
+func StatsRange(ctx context.Context, db *store.DB, since, until time.Time, filterID string) ([]UserStat, error) {
 	list, err := List(ctx, db)
 	if err != nil {
 		return nil, err
 	}
 	sinceUnix := since.Unix()
+	hasUntil := !until.IsZero()
+
+	query := `
+		SELECT
+			COUNT(*),
+			COALESCE(SUM(CASE WHEN status_code=200 THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN status_code>=400 OR status_code=-1 THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(input_tokens),0),
+			COALESCE(SUM(output_tokens),0),
+			COALESCE(SUM(cache_read_tokens),0),
+			COALESCE(SUM(cache_creation_tokens),0),
+			COALESCE(SUM(bytes_sent),0),
+			COALESCE(SUM(bytes_received),0),
+			COALESCE(SUM(latency_ms),0),
+			COUNT(DISTINCT CASE WHEN conv_id!='' THEN conv_id END)
+		FROM request_log
+		WHERE user_token_id=? AND ts>=?`
+	if hasUntil {
+		query += ` AND ts<?`
+	}
+
 	out := make([]UserStat, 0, len(list))
 	for _, ut := range list {
 		if filterID != "" && ut.ID != filterID {
@@ -41,21 +69,11 @@ func Stats(ctx context.Context, db *store.DB, since time.Time, filterID string) 
 		}
 		s := UserStat{ID: ut.ID, Name: ut.Name}
 		var latencySum int64
-		err := db.QueryRowContext(ctx, `
-			SELECT
-				COUNT(*),
-				COALESCE(SUM(CASE WHEN status_code=200 THEN 1 ELSE 0 END),0),
-				COALESCE(SUM(CASE WHEN status_code>=400 OR status_code=-1 THEN 1 ELSE 0 END),0),
-				COALESCE(SUM(input_tokens),0),
-				COALESCE(SUM(output_tokens),0),
-				COALESCE(SUM(cache_read_tokens),0),
-				COALESCE(SUM(cache_creation_tokens),0),
-				COALESCE(SUM(bytes_sent),0),
-				COALESCE(SUM(bytes_received),0),
-				COALESCE(SUM(latency_ms),0),
-				COUNT(DISTINCT CASE WHEN conv_id!='' THEN conv_id END)
-			FROM request_log
-			WHERE user_token_id=? AND ts>=?`, ut.ID, sinceUnix).
+		args := []any{ut.ID, sinceUnix}
+		if hasUntil {
+			args = append(args, until.Unix())
+		}
+		err := db.QueryRowContext(ctx, query, args...).
 			Scan(&s.Requests, &s.OK, &s.Errors,
 				&s.TokensIn, &s.TokensOut, &s.CacheRead, &s.CacheCreation,
 				&s.BytesSent, &s.BytesReceived, &latencySum, &s.Conversations)

@@ -14,20 +14,28 @@ import (
 //
 // Priority order:
 //  1. /health — always public.
-//  2. adminToken match — admin identity, all routes allowed.
-//  3. user token DB match — user identity, /v1/* and /health only;
+//  2. When uiEnabled, any path that is not /v1/* and not /admin/* is passed
+//     through untouched — the web UI (mounted at "/") does its own cookie auth.
+//  3. adminToken match — admin identity, all routes allowed.
+//  4. user token DB match — user identity, /v1/* and /health only;
 //     /admin/* requests are rejected with 403.
-//  4. No auth configured (adminToken=="" and no user tokens) — passthrough.
-//  5. Otherwise — 401.
-func AuthMiddleware(adminToken string, db *store.DB, next http.Handler) http.Handler {
+//  5. No auth configured (adminToken=="" and no user tokens) — passthrough.
+//  6. Otherwise — 401.
+func AuthMiddleware(adminToken string, db *store.DB, uiEnabled bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		// The web UI authenticates itself with its own session cookie.
-		if r.URL.Path == "/ui" || strings.HasPrefix(r.URL.Path, "/ui/") {
+		isProxy := strings.HasPrefix(r.URL.Path, "/v1/")
+		isAdmin := strings.HasPrefix(r.URL.Path, "/admin/")
+
+		// When the UI is enabled, everything outside the proxy (/v1/*) and admin
+		// (/admin/*) surfaces is handled by the web UI, which authenticates
+		// itself with its own session cookie. Bearer auth applies only to the
+		// proxy and admin routes.
+		if uiEnabled && !isProxy && !isAdmin {
 			next.ServeHTTP(w, r)
 			return
 		}

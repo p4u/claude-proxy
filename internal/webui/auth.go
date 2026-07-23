@@ -18,7 +18,7 @@ import (
 const (
 	sessionCookie = "cpui_session"
 	sessionTTL    = 24 * time.Hour
-	cookiePath    = "/ui"
+	cookiePath    = "/"
 )
 
 // deriveKey builds the cookie-signing key: HMAC-SHA256 over SHA256(password)
