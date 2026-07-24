@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"fmt"
+	"math"
 	"path/filepath"
 	"testing"
 	"time"
@@ -373,6 +374,97 @@ func TestAllSaturatedNoActive(t *testing.T) {
 	p := New(db)
 	if _, _, err := p.Bind(ctx, "x"); err != ErrNoCredentials {
 		t.Fatalf("expected ErrNoCredentials when all active creds are saturated, got %v", err)
+	}
+}
+
+// TestStickyRebindsOffSaturated verifies that an existing conversation pinned to
+// a credential whose latest snapshot is ≥100% on either window is migrated onto
+// a fresh, non-saturated credential on the next Bind (extending the ≥100% cutoff
+// from new bindings to sticky ones).
+func TestStickyRebindsOffSaturated(t *testing.T) {
+	db, _ := setup(t)
+	p := New(db)
+	ctx := context.Background()
+
+	c1, isNew, err := p.Bind(ctx, "convSat")
+	if err != nil || !isNew {
+		t.Fatalf("first bind: isNew=%v err=%v", isNew, err)
+	}
+
+	// Saturate the bound credential's latest snapshot (7d maxed); the other two
+	// setup() creds stay snapshot-free (healthy).
+	now := time.Now().Unix()
+	if _, err := db.ExecContext(ctx, `INSERT INTO usage_history
+		(credential_id, captured_at, five_hour_pct, five_hour_resets_at,
+		 seven_day_pct, seven_day_resets_at, seven_day_sonnet_pct, seven_day_sonnet_resets_at)
+		VALUES (?, ?, 10.0, NULL, 100.0, NULL, 0.0, NULL)`, c1.ID, now); err != nil {
+		t.Fatal(err)
+	}
+
+	c2, isNew, err := p.Bind(ctx, "convSat")
+	if err != nil {
+		t.Fatalf("rebind: %v", err)
+	}
+	if !isNew {
+		t.Fatal("rebind off a saturated cred should report isNew=true")
+	}
+	if c2.ID == c1.ID {
+		t.Fatalf("conversation stayed on saturated cred %s", c1.ID)
+	}
+
+	// Confirm the conversation row actually moved.
+	var stored string
+	_ = db.QueryRow(`SELECT credential_id FROM conversations WHERE id='convSat'`).Scan(&stored)
+	if stored != c2.ID {
+		t.Fatalf("conversations row not updated: have %s want %s", stored, c2.ID)
+	}
+}
+
+// TestStickySaturatedKeptWhenNoAlternative verifies that a saturated sticky
+// binding is retained (not failed) when there is no healthy alternative, so the
+// request still reaches Anthropic for a real 429.
+func TestStickySaturatedKeptWhenNoAlternative(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(dir + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	only, _ := creds.Insert(ctx, db, "only", "pro", "sk-ant-oat-x", "rt-x", time.Now().Add(time.Hour), 1)
+	p := New(db)
+
+	if _, _, err := p.Bind(ctx, "c1"); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	if _, err := db.ExecContext(ctx, `INSERT INTO usage_history
+		(credential_id, captured_at, five_hour_pct, five_hour_resets_at,
+		 seven_day_pct, seven_day_resets_at, seven_day_sonnet_pct, seven_day_sonnet_resets_at)
+		VALUES (?, ?, 100.0, NULL, 100.0, NULL, 0.0, NULL)`, only.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	c, isNew, err := p.Bind(ctx, "c1")
+	if err != nil {
+		t.Fatalf("expected saturated sticky to be kept, got %v", err)
+	}
+	if isNew {
+		t.Fatal("keeping a saturated pin must not report isNew")
+	}
+	if c.ID != only.ID {
+		t.Fatalf("expected to keep %s, got %s", only.ID, c.ID)
+	}
+}
+
+func TestScoreSharedFormula(t *testing.T) {
+	// Score must equal weight × room_5h × room_7d^SevenDayExp.
+	got := Score(2, 20, 40)
+	want := 2.0 * Room(20) * math.Pow(Room(40), SevenDayExp)
+	if got != want {
+		t.Fatalf("Score=%v want %v", got, want)
+	}
+	if !Saturated(100, 0) || !Saturated(0, 100) || Saturated(99, 99) {
+		t.Fatal("Saturated cutoff wrong")
 	}
 }
 

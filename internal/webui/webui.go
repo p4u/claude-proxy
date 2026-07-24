@@ -106,6 +106,10 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, rest string) {
 		s.handleStatsUsers(w, r)
 	case rest == "/stats/latency" && r.Method == http.MethodGet:
 		s.handleStatsLatency(w, r)
+	case rest == "/stats/totals" && r.Method == http.MethodGet:
+		s.handleStatsTotals(w, r)
+	case rest == "/stats/selection" && r.Method == http.MethodGet:
+		s.handleStatsSelection(w, r)
 	case rest == "/usage/current" && r.Method == http.MethodGet:
 		s.handleUsageCurrent(w, r)
 	case rest == "/usage/history" && r.Method == http.MethodGet:

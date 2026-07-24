@@ -72,7 +72,7 @@ function credRow(c, root) {
     el("td", {}, statusBadge(c.status)),
     el("td", { class: "num", text: String(c.weight ?? "—") }),
     el("td", { class: "num", text: compactNum(c.request_count ?? c.requests ?? 0) }),
-    el("td", { text: c.last_used_at ? relTime(tsOf(c.last_used_at)) : "never" }),
+    el("td", { text: c.last_request_at ? relTime(tsOf(c.last_request_at)) : "never" }),
     el("td", { text: c.expires_at ? localTime(tsOf(c.expires_at)) : "—" }),
     el("td", { class: "actions" }, actions),
   ]);

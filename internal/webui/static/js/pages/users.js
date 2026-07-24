@@ -4,7 +4,7 @@ import {
 } from "../ui.js";
 import { periodControl, sectionHead } from "../components.js";
 import { getWindow, setWindowPeriod, setWindowCustom } from "../store.js";
-import { compactNum, fullNum, ms, relTime } from "../format.js";
+import { compactNum, fullNum, ms, relTime, localTime } from "../format.js";
 
 export async function render(root) {
   clear(root);
@@ -55,6 +55,7 @@ function userRow(u, s, root) {
   const disabled = (u.status || "").toLowerCase() === "disabled";
   const errTone = (s.errors || 0) > 0 ? "cell-warn" : "";
   const actions = el("div", { class: "row-actions" }, [
+    button("Prompts", { onClick: () => promptsModal(u) }),
     button("Rotate", {
       onClick: async () => {
         const ok = await confirmDialog({
@@ -142,6 +143,42 @@ function createModal(root) {
       }),
     ],
   });
+}
+
+// Per-user recent prompts. Prompt text is untrusted — rendered via textContent.
+function promptsModal(u) {
+  const list = el("div", { class: "prompts" }, spinner("Loading prompts…"));
+  const m = modal({
+    title: `Recent prompts · ${u.name}`,
+    subtitle: "Last user prompts routed with this token, newest first. Prompts are retained for a limited time, then purged.",
+    wide: true,
+    body: list,
+    actions: [button("Close", { kind: "ghost", onClick: () => m.close() })],
+  });
+  (async () => {
+    try {
+      const rows = await api.userPrompts(u.id, 50);
+      clear(list);
+      if (!rows || !rows.length) {
+        list.append(emptyState("No prompts recorded", "Prompts are kept for a limited retention window, then purged. Nothing recent for this user."));
+        return;
+      }
+      for (const p of rows) list.append(promptItem(p));
+    } catch (e) {
+      clear(list).append(errorState(e.message));
+    }
+  })();
+}
+
+function promptItem(p) {
+  const head = el("div", { class: "prompt__head" }, [
+    el("span", { class: "prompt__time", text: localTime(tsOf(p.ts)) }),
+    p.model ? el("span", { class: "prompt__model", text: p.model }) : null,
+  ]);
+  // textContent (not innerHTML) — the prompt is untrusted user input.
+  const bodyEl = el("pre", { class: "prompt__text" });
+  bodyEl.textContent = p.prompt || "";
+  return el("div", { class: "prompt" }, [head, bodyEl]);
 }
 
 function tokenReveal(name, token, verb) {

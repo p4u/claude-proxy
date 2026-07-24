@@ -117,3 +117,41 @@ queries must use the indexes on `request_log(ts)` / `usage_history(credential_id
   restore all); a second series click while soloed switches the solo target.
 - The period selector offers the presets plus **Custom** (from/to datetime-local
   inputs), driving all charts via `from`/`to` params.
+
+## v2 additions (2026-07-24)
+
+- **`GET /api/overview`** now takes the standard window params (`period` | `from`+`to`);
+  fields lose the `_24h` suffix: `{requests, tokens:{input,output,cache_read,cache_creation},
+  active_conversations, credentials:{total,active,limited,errored}, users_total,
+  avg_latency_ms, error_rate}`. Tiles reflect the selected window.
+- **`GET /api/stats/totals?period|from,to&buckets`** → aggregate (no grouping) series:
+  `{buckets:[ts...], requests:[...], errors:[...],
+    tokens:{input:[...],output:[...],cache_read:[...],cache_creation:[...]}}`.
+- **`GET /api/usage/current`**: each entry gains
+  `"selection": {room_5h, room_7d, score, share_pct, saturated}` — score mirrors the
+  pool exactly (`weight × room_5h × room_7d^1.5`, sevenDayExp exported/shared from
+  internal/pool), `share_pct` = score/Σscore×100 across active credentials,
+  `saturated` = latest snapshot ≥100% on either window (excluded from new bindings).
+- **`GET /api/stats/selection?period|from,to&buckets`** → how often each credential is
+  picked for NEW conversations (from `conversations.created_at`):
+  `{buckets:[ts...], series:[{credential_id,label,picks:[...]}],
+    totals:[{credential_id,label,picks,share_pct}]}`.
+- **`GET /api/usage/history`** response is now an aligned grid (fixes the broken
+  multi-credential chart): `{buckets:[ts...], series:[{credential_id,label,
+  five_hour_pct:[...], seven_day_pct:[...], seven_day_sonnet_pct:[...]}]}` — one value
+  per bucket per series, `null` where a credential has no snapshot in that bucket;
+  buckets downsampled to ≤200.
+- **Prompt logging**: new table `prompt_log(id, user_token_id→SET NULL, conv_id, ts,
+  model, prompt)` — the proxy stores the LAST `role:"user"` text (string or first text
+  block, trimmed to 4096 chars) from `POST /v1/messages` request bodies. Never responses.
+  Retention: env `CLAUDE_PROXY_PROMPT_RETENTION_DAYS` (`.env` `PROMPT_RETENTION_DAYS`,
+  default 7; `0` disables capture entirely); hourly janitor deletes older rows.
+  `GET /api/users/{id}/prompts?limit=50` → `[{ts,conv_id,model,prompt}]` (newest first).
+- **Pool rebinding**: `Bind()` re-picks when the sticky credential's latest snapshot is
+  ≥100% on either window — existing conversations migrate off saturated credentials.
+- **Frontend**: overview tiles follow the global window; Subscriptions page scopes its
+  period picker to the History + Selection charts only (cards always show latest);
+  cards show the selection score/share and a "saturated" badge; new stacked Totals
+  chart (tokens by type + requests) on the dashboard; credentials table reads
+  `last_request_at` (fixes perpetual "never"); Users page gains a per-user "Prompts"
+  button + modal (newest prompts, ts + model).

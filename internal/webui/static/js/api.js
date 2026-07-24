@@ -80,19 +80,24 @@ export const api = {
   session: () => request("GET", "/session"),
 
   // Data
-  overview: () => request("GET", "/overview"),
+  overview: (win) => request("GET", `/overview?${winParams(win)}`),
   statsRequests: (win, buckets, groupBy) =>
     request("GET", `/stats/requests?${winParams(win)}&buckets=${buckets}&group_by=${groupBy}`),
   statsTokens: (win, buckets, groupBy) =>
     request("GET", `/stats/tokens?${winParams(win)}&buckets=${buckets}&group_by=${groupBy}`),
+  statsTotals: (win, buckets) =>
+    request("GET", `/stats/totals?${winParams(win)}&buckets=${buckets}`),
   statsLatency: (win, buckets) =>
     request("GET", `/stats/latency?${winParams(win)}&buckets=${buckets}`),
   statsUsers: (win) => request("GET", `/stats/users?${winParams(win)}`),
+  statsSelection: (win, buckets) =>
+    request("GET", `/stats/selection?${winParams(win)}&buckets=${buckets}`),
   usageCurrent: () => request("GET", "/usage/current"),
   usageHistory: (win, credId) =>
     request("GET", `/usage/history?${winParams(win)}` + (credId ? `&credential_id=${credId}` : "")),
   credentials: () => request("GET", "/credentials"),
   users: () => request("GET", "/users"),
+  userPrompts: (id, limit = 50) => request("GET", `/users/${id}/prompts?limit=${limit}`),
   conversations: (limit = 100) => request("GET", `/conversations?limit=${limit}`),
 };
 

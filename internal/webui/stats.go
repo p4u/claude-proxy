@@ -328,7 +328,11 @@ func percentile(vals []int64, p int) int64 {
 
 func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	since := time.Now().Add(-24 * time.Hour).Unix()
+	from, to, _, err := parseWindow(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	var (
 		requests, errors                    int64
@@ -341,7 +345,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 		       COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
 		       COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0),
 		       COALESCE(SUM(latency_ms),0)
-		FROM request_log WHERE ts >= ?`, since).
+		FROM request_log WHERE ts >= ? AND ts < ?`, from, to).
 		Scan(&requests, &errors, &tin, &tout, &cacheRead, &cacheCreation, &latencySum)
 
 	var activeConvs, usersTotal int64
@@ -378,15 +382,160 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, map[string]any{
-		"requests_24h": requests,
-		"tokens_24h": map[string]int64{
+		"requests": requests,
+		"tokens": map[string]int64{
 			"input": tin, "output": tout,
 			"cache_read": cacheRead, "cache_creation": cacheCreation,
 		},
 		"active_conversations": activeConvs,
 		"credentials":          creds,
 		"users_total":          usersTotal,
-		"avg_latency_ms_24h":   avgLat,
-		"error_rate_24h":       errRate,
+		"avg_latency_ms":       avgLat,
+		"error_rate":           errRate,
+	})
+}
+
+// handleStatsTotals returns aggregate (no grouping) bucketed series over the
+// selected window: requests, errors, and per-type token sums.
+func (s *Server) handleStatsTotals(w http.ResponseWriter, r *http.Request) {
+	from, to, dur, err := parseWindow(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	n := bucketCount(r)
+
+	rows, err := s.db.QueryContext(r.Context(), `
+		SELECT ts, status_code, input_tokens, output_tokens,
+		       cache_read_tokens, cache_creation_tokens
+		FROM request_log WHERE ts >= ? AND ts < ?`, from, to)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+
+	requests := make([]int64, n)
+	errs := make([]int64, n)
+	tin := make([]int64, n)
+	tout := make([]int64, n)
+	cacheRead := make([]int64, n)
+	cacheCreation := make([]int64, n)
+	for rows.Next() {
+		var ts, status, in, out, cr, cc int64
+		if err := rows.Scan(&ts, &status, &in, &out, &cr, &cc); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		bi := bucketIndex(ts, from, dur, n)
+		requests[bi]++
+		if status >= 400 || status == -1 {
+			errs[bi]++
+		}
+		tin[bi] += in
+		tout[bi] += out
+		cacheRead[bi] += cr
+		cacheCreation[bi] += cc
+	}
+	if err := rows.Err(); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{
+		"buckets":  bucketTimestamps(from, dur, n),
+		"requests": requests,
+		"errors":   errs,
+		"tokens": map[string][]int64{
+			"input": tin, "output": tout,
+			"cache_read": cacheRead, "cache_creation": cacheCreation,
+		},
+	})
+}
+
+// handleStatsSelection reports how often each credential was picked for NEW
+// conversations (from conversations.created_at) over the window: per-bucket
+// pick counts plus totals with share_pct.
+func (s *Server) handleStatsSelection(w http.ResponseWriter, r *http.Request) {
+	from, to, dur, err := parseWindow(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	n := bucketCount(r)
+	ctx := r.Context()
+
+	labels, err := s.labelMap(ctx, "credential")
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT created_at, credential_id FROM conversations
+		WHERE created_at >= ? AND created_at < ?`, from, to)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+
+	type selSeries struct {
+		CredentialID string  `json:"credential_id"`
+		Label        string  `json:"label"`
+		Picks        []int64 `json:"picks"`
+	}
+	series := map[string]*selSeries{}
+	order := []string{}
+	totals := map[string]int64{}
+	var grand int64
+	for rows.Next() {
+		var ts int64
+		var cid string
+		if err := rows.Scan(&ts, &cid); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		ss := series[cid]
+		if ss == nil {
+			lbl := labels[cid]
+			if lbl == "" {
+				lbl = cid
+			}
+			ss = &selSeries{CredentialID: cid, Label: lbl, Picks: make([]int64, n)}
+			series[cid] = ss
+			order = append(order, cid)
+		}
+		ss.Picks[bucketIndex(ts, from, dur, n)]++
+		totals[cid]++
+		grand++
+	}
+	if err := rows.Err(); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	type selTotal struct {
+		CredentialID string  `json:"credential_id"`
+		Label        string  `json:"label"`
+		Picks        int64   `json:"picks"`
+		SharePct     float64 `json:"share_pct"`
+	}
+	outSeries := make([]*selSeries, 0, len(order))
+	outTotals := make([]selTotal, 0, len(order))
+	for _, cid := range order {
+		outSeries = append(outSeries, series[cid])
+		share := 0.0
+		if grand > 0 {
+			share = float64(totals[cid]) / float64(grand) * 100
+		}
+		outTotals = append(outTotals, selTotal{
+			CredentialID: cid, Label: series[cid].Label,
+			Picks: totals[cid], SharePct: share,
+		})
+	}
+	writeJSON(w, map[string]any{
+		"buckets": bucketTimestamps(from, dur, n),
+		"series":  outSeries,
+		"totals":  outTotals,
 	})
 }

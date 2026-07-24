@@ -75,6 +75,15 @@ export function applyTheme() {
   else document.documentElement.setAttribute("data-theme", t);
 }
 
+// Short human label for the active window, for tile sublabels etc.
+// Presets → their button label ("7D"); custom → "custom".
+export function windowLabel(win) {
+  if (win && win.mode === "custom") return "custom";
+  const p = (win && win.period) || getPeriod();
+  const found = PERIODS.find((x) => x.value === p);
+  return found ? found.label : p;
+}
+
 // Period → seconds (for axis span hints).
 export function periodSeconds(p) {
   return { "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800, "30d": 2592000 }[p] || 86400;

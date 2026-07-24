@@ -80,7 +80,11 @@ func (p *Pool) Bind(ctx context.Context, convID string) (*creds.Credential, bool
 
 	// Sticky semantics:
 	//   active, limited → keep the existing pin (caller passes through 429
-	//                     for limited, or sends normally for active).
+	//                     for limited, or sends normally for active) UNLESS the
+	//                     credential's latest usage snapshot is saturated
+	//                     (≥100% on either window), in which case migrate the
+	//                     conversation onto a fresh credential — the same ≥100%
+	//                     cutoff pickActiveLocked applies to new bindings.
 	//   expired, revoked, disabled → permanent failure on this credential.
 	//                                Auto-rebind to a healthy active cred so
 	//                                the conversation can keep going.
@@ -108,6 +112,36 @@ func (p *Pool) Bind(ctx context.Context, convID string) (*creds.Credential, bool
 			}
 			// Surface the rebind to the caller as "new" so it logs accordingly.
 			return rebound, true, nil
+		case creds.StatusActive, creds.StatusLimited:
+			saturated, serr := credSaturatedLocked(ctx, tx, credID)
+			if serr != nil {
+				return nil, false, serr
+			}
+			if saturated {
+				newCredID, perr := p.pickActiveLocked(ctx, tx)
+				switch {
+				case errors.Is(perr, ErrNoCredentials):
+					// No healthy alternative — keep the sticky (saturated) pin
+					// so the request still reaches Anthropic for a real 429.
+				case perr != nil:
+					return nil, false, perr
+				case newCredID != credID:
+					if _, uerr := tx.ExecContext(ctx,
+						`UPDATE conversations SET credential_id=?, last_seen_at=? WHERE id=?`,
+						newCredID, time.Now().Unix(), convID); uerr != nil {
+						return nil, false, uerr
+					}
+					rebound, gerr := getCredTx(ctx, tx, newCredID)
+					if gerr != nil {
+						return nil, false, gerr
+					}
+					if err := tx.Commit(); err != nil {
+						return nil, false, err
+					}
+					// Surface the rebind as "new" so callers log the migration.
+					return rebound, true, nil
+				}
+			}
 		}
 	}
 
@@ -219,11 +253,40 @@ type weightedEntry struct {
 	weight int
 }
 
-// sevenDayExp controls how hard the slow-resetting 7-day quota is protected
+// SevenDayExp controls how hard the slow-resetting 7-day quota is protected
 // relative to the 5-hour window. >1 makes a low 7d room shrink the score
 // faster, so the pool prefers to spend the cheap 5h window (which resets in
 // hours) over the expensive weekly one (which resets slowly).
-const sevenDayExp = 1.5
+//
+// Exported so the web UI can surface the exact selection score without
+// re-deriving (and drifting from) the pool's formula.
+const SevenDayExp = 1.5
+
+// Room returns the remaining fraction (0..1) of a utilization window given its
+// utilization percentage. room = max(0, 1 − pct/100).
+func Room(pct float64) float64 {
+	return math.Max(0, 1-pct/100)
+}
+
+// Score is the pool's usage-aware effective selection score for one credential:
+//
+//	score = weight × room_5h × room_7d^SevenDayExp
+//
+// It is the single source of truth for selection weighting, shared between the
+// pool's picker and the web UI's usage view so the two can never diverge.
+func Score(weight int, fhPct, sdPct float64) float64 {
+	if weight < 1 {
+		weight = 1
+	}
+	return float64(weight) * Room(fhPct) * math.Pow(Room(sdPct), SevenDayExp)
+}
+
+// Saturated reports whether a credential's latest snapshot maxes out EITHER
+// window (≥100%). Saturated credentials are excluded from new bindings and
+// trigger rebinding of existing ones.
+func Saturated(fhPct, sdPct float64) bool {
+	return fhPct >= 100 || sdPct >= 100
+}
 
 // weightedRandPick computes a usage-aware effective score for each candidate
 // and returns one chosen by weighted-random selection.
@@ -266,13 +329,11 @@ func (p *Pool) weightedRandPick(ctx context.Context, tx *sql.Tx, candidates []we
 			//
 			// Multiply the two windows' remaining room (independent ceilings)
 			// and penalise low 7d room harder via the exponent.
-			roomFH := math.Max(0, 1-s.fhPct/100)
-			roomSD := math.Max(0, 1-s.sdPct/100)
-			s.head = roomFH * math.Pow(roomSD, sevenDayExp)
+			s.head = Room(s.fhPct) * math.Pow(Room(s.sdPct), SevenDayExp)
 		}
 		// err == sql.ErrNoRows → no snapshot yet; keep head=1.0 (bootstrap)
 
-		s.score = float64(e.weight) * s.head
+		s.score = Score(e.weight, s.fhPct, s.sdPct)
 		entries[i] = s
 
 		if e.weight > bestWeight {
@@ -321,6 +382,24 @@ func (p *Pool) weightedRandPick(ctx context.Context, tx *sql.Tx, candidates []we
 		}
 	}
 	return entries[len(entries)-1].id, nil
+}
+
+// credSaturatedLocked reports whether a credential's most recent usage snapshot
+// maxes out either window (≥100%). No snapshot ⇒ not saturated (bootstrap).
+func credSaturatedLocked(ctx context.Context, tx *sql.Tx, credID string) (bool, error) {
+	var fhPct, sdPct float64
+	err := tx.QueryRowContext(ctx, `
+		SELECT five_hour_pct, seven_day_pct
+		FROM usage_history
+		WHERE credential_id=?
+		ORDER BY captured_at DESC LIMIT 1`, credID).Scan(&fhPct, &sdPct)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return Saturated(fhPct, sdPct), nil
 }
 
 func getCredTx(ctx context.Context, tx *sql.Tx, id string) (*creds.Credential, error) {

@@ -36,6 +36,12 @@ type Handler struct {
 	// (see models1m.go). Enabled by default; disable via CLAUDE_PROXY_MODELS_1M=0.
 	Augment1M   bool
 	modelsCache modelsCache
+
+	// PromptRetentionDays gates prompt capture: when >0 the LAST user prompt of
+	// each POST /v1/messages request is stored in prompt_log (see
+	// promptcapture.go); 0 disables capture entirely. Set from
+	// CLAUDE_PROXY_PROMPT_RETENTION_DAYS at startup.
+	PromptRetentionDays int
 }
 
 func New(db *store.DB, p *pool.Pool, r *creds.Refresher, log *slog.Logger) *Handler {
@@ -116,6 +122,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if err := creds.MarkRequest(r.Context(), h.db, cred.ID); err != nil {
 		h.log.Error("counter bump", "err", err, "cred", cred.ID)
+	}
+
+	// Capture the user's prompt (never the response) for POST /v1/messages when
+	// prompt logging is enabled. No-op otherwise.
+	if r.Method == http.MethodPost && r.URL.Path == "/v1/messages" {
+		h.capturePrompt(r.Context(), convID, body)
 	}
 
 	status, rxBytes, usage := h.forward(w, r, body, cred, true)

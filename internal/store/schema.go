@@ -68,6 +68,20 @@ CREATE TABLE IF NOT EXISTS request_log (
 CREATE INDEX IF NOT EXISTS idx_request_log_user_ts ON request_log(user_token_id, ts);
 CREATE INDEX IF NOT EXISTS idx_request_log_ts      ON request_log(ts);
 
+-- One row per captured user prompt (see internal/proxy prompt capture). Only
+-- the LAST role:"user" text of a /v1/messages request is stored, never model
+-- responses; retention is bounded by CLAUDE_PROXY_PROMPT_RETENTION_DAYS.
+CREATE TABLE IF NOT EXISTS prompt_log (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_token_id TEXT    REFERENCES user_tokens(id) ON DELETE SET NULL,
+  conv_id       TEXT    NOT NULL DEFAULT '',
+  ts            INTEGER NOT NULL,
+  model         TEXT    NOT NULL DEFAULT '',
+  prompt        TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_prompt_log_user_ts ON prompt_log(user_token_id, ts);
+CREATE INDEX IF NOT EXISTS idx_prompt_log_ts      ON prompt_log(ts);
+
 CREATE TABLE IF NOT EXISTS usage_history (
   id                          INTEGER PRIMARY KEY AUTOINCREMENT,
   credential_id               TEXT    NOT NULL REFERENCES credentials(id) ON DELETE CASCADE,

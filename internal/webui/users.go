@@ -3,6 +3,7 @@ package webui
 import (
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -52,6 +53,9 @@ func (s *Server) userAction(w http.ResponseWriter, r *http.Request, id, action s
 		}
 		writeJSON(w, map[string]any{"ok": true, "id": id, "token": token})
 		return
+	case action == "prompts" && r.Method == http.MethodGet:
+		s.listUserPrompts(w, r, id)
+		return
 	case action == "" && r.Method == http.MethodDelete:
 		err = usertoken.Delete(ctx, s.db, id)
 	default:
@@ -92,6 +96,50 @@ func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {
 			v.LastUsedAt = &s
 		}
 		out = append(out, v)
+	}
+	writeJSON(w, out)
+}
+
+type promptView struct {
+	TS     string `json:"ts"`
+	ConvID string `json:"conv_id"`
+	Model  string `json:"model"`
+	Prompt string `json:"prompt"`
+}
+
+// listUserPrompts returns the newest captured prompts for a user token.
+func (s *Server) listUserPrompts(w http.ResponseWriter, r *http.Request, id string) {
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	rows, err := s.db.QueryContext(r.Context(), `
+		SELECT ts, conv_id, model, prompt FROM prompt_log
+		WHERE user_token_id = ? ORDER BY ts DESC LIMIT ?`, id, limit)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+	out := []promptView{}
+	for rows.Next() {
+		var ts int64
+		var pv promptView
+		if err := rows.Scan(&ts, &pv.ConvID, &pv.Model, &pv.Prompt); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		pv.TS = time.Unix(ts, 0).UTC().Format(time.RFC3339)
+		out = append(out, pv)
+	}
+	if err := rows.Err(); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
 	}
 	writeJSON(w, out)
 }

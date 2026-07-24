@@ -24,6 +24,9 @@ services:
       # traefik is auto-detected from X-Forwarded-Proto.
       CLAUDE_PROXY_UI_SECURE_COOKIES: "${UI_SECURE_COOKIES:-}"
       CLAUDE_PROXY_MODELS_1M: "${MODELS_1M:-}"
+      # Days to retain captured user prompts (last user message only, never
+      # responses). Default 7; 0 disables prompt capture.
+      CLAUDE_PROXY_PROMPT_RETENTION_DAYS: "${PROMPT_RETENTION_DAYS:-}"
     ports:
       # When traefik is active (profile=tls), keep this on 127.0.0.1 — traefik
       # reaches the container over the docker network, no host port needed.

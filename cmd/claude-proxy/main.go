@@ -87,6 +87,20 @@ func isTruthy(s string) bool {
 	return false
 }
 
+// envIntDefault parses an integer env var, returning def when unset/empty or
+// unparseable. Used for flag defaults sourced from the environment.
+func envIntDefault(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
 func isTerminal(f *os.File) bool {
 	if f == nil {
 		return false
@@ -115,6 +129,8 @@ func runServe(args []string) {
 		"shared bearer token (env CLAUDE_PROXY_AUTH_TOKEN). empty disables auth.")
 	uiPassword := fs.String("ui-password", os.Getenv("CLAUDE_PROXY_UI_PASSWORD"),
 		"web UI password (env CLAUDE_PROXY_UI_PASSWORD). empty disables the UI.")
+	promptRetentionDays := fs.Int("prompt-retention-days", envIntDefault("CLAUDE_PROXY_PROMPT_RETENTION_DAYS", 7),
+		"days to retain captured user prompts (env CLAUDE_PROXY_PROMPT_RETENTION_DAYS). 0 disables prompt capture.")
 	_ = fs.String("on-limited", "passthrough", "behavior when pinned credential is limited")
 	logLevel := fs.String("log-level", "info", "log level: debug|info|warn|error")
 	logFormat := fs.String("log-format", "auto", "log format: auto|pretty|text|json")
@@ -182,6 +198,11 @@ func runServe(args []string) {
 	// [1m] model-discovery augmentation is on by default; CLAUDE_PROXY_MODELS_1M=0 disables it.
 	if v, ok := os.LookupEnv("CLAUDE_PROXY_MODELS_1M"); ok {
 		proxyH.Augment1M = isTruthy(v)
+	}
+	proxyH.PromptRetentionDays = *promptRetentionDays
+	if *promptRetentionDays > 0 {
+		go proxy.PromptJanitor(ctx, db, *promptRetentionDays, logger)
+		logger.Info("prompt logging enabled", "retention_days", *promptRetentionDays)
 	}
 	adminH := admin.New(db)
 

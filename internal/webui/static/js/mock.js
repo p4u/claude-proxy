@@ -75,18 +75,45 @@ function groupSeries(q, group) {
   return { buckets: b, series };
 }
 
+// Aggregate (no grouping) token/request series over the window.
+function totalsSeries(q) {
+  const n = 60;
+  const b = buckets(q, n);
+  const requests = wave(n, 60, 90, 7, 0);
+  return {
+    buckets: b,
+    requests,
+    errors: requests.map((r, i) => (rand(r + i) > 0.85 ? Math.round(r * 0.08) : 0)),
+    tokens: {
+      input: requests.map((r) => r * (900 + Math.round(rand(r) * 400))),
+      output: requests.map((r) => r * (280 + Math.round(rand(r + 3) * 180))),
+      cache_read: requests.map((r) => r * (2600 + Math.round(rand(r + 5) * 1400))),
+      cache_creation: requests.map((r) => r * (90 + Math.round(rand(r + 8) * 120))),
+    },
+  };
+}
+
 const DB = {
-  "/overview": () => ({
-    requests_24h: 18432,
-    tokens_24h: { input: 42_800_000, output: 9_650_000, cache_read: 128_400_000, cache_creation: 3_200_000 },
-    active_conversations: 47,
-    credentials: { total: 5, active: 3, limited: 1, errored: 0 },
-    users_total: 4,
-    avg_latency_ms_24h: 842,
-    error_rate_24h: 0.021,
-  }),
+  "/overview": (q) => {
+    // Follows the selected window: scale totals vs a 24h baseline.
+    const scale = Math.max(0.1, resolveWindow(q).span / 86400);
+    const k = (v) => Math.round(v * scale);
+    return {
+      requests: k(18432),
+      tokens: {
+        input: k(42_800_000), output: k(9_650_000),
+        cache_read: k(128_400_000), cache_creation: k(3_200_000),
+      },
+      active_conversations: 47,
+      credentials: { total: 5, active: 3, limited: 1, errored: 0 },
+      users_total: 4,
+      avg_latency_ms: 842,
+      error_rate: 0.021,
+    };
+  },
   "/stats/requests": (q) => groupSeries(q, q.get("group_by") || "user"),
   "/stats/tokens": (q) => groupSeries(q, q.get("group_by") || "user"),
+  "/stats/totals": (q) => totalsSeries(q),
   "/stats/latency": (q) => {
     const n = 60;
     const b = buckets(q, n);
@@ -107,37 +134,75 @@ const DB = {
       conversations: [12, 9, 3, 7][i],
     }));
   },
-  "/usage/current": () =>
-    CREDS.map((c, i) => {
-      const five = [72, 41, 100, 18, 0][i];
-      const seven = [58, 63, 92, 22, 0][i];
-      const sonnet = [44, 51, 78, 15, 0][i];
-      return {
-        credential_id: c.id, label: c.label, subscription_type: c.type, status: c.status, weight: c.weight,
-        five_hour: { pct: five, resets_at: now + (3600 * (1 + i)) },
-        seven_day: { pct: seven, resets_at: now + (86400 * (2 + i)) },
-        seven_day_sonnet: { pct: sonnet, resets_at: now + (86400 * (2 + i)) },
-        captured_at: now - 300 - i * 90,
-      };
-    }),
+  "/usage/current": () => {
+    const fives = [72, 41, 100, 18, 0];
+    const sevens = [58, 63, 92, 22, 0];
+    const sonnets = [44, 51, 78, 15, 0];
+    // Score mirrors the pool: weight × room_5h × room_7d^1.5. Disabled creds and
+    // saturated snapshots (≥100% on either window) are excluded from the share.
+    const rows = CREDS.map((c, i) => {
+      const five = fives[i], seven = sevens[i];
+      const room5 = Math.max(0, 1 - five / 100);
+      const room7 = Math.max(0, 1 - seven / 100);
+      const saturated = five >= 100 || seven >= 100;
+      const active = c.status !== "disabled" && !saturated;
+      const score = active ? c.weight * room5 * Math.pow(room7, 1.5) : 0;
+      return { c, i, five, seven, sonnet: sonnets[i], room5, room7, saturated, score };
+    });
+    const sum = rows.reduce((a, r) => a + r.score, 0) || 1;
+    return rows.map(({ c, i, five, seven, sonnet, room5, room7, saturated, score }) => ({
+      credential_id: c.id, label: c.label, subscription_type: c.type, status: c.status, weight: c.weight,
+      five_hour: { pct: five, resets_at: now + (3600 * (1 + i)) },
+      seven_day: { pct: seven, resets_at: now + (86400 * (2 + i)) },
+      seven_day_sonnet: { pct: sonnet, resets_at: now + (86400 * (2 + i)) },
+      captured_at: now - 300 - i * 90,
+      selection: {
+        room_5h: room5, room_7d: room7, score,
+        share_pct: score > 0 ? (score / sum) * 100 : 0,
+        saturated,
+      },
+    }));
+  },
   "/usage/history": (q) => {
+    // Aligned grid: shared buckets, one value per bucket per series, null gaps.
     const n = 48;
     const b = buckets(q, n);
-    const series = CREDS.filter((c) => c.status !== "disabled").map((c, i) => ({
+    const active = CREDS.filter((c) => c.status !== "disabled");
+    const series = active.map((c, i) => {
+      const five = wave(n, 30 + i * 12, 55, i + 2).map((v) => Math.min(100, v));
+      const seven = wave(n, 25 + i * 10, 45, i + 5).map((v) => Math.min(100, v));
+      const sonnet = wave(n, 18 + i * 8, 40, i + 8).map((v) => Math.min(100, v));
+      // Simulate missing snapshots (a fresh import mid-window) as nulls.
+      const nulls = (arr) => arr.map((v, j) => (i === active.length - 1 && j < n / 3 ? null : v));
+      return {
+        credential_id: c.id, label: c.label,
+        five_hour_pct: nulls(five),
+        seven_day_pct: nulls(seven),
+        seven_day_sonnet_pct: nulls(sonnet),
+      };
+    });
+    return { buckets: b, series };
+  },
+  "/stats/selection": (q) => {
+    const n = 60;
+    const b = buckets(q, n);
+    const active = CREDS.filter((c) => c.status !== "disabled" && c.status !== "limited");
+    const series = active.map((c, i) => ({
       credential_id: c.id, label: c.label,
-      points: b.map((ts, j) => ({
-        ts,
-        five_hour_pct: Math.min(100, wave(n, 30 + i * 12, 55, i + 2)[j]),
-        seven_day_pct: Math.min(100, wave(n, 25 + i * 10, 45, i + 5)[j]),
-        seven_day_sonnet_pct: Math.min(100, wave(n, 18 + i * 8, 40, i + 8)[j]),
-      })),
+      picks: wave(n, 6 - i, 10, i + 4, 0),
     }));
-    return { series };
+    const totalPicks = series.map((s) => s.picks.reduce((a, v) => a + v, 0));
+    const grand = totalPicks.reduce((a, v) => a + v, 0) || 1;
+    const totals = active.map((c, i) => ({
+      credential_id: c.id, label: c.label, picks: totalPicks[i],
+      share_pct: (totalPicks[i] / grand) * 100,
+    }));
+    return { buckets: b, series, totals };
   },
   "/credentials": () =>
     CREDS.map((c, i) => ({
       id: c.id, label: c.label, subscription_type: c.type, status: c.status, weight: c.weight,
-      request_count: [8200, 5400, 1200, 3600, 40][i], last_used_at: c.status === "disabled" ? null : now - 60 * (i + 1),
+      request_count: [8200, 5400, 1200, 3600, 40][i], last_request_at: c.status === "disabled" ? null : now - 60 * (i + 1),
       expires_at: now + 3600 * (5 - i), created_at: now - 86400 * (30 - i * 4),
     })),
   "/users": () =>
@@ -182,6 +247,30 @@ window.fetch = async (input, init = {}) => {
   if (u.searchParams.has("from") && u.searchParams.has("to")) {
     const w = resolveWindow(u.searchParams);
     if (!w.valid) return json({ error: "invalid range: from must be before to and span ≤ 90 days" }, 400);
+  }
+
+  // Dynamic route: per-user recent prompts.
+  const pm = path.match(/^\/users\/([^/]+)\/prompts$/);
+  if (pm) {
+    const limit = Math.min(parseInt(u.searchParams.get("limit"), 10) || 50, 200);
+    // carol is disabled with no traffic → exercise the empty state.
+    if (pm[1] === "utok_carol") return json([]);
+    const models = ["claude-opus-4-8", "claude-sonnet-4-5", "claude-haiku-4-5"];
+    const samples = [
+      "Refactor the pool selection to prefer the least-saturated credential.",
+      "Why does my SSE stream cut off after ~30s behind the proxy?",
+      "Summarize the diff in internal/webui/static and flag any contract drift.",
+      "Write a table-driven test for winParams covering custom windows.",
+      "Explain the 4-priority conversation key derivation with an example.\nInclude the fallback hashing case.",
+      "<script>alert('xss')</script> — make sure this renders as literal text.",
+    ];
+    const rows = Array.from({ length: Math.min(limit, 18) }, (_, i) => ({
+      ts: now - i * 640 - Math.round(rand(i + 1) * 300),
+      conv_id: "conv_" + (2000 + i),
+      model: models[i % models.length],
+      prompt: samples[i % samples.length],
+    }));
+    return json(rows);
   }
 
   const handler = DB[path];
