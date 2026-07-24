@@ -56,6 +56,16 @@ func TestAugmentModels(t *testing.T) {
 	if len(env.Data) != 5 {
 		t.Errorf("want 5 entries (3 + 2 variants), got %d", len(env.Data))
 	}
+
+	// The [1m] variant must precede its base model so it is the visible row
+	// in Claude Code's collapsed /model picker.
+	idx := map[string]int{}
+	for i, m := range env.Data {
+		idx[m.ID] = i
+	}
+	if idx["claude-opus-4-8[1m]"] > idx["claude-opus-4-8"] {
+		t.Error("[1m] variant must come before its base model")
+	}
 }
 
 func TestAugmentModelsIdempotentAndMalformed(t *testing.T) {

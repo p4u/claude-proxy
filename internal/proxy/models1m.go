@@ -62,19 +62,23 @@ func augmentModels(raw []byte) []byte {
 		}
 	}
 
+	// The [1m] variant is inserted BEFORE its base model: Claude Code's /model
+	// picker collapses long gateway lists behind a "+N models" tail, and models
+	// without a built-in picker row (e.g. Fable) are only reachable through
+	// these gateway rows — putting the 1M variant first makes it the visible,
+	// default pick instead of the 200K bare entry.
 	out := make([]map[string]any, 0, len(entries)*2)
 	for _, e := range entries {
-		out = append(out, e)
 		id, ok := e["id"].(string)
-		if !ok || !has1MVariant(id) || existing[id+"[1m]"] {
-			continue
+		if ok && has1MVariant(id) && !existing[id+"[1m]"] {
+			variant := maps.Clone(e)
+			variant["id"] = id + "[1m]"
+			if dn, ok := e["display_name"].(string); ok {
+				variant["display_name"] = dn + " (1M context)"
+			}
+			out = append(out, variant)
 		}
-		variant := maps.Clone(e)
-		variant["id"] = id + "[1m]"
-		if dn, ok := e["display_name"].(string); ok {
-			variant["display_name"] = dn + " (1M context)"
-		}
-		out = append(out, variant)
+		out = append(out, e)
 	}
 
 	data, err := json.Marshal(out)
