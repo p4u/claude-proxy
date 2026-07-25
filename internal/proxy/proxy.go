@@ -124,13 +124,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("counter bump", "err", err, "cred", cred.ID)
 	}
 
-	// Capture the user's prompt (never the response) for POST /v1/messages when
-	// prompt logging is enabled. No-op otherwise.
+	// Capture the user's prompt for POST /v1/messages when prompt logging is
+	// enabled, plus the full message history for users opted into full capture.
+	// No-op otherwise.
+	replySeq, captureReply := -1, false
 	if r.Method == http.MethodPost && r.URL.Path == "/v1/messages" {
 		h.capturePrompt(r.Context(), convID, body)
+		if seq, ok := h.captureConversation(r.Context(), convID, body); ok {
+			replySeq, captureReply = seq, true
+		}
 	}
 
-	status, rxBytes, usage := h.forward(w, r, body, cred, true)
+	status, rxBytes, usage, reply := h.forward(w, r, body, cred, true, captureReply)
 	latency := time.Since(start)
 	h.log.Info("forwarded",
 		"cred", cred.ID, "label", cred.Label,
@@ -139,6 +144,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"bytes_sent", len(body), "bytes_received", rxBytes,
 		"model", usage.Model,
 		"tokens_in", usage.InputTokens, "tokens_out", usage.OutputTokens)
+
+	if captureReply && status == http.StatusOK {
+		h.captureAssistantReply(r.Context(), convID, replySeq, usage.Model, reply)
+	}
 
 	h.logRequest(r.Context(), r.URL.Path, convID, cred.ID, status, int64(len(body)), rxBytes, latency, usage)
 }
@@ -228,17 +237,18 @@ func (h *Handler) pickAny(ctx context.Context) (*creds.Credential, error) {
 }
 
 // forward sends the request upstream and streams the response back. Returns the
-// upstream HTTP status (or -1 on local failure) and bytes received from upstream.
-// If allowRetry is true and upstream returns 401, the proxy refreshes the
-// credential and retries once.
-func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, cred *creds.Credential, allowRetry bool) (int, int64, tokenUsage) {
+// upstream HTTP status (or -1 on local failure), bytes received from upstream,
+// the parsed token usage, and — when captureText is set — the assistant's
+// visible output text (for full conversation capture). If allowRetry is true
+// and upstream returns 401, the proxy refreshes the credential and retries once.
+func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, cred *creds.Credential, allowRetry, captureText bool) (int, int64, tokenUsage, string) {
 	upstreamURL := "https://" + UpstreamHost + r.URL.RequestURI()
 
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, bytes.NewReader(body))
 	if err != nil {
 		http.Error(w, "build upstream req", http.StatusBadGateway)
 		_ = creds.MarkError(r.Context(), h.db, cred.ID)
-		return -1, 0, tokenUsage{}
+		return -1, 0, tokenUsage{}, ""
 	}
 
 	copyHeaders(upstreamReq.Header, r.Header)
@@ -260,7 +270,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 		http.Error(w, "upstream: "+err.Error(), http.StatusBadGateway)
 		_ = creds.MarkError(r.Context(), h.db, cred.ID)
 		h.log.Error("upstream transport error", "cred", cred.ID, "err", err)
-		return -1, 0, tokenUsage{}
+		return -1, 0, tokenUsage{}, ""
 	}
 
 	h.log.Debug(
@@ -283,10 +293,10 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 			_ = creds.MarkError(r.Context(), h.db, cred.ID)
 			h.log.Error("refresh failed after 401; marked expired", "cred", cred.ID, "err", rerr)
 			http.Error(w, "proxy: credential expired", http.StatusBadGateway)
-			return 401, 0, tokenUsage{}
+			return 401, 0, tokenUsage{}, ""
 		}
 		h.log.Info("refresh succeeded; retrying upstream", "cred", cred.ID)
-		return h.forward(w, r, body, fresh, false)
+		return h.forward(w, r, body, fresh, false, captureText)
 	}
 
 	if resp.StatusCode == http.StatusTooManyRequests {
@@ -332,7 +342,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 	// responses; other statuses carry no billable usage worth parsing.
 	var cap *usageCapture
 	if resp.StatusCode == http.StatusOK {
-		cap = newUsageCapture(resp.Header.Get("Content-Type"), resp.Header.Get("Content-Encoding"))
+		cap = newUsageCapture(resp.Header.Get("Content-Type"), resp.Header.Get("Content-Encoding"), captureText)
 	}
 
 	flusher, _ := w.(http.Flusher)
@@ -343,7 +353,8 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				h.log.Warn("client write error", "err", werr, "cred", cred.ID, "streamed", rxBytes)
-				return resp.StatusCode, rxBytes, closeUsage(cap)
+				u, text := closeUsage(cap)
+				return resp.StatusCode, rxBytes, u, text
 			}
 			if cap != nil {
 				cap.Write(buf[:n])
@@ -356,21 +367,25 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 		if rerr == io.EOF {
 			h.log.Debug("stream done",
 				"cred", cred.ID, "label", cred.Label, "status", resp.StatusCode, "bytes", rxBytes)
-			return resp.StatusCode, rxBytes, closeUsage(cap)
+			u, text := closeUsage(cap)
+			return resp.StatusCode, rxBytes, u, text
 		}
 		if rerr != nil {
 			h.log.Warn("upstream stream error", "err", rerr, "cred", cred.ID, "streamed", rxBytes)
-			return resp.StatusCode, rxBytes, closeUsage(cap)
+			u, text := closeUsage(cap)
+			return resp.StatusCode, rxBytes, u, text
 		}
 	}
 }
 
-// closeUsage finalizes a capture (nil-safe) and returns the parsed usage.
-func closeUsage(c *usageCapture) tokenUsage {
+// closeUsage finalizes a capture (nil-safe) and returns the parsed usage plus
+// any accumulated assistant text.
+func closeUsage(c *usageCapture) (tokenUsage, string) {
 	if c == nil {
-		return tokenUsage{}
+		return tokenUsage{}, ""
 	}
-	return c.Close()
+	u := c.Close()
+	return u, c.Text()
 }
 
 // logRequest inserts one row into request_log for dashboard aggregation.

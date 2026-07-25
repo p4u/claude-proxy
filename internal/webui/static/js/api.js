@@ -97,8 +97,34 @@ export const api = {
     request("GET", `/usage/history?${winParams(win)}` + (credId ? `&credential_id=${credId}` : "")),
   credentials: () => request("GET", "/credentials"),
   users: () => request("GET", "/users"),
-  userPrompts: (id, limit = 50) => request("GET", `/users/${id}/prompts?limit=${limit}`),
+
+  // Per-user capture mode. `full` true ⇒ store both sides of every conversation.
+  setUserCapture: (id, full) => request("POST", `/users/${enc(id)}/capture`, { full: !!full }),
+
+  // Paginated envelopes: {items, total, limit, offset, has_more}.
+  userPrompts: (id, { limit = 50, offset = 0 } = {}) =>
+    request("GET", `/users/${enc(id)}/prompts?${page(limit, offset)}`),
+  userConversations: (id, { limit = 25, offset = 0 } = {}) =>
+    request("GET", `/users/${enc(id)}/conversations?${page(limit, offset)}`),
+  conversationMessages: (convID, { limit = 20, offset = 0 } = {}) =>
+    request("GET", `/conversations/${enc(convID)}/messages?${page(limit, offset)}`),
+
   conversations: (limit = 100) => request("GET", `/conversations?limit=${limit}`),
 };
+
+// Markdown export is a normal navigation, not an XHR: same-origin cookie auth
+// applies and the browser handles the download + filename from
+// Content-Disposition. Never fetch+blob this.
+export function conversationExportUrl(convID) {
+  return `${API_BASE}/conversations/${enc(convID)}/export.md`;
+}
+
+function enc(v) {
+  return encodeURIComponent(String(v == null ? "" : v));
+}
+
+function page(limit, offset) {
+  return `limit=${Math.max(1, limit | 0)}&offset=${Math.max(0, offset | 0)}`;
+}
 
 export { ApiError };

@@ -155,3 +155,114 @@ queries must use the indexes on `request_log(ts)` / `usage_history(credential_id
   chart (tokens by type + requests) on the dashboard; credentials table reads
   `last_request_at` (fixes perpetual "never"); Users page gains a per-user "Prompts"
   button + modal (newest prompts, ts + model).
+
+## v3 additions — full conversation capture (2026-07-24)
+
+Gated by the existing `CLAUDE_PROXY_PROMPT_RETENTION_DAYS` (`0` => no capture of
+any kind, per-user flag ignored) and pruned by the same hourly janitor.
+
+### Per-user capture mode
+
+`user_tokens` gains `full_capture INTEGER NOT NULL DEFAULT 0` (additive ALTER,
+existing swallow-duplicate mechanism). Default **0** = today's behavior: one
+`prompt_log` row per request holding the last user message.
+
+When **1**, the proxy additionally records the whole conversation, both roles:
+
+- **Request side** - `POST /v1/messages` carries the full `messages` array (the
+  API is stateless, so every prior turn is re-sent). Store messages not yet
+  stored for this `conv_id`: keep a per-conversation `seq` and insert from
+  `stored_count` onward. Idempotent by construction.
+- **Response side** - extend `internal/proxy/usagecapture.go` to accumulate
+  assistant output text (SSE `content_block_delta` of type `text_delta`, and the
+  `content[]` text blocks of non-streaming JSON) **only when full capture is on
+  for that request**; append it as the next `assistant` message once the stream
+  completes. Thinking blocks and tool payloads are NOT stored. Parse failures
+  stay silent and must never affect the client stream.
+- Per-message cap 32768 runes (truncate, append a truncation marker).
+- Document the limitation: server-side context compaction/editing can rewrite
+  history, so `seq` alignment may drift on very long conversations.
+
+New table:
+
+    conversation_message(
+      id INTEGER PK AUTOINCREMENT,
+      conv_id TEXT NOT NULL,
+      user_token_id TEXT REFERENCES user_tokens(id) ON DELETE SET NULL,
+      seq INTEGER NOT NULL,          -- 0-based position within the conversation
+      role TEXT NOT NULL,            -- "user" | "assistant"
+      content TEXT NOT NULL DEFAULT '',
+      model TEXT NOT NULL DEFAULT '',
+      ts INTEGER NOT NULL,
+      UNIQUE(conv_id, seq)
+    )
+    INDEX (conv_id, seq), INDEX (user_token_id, ts), INDEX (ts)
+
+`usertoken.UserToken` and `usertoken.Identity` gain `FullCapture bool`
+(populated by the existing `LookupByToken` in AuthMiddleware - no extra query).
+
+### API
+
+- `GET /api/users` - each entry gains `"full_capture": bool`.
+- `POST /api/users/{id}/capture` `{"full": bool}` -> `{"ok":true,"full_capture":bool}`.
+- `GET /api/users/{id}/prompts?limit&offset` - **paginated over ALL rows** for
+  that user (not just the newest 50): `{items:[{ts,conv_id,model,prompt}],
+  total, limit, offset, has_more}`. Newest first. `limit` default 50, max 500.
+- `GET /api/users/{id}/conversations?limit&offset` ->
+  `{items:[{conv_id, first_ts, last_ts, messages, prompts, model, source}],
+  total, limit, offset, has_more}` - newest `last_ts` first. `messages` counts
+  `conversation_message` rows, `prompts` counts `prompt_log` rows; `source` is
+  `"full"` when full messages exist for that conversation, else `"prompts"`.
+- `GET /api/conversations/{convID}/messages?limit&offset` ->
+  `{items:[{seq,role,content,model,ts}], total, limit, offset, has_more,
+  source, conv_id, user:{id,name}}` - ascending `seq`. When no
+  `conversation_message` rows exist, fall back to that conversation's
+  `prompt_log` rows rendered as `role:"user"` items with `source:"prompts"`, so
+  the viewer works in both modes.
+- `GET /api/conversations/{convID}/export.md` -> `text/markdown; charset=utf-8`
+  with `Content-Disposition: attachment; filename="conversation-<short>.md"`.
+  Same full-vs-prompts fallback.
+
+Export format - readable in any markdown viewer. Do **not** fence message bodies
+(they already contain code fences); separate turns with `---` and a heading
+carrying index, role, and timestamp:
+
+    # Conversation 4f2a9c1b
+    
+    | | |
+    |---|---|
+    | **User** | alice |
+    | **Model** | claude-fable-5 |
+    | **Messages** | 24 |
+    | **Started** | 2026-07-24 10:12:03 UTC |
+    | **Last activity** | 2026-07-24 10:41:55 UTC |
+    | **Exported** | 2026-07-24 11:02:10 UTC |
+    | **Source** | full conversation |
+    
+    ---
+    
+    ### 1 - User - 2026-07-24 10:12:03 UTC
+    
+    <content verbatim>
+    
+    ---
+    
+    ### 2 - Assistant - 2026-07-24 10:12:20 UTC
+    
+    <content verbatim>
+
+`Source` renders as `full conversation` or `user prompts only`; in the
+prompts-only case add a note under the table stating assistant replies were not
+captured for this conversation.
+
+### Frontend (Users page)
+
+- Row gains a **Full capture** toggle -> `POST .../capture`, with a short helper
+  making the privacy tradeoff explicit ("stores both sides of every
+  conversation, including pasted file contents").
+- The existing **Prompts** button opens a modal with two tabs: **Prompts** (all
+  rows, paginated - prev/next with a range indicator) and **Conversations**
+  (paginated list; click a row -> paginated message viewer, role-labelled,
+  whitespace-preserving; a **Download .md** button hitting the export endpoint
+  via a normal anchor so the browser saves the file).
+- Message content is rendered with `textContent` (never `innerHTML`).

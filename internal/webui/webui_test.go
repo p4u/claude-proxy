@@ -598,7 +598,7 @@ func TestUsageCurrentSelection(t *testing.T) {
 	}
 }
 
-func TestUserPromptsEndpoint(t *testing.T) {
+func TestUserPromptsPaginated(t *testing.T) {
 	db, h := newTestServer(t)
 	ctx := context.Background()
 	ut, _ := usertoken.Create(ctx, db, "frank")
@@ -610,27 +610,319 @@ func TestUserPromptsEndpoint(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	ins(now-10, "older")
-	ins(now, "newest")
+	for i := 0; i < 5; i++ {
+		ins(now-int64(i), "p"+strconv.Itoa(i)) // p0 newest
+	}
 
 	cookie := loginCookie(t, h)
-	w := do(t, h, http.MethodGet, "/api/users/"+ut.ID+"/prompts?limit=50", "", cookie)
+	type resp struct {
+		Items []struct {
+			TS     string `json:"ts"`
+			Model  string `json:"model"`
+			Prompt string `json:"prompt"`
+		} `json:"items"`
+		Total   int  `json:"total"`
+		Limit   int  `json:"limit"`
+		Offset  int  `json:"offset"`
+		HasMore bool `json:"has_more"`
+	}
+	get := func(url string) resp {
+		t.Helper()
+		w := do(t, h, http.MethodGet, url, "", cookie)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s = %d: %s", url, w.Code, w.Body.String())
+		}
+		var r resp
+		if err := json.Unmarshal(w.Body.Bytes(), &r); err != nil {
+			t.Fatalf("decode: %v (%s)", err, w.Body.String())
+		}
+		return r
+	}
+
+	first := get("/api/users/" + ut.ID + "/prompts?limit=2")
+	if first.Total != 5 || first.Limit != 2 || first.Offset != 0 || !first.HasMore {
+		t.Fatalf("page 1 meta = %+v", first)
+	}
+	if len(first.Items) != 2 || first.Items[0].Prompt != "p0" {
+		t.Fatalf("page 1 items = %+v (want newest-first)", first.Items)
+	}
+
+	last := get("/api/users/" + ut.ID + "/prompts?limit=2&offset=4")
+	if last.HasMore {
+		t.Fatalf("last page should not report has_more: %+v", last)
+	}
+	if len(last.Items) != 1 || last.Items[0].Prompt != "p4" {
+		t.Fatalf("last page items = %+v", last.Items)
+	}
+}
+
+// seedConv writes conversation_message rows for a conversation.
+func seedConv(t *testing.T, db *store.DB, userID, convID string, base int64, msgs ...[2]string) {
+	t.Helper()
+	for i, m := range msgs {
+		if _, err := db.Exec(`
+			INSERT INTO conversation_message (conv_id, user_token_id, seq, role, content, model, ts)
+			VALUES (?, ?, ?, ?, ?, 'claude-test', ?)`,
+			convID, userID, i, m[0], m[1], base+int64(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestUserCaptureToggle(t *testing.T) {
+	db, h := newTestServer(t)
+	ctx := context.Background()
+	ut, _ := usertoken.Create(ctx, db, "grace")
+	cookie := loginCookie(t, h)
+
+	users := func() []userView {
+		t.Helper()
+		w := do(t, h, http.MethodGet, "/api/users", "", cookie)
+		if w.Code != http.StatusOK {
+			t.Fatalf("users = %d: %s", w.Code, w.Body.String())
+		}
+		var out []userView
+		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode: %v (%s)", err, w.Body.String())
+		}
+		return out
+	}
+	if got := users(); len(got) != 1 || got[0].FullCapture {
+		t.Fatalf("default full_capture should be false: %+v", got)
+	}
+
+	w := do(t, h, http.MethodPost, "/api/users/"+ut.ID+"/capture", `{"full":true}`, cookie)
 	if w.Code != http.StatusOK {
-		t.Fatalf("prompts = %d: %s", w.Code, w.Body.String())
+		t.Fatalf("capture = %d: %s", w.Code, w.Body.String())
 	}
-	var rows []struct {
-		TS     string `json:"ts"`
-		Model  string `json:"model"`
-		Prompt string `json:"prompt"`
+	var res struct {
+		OK          bool `json:"ok"`
+		FullCapture bool `json:"full_capture"`
 	}
-	if err := json.Unmarshal(w.Body.Bytes(), &rows); err != nil {
-		t.Fatalf("decode: %v", err)
+	_ = json.Unmarshal(w.Body.Bytes(), &res)
+	if !res.OK || !res.FullCapture {
+		t.Fatalf("capture response = %+v", res)
 	}
-	if len(rows) != 2 {
-		t.Fatalf("rows=%d, want 2", len(rows))
+	if got := users(); !got[0].FullCapture {
+		t.Fatal("full_capture not reflected in users list")
 	}
-	if rows[0].Prompt != "newest" {
-		t.Fatalf("first prompt=%q, want newest-first ordering", rows[0].Prompt)
+	// The proxy identity must see it too.
+	reloaded, err := usertoken.Get(ctx, db, ut.ID)
+	if err != nil || !reloaded.FullCapture {
+		t.Fatalf("usertoken.Get full_capture = %v (err %v)", reloaded, err)
+	}
+
+	// Toggle back off.
+	do(t, h, http.MethodPost, "/api/users/"+ut.ID+"/capture", `{"full":false}`, cookie)
+	if got := users(); got[0].FullCapture {
+		t.Fatal("full_capture not cleared")
+	}
+	// Unknown user → 404.
+	if w := do(t, h, http.MethodPost, "/api/users/nope/capture", `{"full":true}`, cookie); w.Code != http.StatusNotFound {
+		t.Fatalf("unknown user capture = %d, want 404", w.Code)
+	}
+}
+
+func TestUserConversationsList(t *testing.T) {
+	db, h := newTestServer(t)
+	ctx := context.Background()
+	ut, _ := usertoken.Create(ctx, db, "heidi")
+	now := time.Now().Unix()
+
+	seedConv(t, db, ut.ID, "conv-full", now-100,
+		[2]string{"user", "hello"}, [2]string{"assistant", "hi there"})
+	// A prompts-only conversation, newer.
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO prompt_log (user_token_id, conv_id, ts, model, prompt)
+		VALUES (?, 'conv-prompts', ?, 'm', 'just a prompt')`, ut.ID, now-10); err != nil {
+		t.Fatal(err)
+	}
+
+	cookie := loginCookie(t, h)
+	w := do(t, h, http.MethodGet, "/api/users/"+ut.ID+"/conversations", "", cookie)
+	if w.Code != http.StatusOK {
+		t.Fatalf("conversations = %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Items []struct {
+			ConvID   string `json:"conv_id"`
+			Messages int    `json:"messages"`
+			Prompts  int    `json:"prompts"`
+			Model    string `json:"model"`
+			Source   string `json:"source"`
+			FirstTS  string `json:"first_ts"`
+			LastTS   string `json:"last_ts"`
+		} `json:"items"`
+		Total   int  `json:"total"`
+		HasMore bool `json:"has_more"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v (%s)", err, w.Body.String())
+	}
+	if resp.Total != 2 || len(resp.Items) != 2 || resp.HasMore {
+		t.Fatalf("meta = %+v", resp)
+	}
+	// Newest last_ts first.
+	if resp.Items[0].ConvID != "conv-prompts" || resp.Items[0].Source != "prompts" {
+		t.Fatalf("first item = %+v", resp.Items[0])
+	}
+	full := resp.Items[1]
+	if full.ConvID != "conv-full" || full.Source != "full" || full.Messages != 2 || full.Prompts != 0 {
+		t.Fatalf("full conv item = %+v", full)
+	}
+	if full.Model != "claude-test" || full.FirstTS == "" || full.LastTS == "" {
+		t.Fatalf("full conv metadata = %+v", full)
+	}
+}
+
+func TestRecentConversationsStillListed(t *testing.T) {
+	db, h := newTestServer(t)
+	ctx := context.Background()
+	c, _ := creds.Insert(ctx, db, "A", "max", "sk-ant-oat-a", "rt-a", time.Now().Add(time.Hour), 5)
+	now := time.Now().Unix()
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO conversations (id, credential_id, created_at, last_seen_at, request_count, status)
+		VALUES ('cv1', ?, ?, ?, 3, 'active')`, c.ID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	cookie := loginCookie(t, h)
+	w := do(t, h, http.MethodGet, "/api/conversations?limit=10", "", cookie)
+	if w.Code != http.StatusOK {
+		t.Fatalf("conversations = %d: %s", w.Code, w.Body.String())
+	}
+	var out []convView
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v (%s)", err, w.Body.String())
+	}
+	if len(out) != 1 || out[0].ID != "cv1" || out[0].RequestCount != 3 {
+		t.Fatalf("recent bindings list = %+v", out)
+	}
+}
+
+func TestConversationMessagesAndFallback(t *testing.T) {
+	db, h := newTestServer(t)
+	ctx := context.Background()
+	ut, _ := usertoken.Create(ctx, db, "ivan")
+	now := time.Now().Unix()
+	seedConv(t, db, ut.ID, "conv-1", now,
+		[2]string{"user", "q1"}, [2]string{"assistant", "a1"}, [2]string{"user", "q2"})
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO prompt_log (user_token_id, conv_id, ts, model, prompt)
+		VALUES (?, 'conv-2', ?, 'm', 'only prompt')`, ut.ID, now); err != nil {
+		t.Fatal(err)
+	}
+
+	cookie := loginCookie(t, h)
+	type resp struct {
+		Items []struct {
+			Seq     int    `json:"seq"`
+			Role    string `json:"role"`
+			Content string `json:"content"`
+			TS      string `json:"ts"`
+		} `json:"items"`
+		Total   int    `json:"total"`
+		HasMore bool   `json:"has_more"`
+		Source  string `json:"source"`
+		ConvID  string `json:"conv_id"`
+		User    struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"user"`
+	}
+	get := func(url string) resp {
+		t.Helper()
+		w := do(t, h, http.MethodGet, url, "", cookie)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s = %d: %s", url, w.Code, w.Body.String())
+		}
+		var r resp
+		if err := json.Unmarshal(w.Body.Bytes(), &r); err != nil {
+			t.Fatalf("decode: %v (%s)", err, w.Body.String())
+		}
+		return r
+	}
+
+	full := get("/api/conversations/conv-1/messages")
+	if full.Source != "full" || full.Total != 3 || full.ConvID != "conv-1" {
+		t.Fatalf("full meta = %+v", full)
+	}
+	if full.User.Name != "ivan" || full.User.ID != ut.ID {
+		t.Fatalf("user = %+v", full.User)
+	}
+	if len(full.Items) != 3 || full.Items[0].Seq != 0 || full.Items[1].Role != "assistant" {
+		t.Fatalf("items = %+v (want ascending seq)", full.Items)
+	}
+
+	paged := get("/api/conversations/conv-1/messages?limit=2")
+	if !paged.HasMore || len(paged.Items) != 2 {
+		t.Fatalf("paged = %+v", paged)
+	}
+
+	// Prompts-only conversation falls back to prompt_log as user turns.
+	fb := get("/api/conversations/conv-2/messages")
+	if fb.Source != "prompts" || fb.Total != 1 {
+		t.Fatalf("fallback meta = %+v", fb)
+	}
+	if len(fb.Items) != 1 || fb.Items[0].Role != "user" || fb.Items[0].Content != "only prompt" {
+		t.Fatalf("fallback items = %+v", fb.Items)
+	}
+}
+
+func TestConversationExportMarkdown(t *testing.T) {
+	db, h := newTestServer(t)
+	ctx := context.Background()
+	ut, _ := usertoken.Create(ctx, db, "judy")
+	now := time.Now().Unix()
+	seedConv(t, db, ut.ID, "4f2a9c1b-xyz", now,
+		[2]string{"user", "how do I ```fence``` this?"}, [2]string{"assistant", "like so"})
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO prompt_log (user_token_id, conv_id, ts, model, prompt)
+		VALUES (?, 'conv-p', ?, 'm', 'lonely prompt')`, ut.ID, now); err != nil {
+		t.Fatal(err)
+	}
+
+	cookie := loginCookie(t, h)
+	w := do(t, h, http.MethodGet, "/api/conversations/4f2a9c1b-xyz/export.md", "", cookie)
+	if w.Code != http.StatusOK {
+		t.Fatalf("export = %d: %s", w.Code, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "text/markdown; charset=utf-8" {
+		t.Fatalf("Content-Type = %q", ct)
+	}
+	if cd := w.Header().Get("Content-Disposition"); cd != `attachment; filename="conversation-4f2a9c1b.md"` {
+		t.Fatalf("Content-Disposition = %q", cd)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		"# Conversation 4f2a9c1b",
+		"| **User** | judy |",
+		"| **Model** | claude-test |",
+		"| **Messages** | 2 |",
+		"| **Source** | full conversation |",
+		"### 1 - User - ",
+		"### 2 - Assistant - ",
+		"how do I ```fence``` this?",
+		"\n---\n",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("export missing %q:\n%s", want, body)
+		}
+	}
+
+	// Prompts-only export carries the caveat note.
+	w2 := do(t, h, http.MethodGet, "/api/conversations/conv-p/export.md", "", cookie)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("prompts export = %d", w2.Code)
+	}
+	b2 := w2.Body.String()
+	if !strings.Contains(b2, "| **Source** | user prompts only |") ||
+		!strings.Contains(b2, "Assistant replies were not captured") {
+		t.Fatalf("prompts-only export missing note:\n%s", b2)
+	}
+
+	// Unknown conversation → 404.
+	if w := do(t, h, http.MethodGet, "/api/conversations/nope/export.md", "", cookie); w.Code != http.StatusNotFound {
+		t.Fatalf("unknown export = %d, want 404", w.Code)
 	}
 }
 

@@ -63,6 +63,7 @@ func AuthMiddleware(adminToken string, db *store.DB, uiEnabled bool, next http.H
 				ctx := usertoken.WithIdentity(r.Context(), &usertoken.Identity{
 					UserTokenID: ut.ID,
 					UserName:    ut.Name,
+					FullCapture: ut.FullCapture,
 				})
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return

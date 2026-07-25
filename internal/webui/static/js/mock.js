@@ -10,11 +10,13 @@ const CREDS = [
   { id: "cred_dz17", label: "enterprise-01", type: "enterprise", weight: 5, status: "active" },
   { id: "cred_er05", label: "pro-old", type: "pro", weight: 1, status: "disabled" },
 ];
+// full_capture is mutated in place by POST /users/{id}/capture so the toggle
+// stays stateful for the whole mock session.
 const USERS = [
-  { id: "utok_alice", name: "alice", status: "active" },
-  { id: "utok_bob", name: "bob", status: "active" },
-  { id: "utok_carol", name: "carol", status: "disabled" },
-  { id: "utok_ci", name: "ci-runner", status: "active" },
+  { id: "utok_alice", name: "alice", status: "active", full_capture: true },
+  { id: "utok_bob", name: "bob", status: "active", full_capture: false },
+  { id: "utok_carol", name: "carol", status: "disabled", full_capture: false },
+  { id: "utok_ci", name: "ci-runner", status: "active", full_capture: false },
 ];
 
 const now = Math.floor(Date.now() / 1000);
@@ -207,7 +209,8 @@ const DB = {
     })),
   "/users": () =>
     USERS.map((u, i) => ({
-      id: u.id, name: u.name, status: u.status, created_at: now - 86400 * (20 - i * 3),
+      id: u.id, name: u.name, status: u.status, full_capture: u.full_capture,
+      created_at: now - 86400 * (20 - i * 3),
       last_used_at: u.status === "disabled" ? now - 86400 * 4 : now - 120 * (i + 1),
     })),
   "/conversations": () =>
@@ -216,6 +219,120 @@ const DB = {
       last_seen: now - 60 * i, requests: 3 + (i % 7),
     })),
 };
+
+// ---------- v3: prompts, conversations, messages ----------
+
+const MODELS = ["claude-opus-4-8", "claude-sonnet-4-5", "claude-haiku-4-5"];
+
+const PROMPT_SAMPLES = [
+  "Refactor the pool selection to prefer the least-saturated credential.",
+  "Why does my SSE stream cut off after ~30s behind the proxy?",
+  "Summarize the diff in internal/webui/static and flag any contract drift.",
+  "Write a table-driven test for winParams covering custom windows.",
+  "Explain the 4-priority conversation key derivation with an example.\nInclude the fallback hashing case.",
+  "<script>alert('xss')</script> — make sure this renders as literal text.",
+  "Here is the config I pasted:\n\n    HOST_BIND=127.0.0.1\n    HOST_PORT=8787\n    PROMPT_RETENTION_DAYS=7\n\nAnything unsafe?",
+  "Trace what happens on a 429 from api.anthropic.com, step by step.",
+];
+
+const USER_TURNS = [
+  "Refactor the pool selection so a saturated credential is never picked for a new conversation.",
+  "Here's the failing test output:\n\n```\n--- FAIL: TestBind/rebinds_off_saturated (0.00s)\n    pool_test.go:142: got cred_ck88, want cred_ax91\n```\n\nWhat's wrong?",
+  "<script>alert('xss')</script> and <img src=x onerror=alert(1)> — both of these must render as literal text, never execute.",
+  "Explain the 4-priority conversation key derivation with a worked example.",
+  "Paste from the terminal — mind the entities: & < > \" ' and a stray ``` fence.",
+  "Can you show the migration SQL for the new conversation_message table?",
+];
+
+const ASSISTANT_TURNS = [
+  "The selection score mirrors the pool exactly:\n\n```go\nfunc Score(weight, room5h, room7d float64) float64 {\n\treturn weight * room5h * math.Pow(room7d, SevenDayExp)\n}\n```\n\nThe 5h and 7d windows are **independent ceilings** — a request 429s on whichever it hits first — so their remaining room is multiplied, not averaged.",
+  "Short answer: the binding is sticky, but no longer unconditionally.\n\n1. `Bind()` looks up the conversation row\n2. If the pinned credential's latest snapshot is ≥100% on either window, it re-picks\n3. Otherwise it returns the existing pin unchanged\n\nThat's why the test sees `cred_ck88`: its snapshot is at 100%, so it should have been excluded before scoring.",
+  "That string is stored verbatim and rendered with `textContent`, so the browser shows it as text instead of parsing it as HTML. Nothing executes.",
+  "Priority order:\n\n| # | Source |\n|---|---|\n| 1 | `X-Router-Conversation-ID` header |\n| 2 | `$.metadata.user_id` in the body |\n| 3 | `SHA256(system_prompt + first_user_message)` |\n| 4 | `SHA256(remote_addr + body[:4096])` |\n\nThe first one that yields a non-empty value wins.",
+  "Here it is — additive, so it rides the existing swallow-duplicate ALTER mechanism:\n\n```sql\nCREATE TABLE IF NOT EXISTS conversation_message (\n  id INTEGER PRIMARY KEY AUTOINCREMENT,\n  conv_id TEXT NOT NULL,\n  seq INTEGER NOT NULL,\n  role TEXT NOT NULL,\n  content TEXT NOT NULL DEFAULT '',\n  UNIQUE(conv_id, seq)\n);\n```",
+];
+
+const userById = (id) => USERS.find((u) => u.id === id) || null;
+
+// Per-user volume: alice has enough prompts to page through several times.
+const PROMPT_TOTALS = { utok_alice: 63, utok_bob: 12, utok_carol: 0, utok_ci: 4 };
+// Conversation counts; alice has full capture on, so hers are "full".
+const CONV_TOTALS = { utok_alice: 7, utok_bob: 3, utok_carol: 0, utok_ci: 1 };
+// Message counts per conversation index (alice's first is the long multi-turn one).
+const CONV_SIZES = [34, 8, 4, 6, 2, 10, 4, 6];
+
+function convIdFor(uid, i) {
+  return `conv_${uid.replace(/^utok_/, "")}${String(i).padStart(2, "0")}9c1b`;
+}
+// Parse a conversation id back to its owner + index so the message route can
+// regenerate exactly the same content the list advertised.
+function parseConvId(cid) {
+  const m = String(cid).match(/^conv_([a-z-]+)(\d\d)9c1b$/);
+  if (!m) return null;
+  const u = USERS.find((x) => x.id.replace(/^utok_/, "") === m[1]);
+  if (!u) return null;
+  const i = parseInt(m[2], 10);
+  if (i >= (CONV_TOTALS[u.id] || 0)) return null;
+  return { user: u, index: i };
+}
+
+// A conversation is "full" only when both sides were captured at the time it
+// ran. Frozen at load: flipping the toggle now can't rewrite stored history.
+const CAPTURED_FULL = Object.fromEntries(USERS.map((u) => [u.id, u.full_capture]));
+function convSource(u, i) {
+  if (!CAPTURED_FULL[u.id]) return "prompts";
+  return i === CONV_TOTALS[u.id] - 1 ? "prompts" : "full"; // oldest predates the flag
+}
+
+function convMeta(u, i) {
+  const size = CONV_SIZES[i % CONV_SIZES.length];
+  const source = convSource(u, i);
+  const last = now - i * 5400 - 300;
+  return {
+    conv_id: convIdFor(u.id, i),
+    first_ts: last - size * 95,
+    last_ts: last,
+    messages: source === "full" ? size : 0,
+    prompts: source === "full" ? Math.ceil(size / 2) : Math.max(1, Math.round(size / 2)),
+    model: MODELS[i % MODELS.length],
+    source,
+  };
+}
+
+function promptRow(u, i) {
+  const nConv = CONV_TOTALS[u.id] || 1;
+  return {
+    ts: now - i * 640 - Math.round(rand(i + 1) * 300),
+    conv_id: convIdFor(u.id, i % nConv),
+    model: MODELS[i % MODELS.length],
+    prompt: PROMPT_SAMPLES[i % PROMPT_SAMPLES.length],
+  };
+}
+
+function messageRow(u, ci, seq) {
+  const meta = convMeta(u, ci);
+  const isUser = seq % 2 === 0;
+  const pool = isUser ? USER_TURNS : ASSISTANT_TURNS;
+  const idx = Math.floor(seq / 2) % pool.length;
+  return {
+    seq,
+    role: isUser ? "user" : "assistant",
+    content: pool[idx],
+    model: isUser ? "" : meta.model,
+    ts: meta.first_ts + seq * 95,
+  };
+}
+
+// Slice a generated collection into the {items,total,limit,offset,has_more}
+// envelope the v3 endpoints return.
+function envelope(total, q, defLimit, make, extra = {}) {
+  const limit = Math.min(Math.max(parseInt(q.get("limit"), 10) || defLimit, 1), 500);
+  const offset = Math.max(parseInt(q.get("offset"), 10) || 0, 0);
+  const end = Math.min(offset + limit, total);
+  const items = [];
+  for (let i = offset; i < end; i++) items.push(make(i));
+  return { items, total, limit, offset, has_more: end < total, ...extra };
+}
 
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
@@ -240,6 +357,16 @@ window.fetch = async (input, init = {}) => {
   if (method !== "GET") {
     if (path === "/users" && method === "POST") return json({ id: "utok_new", name: JSON.parse(init.body || "{}").name || "new", token: "cpu_" + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2) });
     if (path.endsWith("/rotate")) return json({ token: "cpu_" + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2) });
+    // Per-user capture mode — stateful for the session.
+    const cm = path.match(/^\/users\/([^/]+)\/capture$/);
+    if (cm && method === "POST") {
+      const u = userById(decodeURIComponent(cm[1]));
+      if (!u) return json({ error: "unknown user" }, 404);
+      // carol is the failure fixture: exercises the revert-on-error path.
+      if (u.id === "utok_carol") return json({ error: "user is disabled — enable it before changing capture mode" }, 409);
+      u.full_capture = !!JSON.parse(init.body || "{}").full;
+      return json({ ok: true, full_capture: u.full_capture });
+    }
     return json({ ok: true });
   }
 
@@ -249,28 +376,46 @@ window.fetch = async (input, init = {}) => {
     if (!w.valid) return json({ error: "invalid range: from must be before to and span ≤ 90 days" }, 400);
   }
 
-  // Dynamic route: per-user recent prompts.
+  // Dynamic route: per-user prompts, paginated over ALL stored rows.
   const pm = path.match(/^\/users\/([^/]+)\/prompts$/);
   if (pm) {
-    const limit = Math.min(parseInt(u.searchParams.get("limit"), 10) || 50, 200);
-    // carol is disabled with no traffic → exercise the empty state.
-    if (pm[1] === "utok_carol") return json([]);
-    const models = ["claude-opus-4-8", "claude-sonnet-4-5", "claude-haiku-4-5"];
-    const samples = [
-      "Refactor the pool selection to prefer the least-saturated credential.",
-      "Why does my SSE stream cut off after ~30s behind the proxy?",
-      "Summarize the diff in internal/webui/static and flag any contract drift.",
-      "Write a table-driven test for winParams covering custom windows.",
-      "Explain the 4-priority conversation key derivation with an example.\nInclude the fallback hashing case.",
-      "<script>alert('xss')</script> — make sure this renders as literal text.",
-    ];
-    const rows = Array.from({ length: Math.min(limit, 18) }, (_, i) => ({
-      ts: now - i * 640 - Math.round(rand(i + 1) * 300),
-      conv_id: "conv_" + (2000 + i),
-      model: models[i % models.length],
-      prompt: samples[i % samples.length],
-    }));
-    return json(rows);
+    const usr = userById(decodeURIComponent(pm[1]));
+    if (!usr) return json({ error: "unknown user" }, 404);
+    // carol has no traffic → exercises the empty state.
+    return json(envelope(PROMPT_TOTALS[usr.id] || 0, u.searchParams, 50, (i) => promptRow(usr, i)));
+  }
+
+  // Dynamic route: per-user conversations, newest last_ts first.
+  const cvm = path.match(/^\/users\/([^/]+)\/conversations$/);
+  if (cvm) {
+    const usr = userById(decodeURIComponent(cvm[1]));
+    if (!usr) return json({ error: "unknown user" }, 404);
+    return json(envelope(CONV_TOTALS[usr.id] || 0, u.searchParams, 25, (i) => convMeta(usr, i)));
+  }
+
+  // Dynamic route: conversation messages, ascending seq. Falls back to
+  // prompt_log rows rendered as user turns when nothing full was captured.
+  const mm = path.match(/^\/conversations\/([^/]+)\/messages$/);
+  if (mm) {
+    const ref = parseConvId(decodeURIComponent(mm[1]));
+    if (!ref) return json({ error: "unknown conversation" }, 404);
+    const meta = convMeta(ref.user, ref.index);
+    const extra = {
+      source: meta.source,
+      conv_id: meta.conv_id,
+      user: { id: ref.user.id, name: ref.user.name },
+    };
+    if (meta.source !== "full") {
+      // Prompts-only fallback: user turns synthesized from prompt_log.
+      return json(envelope(meta.prompts, u.searchParams, 20, (i) => ({
+        seq: i,
+        role: "user",
+        content: PROMPT_SAMPLES[(ref.index + i) % PROMPT_SAMPLES.length],
+        model: meta.model,
+        ts: meta.first_ts + i * 190,
+      }), extra));
+    }
+    return json(envelope(meta.messages, u.searchParams, 20, (i) => messageRow(ref.user, ref.index, i), extra));
   }
 
   const handler = DB[path];

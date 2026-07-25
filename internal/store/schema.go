@@ -42,7 +42,10 @@ CREATE TABLE IF NOT EXISTS user_tokens (
   token        TEXT    NOT NULL UNIQUE,
   status       TEXT    NOT NULL DEFAULT 'active',
   created_at   INTEGER NOT NULL,
-  last_used_at INTEGER
+  last_used_at INTEGER,
+  -- 1 => the proxy stores the whole conversation (both roles) for this user
+  -- in conversation_message, not just the last user prompt.
+  full_capture INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_user_tokens_token  ON user_tokens(token);
 CREATE INDEX IF NOT EXISTS idx_user_tokens_status ON user_tokens(status);
@@ -81,6 +84,24 @@ CREATE TABLE IF NOT EXISTS prompt_log (
 );
 CREATE INDEX IF NOT EXISTS idx_prompt_log_user_ts ON prompt_log(user_token_id, ts);
 CREATE INDEX IF NOT EXISTS idx_prompt_log_ts      ON prompt_log(ts);
+
+-- Full conversation capture (opt-in per user via user_tokens.full_capture).
+-- Both roles are stored; tool payloads, images and thinking blocks are not.
+-- Same retention window as prompt_log.
+CREATE TABLE IF NOT EXISTS conversation_message (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  conv_id       TEXT    NOT NULL,
+  user_token_id TEXT    REFERENCES user_tokens(id) ON DELETE SET NULL,
+  seq           INTEGER NOT NULL,
+  role          TEXT    NOT NULL,
+  content       TEXT    NOT NULL DEFAULT '',
+  model         TEXT    NOT NULL DEFAULT '',
+  ts            INTEGER NOT NULL,
+  UNIQUE(conv_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_conv_msg_conv_seq ON conversation_message(conv_id, seq);
+CREATE INDEX IF NOT EXISTS idx_conv_msg_user_ts  ON conversation_message(user_token_id, ts);
+CREATE INDEX IF NOT EXISTS idx_conv_msg_ts       ON conversation_message(ts);
 
 CREATE TABLE IF NOT EXISTS usage_history (
   id                          INTEGER PRIMARY KEY AUTOINCREMENT,

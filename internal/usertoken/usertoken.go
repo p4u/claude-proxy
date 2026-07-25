@@ -28,6 +28,9 @@ type UserToken struct {
 	Status     Status
 	CreatedAt  time.Time
 	LastUsedAt *time.Time
+	// FullCapture opts this user into whole-conversation capture (both roles,
+	// stored in conversation_message). Default false = last-user-prompt only.
+	FullCapture bool
 }
 
 // contextKey is unexported to prevent collisions across packages.
@@ -40,6 +43,7 @@ type Identity struct {
 	IsAdmin     bool   // matched the master PROXY_AUTH_TOKEN
 	UserTokenID string // non-empty when a user token was matched
 	UserName    string
+	FullCapture bool // user opted into whole-conversation capture
 }
 
 // FromContext returns the identity attached by the auth middleware, or nil.
@@ -88,7 +92,7 @@ func Create(ctx context.Context, db *store.DB, name string) (*UserToken, error) 
 // List returns all user tokens ordered by creation time.
 func List(ctx context.Context, db *store.DB) ([]*UserToken, error) {
 	rows, err := db.QueryContext(ctx, `
-		SELECT id, name, token, status, created_at, last_used_at
+		SELECT id, name, token, status, created_at, last_used_at, full_capture
 		FROM user_tokens ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -108,7 +112,7 @@ func List(ctx context.Context, db *store.DB) ([]*UserToken, error) {
 // Get returns a single user token by ID.
 func Get(ctx context.Context, db *store.DB, id string) (*UserToken, error) {
 	rows, err := db.QueryContext(ctx, `
-		SELECT id, name, token, status, created_at, last_used_at
+		SELECT id, name, token, status, created_at, last_used_at, full_capture
 		FROM user_tokens WHERE id=?`, id)
 	if err != nil {
 		return nil, err
@@ -123,7 +127,7 @@ func Get(ctx context.Context, db *store.DB, id string) (*UserToken, error) {
 // LookupByToken finds a user token by its bearer value (used in hot path).
 func LookupByToken(ctx context.Context, db *store.DB, token string) (*UserToken, error) {
 	rows, err := db.QueryContext(ctx, `
-		SELECT id, name, token, status, created_at, last_used_at
+		SELECT id, name, token, status, created_at, last_used_at, full_capture
 		FROM user_tokens WHERE token=?`, token)
 	if err != nil {
 		return nil, err
@@ -146,6 +150,26 @@ func SetStatus(ctx context.Context, db *store.DB, id string, s Status) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// SetFullCapture toggles whole-conversation capture for a user.
+func SetFullCapture(ctx context.Context, db *store.DB, id string, full bool) error {
+	res, err := db.ExecContext(ctx,
+		`UPDATE user_tokens SET full_capture=? WHERE id=?`, boolToInt(full), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // Delete removes a user token and its associated request_log rows.
@@ -192,7 +216,7 @@ func scan(rs interface{ Scan(...any) error }) (*UserToken, error) {
 	var created int64
 	var lu sql.NullInt64
 	var status string
-	if err := rs.Scan(&ut.ID, &ut.Name, &ut.Token, &status, &created, &lu); err != nil {
+	if err := rs.Scan(&ut.ID, &ut.Name, &ut.Token, &status, &created, &lu, &ut.FullCapture); err != nil {
 		return nil, err
 	}
 	ut.Status = Status(status)

@@ -263,6 +263,90 @@ button.legend__item.is-solo .legend__lbl { color: var(--ink); font-weight: 600; 
 .prompt__model { font-family: var(--mono); font-size: 10px; color: var(--ink-2); border: 1px solid var(--border); border-radius: 20px; padding: 1px 8px; text-transform: none; }
 .prompt__text { font-family: var(--mono); font-size: 12px; line-height: 1.5; color: var(--ink); white-space: pre-wrap; word-break: break-word; margin: 0; }
 
+.prompt__conv { font-family: var(--mono); font-size: 10px; color: var(--ink-muted); margin-left: auto; letter-spacing: 0.04em; }
+
+/* ---------- Full-capture switch (Users table) ---------- */
+.switch { position: relative; display: inline-flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
+/* The input covers the whole control: invisible, but it is what gets clicked,
+   focused and read out — the track/thumb below are pure decoration. */
+.switch__input { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; opacity: 0; margin: 0; cursor: pointer; }
+.switch__track {
+  position: relative; flex: none; width: 34px; height: 19px; border-radius: 999px;
+  background: var(--surface-3); border: 1px solid var(--border-strong);
+  transition: background 0.16s, border-color 0.16s;
+}
+.switch__thumb {
+  position: absolute; top: 2px; left: 2px; width: 13px; height: 13px; border-radius: 50%;
+  background: var(--ink-muted); transition: transform 0.16s, background 0.16s;
+}
+.switch__state { font-family: var(--mono); font-size: 11px; color: var(--ink-muted); min-width: 2.2em; }
+.switch.is-on .switch__track { background: color-mix(in srgb, var(--signal) 34%, transparent); border-color: color-mix(in srgb, var(--signal) 60%, transparent); }
+.switch.is-on .switch__thumb { transform: translateX(15px); background: var(--signal); }
+.switch.is-on .switch__state { color: var(--signal); }
+.switch:hover .switch__track { border-color: var(--border-strong); }
+.switch__input:focus-visible + .switch__track { outline: 2px solid var(--accent); outline-offset: 2px; }
+.switch.is-busy { opacity: 0.6; cursor: progress; }
+
+.th-info {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 13px; height: 13px; margin-left: 5px; border-radius: 50%;
+  border: 1px solid var(--border-strong); color: var(--ink-muted);
+  font-size: 9px; line-height: 1; vertical-align: 1px; cursor: help;
+}
+.table-note {
+  font-size: 11.5px; color: var(--ink-2); line-height: 1.5;
+  padding: 11px 14px; border-top: 1px solid var(--border); background: var(--surface-2);
+}
+.table-note strong { color: var(--ink); font-weight: 600; }
+
+/* ---------- Capture browser modal (prompts / conversations) ---------- */
+/* Wins over .modal--wide regardless of source order (both classes are set). */
+.modal.modal--xwide { max-width: 780px; }
+.cap { display: flex; flex-direction: column; gap: 12px; }
+.cap__tabs { display: flex; }
+.cap__tabs .seg { width: 100%; }
+.cap__tabs .seg__btn { flex: 1; }
+.cap__panel { display: flex; flex-direction: column; gap: 10px; min-height: 180px; }
+.cap__bar { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.cap__bar-id { font-family: var(--mono); font-size: 12px; color: var(--ink); letter-spacing: 0.04em; }
+.cap__bar-spacer { flex: 1 1 auto; }
+.cap__note {
+  font-size: 12px; color: var(--ink-2); background: var(--surface-2);
+  border: 1px solid var(--border); border-left: 3px solid var(--signal);
+  border-radius: var(--r-sm); padding: 8px 11px;
+}
+
+.pager { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-top: 4px; border-top: 1px solid var(--border); }
+.pager__range { font-family: var(--mono); font-size: 11px; color: var(--ink-muted); text-align: center; flex: 1 1 auto; }
+
+/* Conversation list */
+.convs { display: flex; flex-direction: column; gap: 6px; max-height: 56vh; overflow-y: auto; }
+.conv {
+  display: flex; flex-direction: column; gap: 5px; width: 100%; text-align: left;
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--r-sm);
+  padding: 9px 11px; cursor: pointer; color: inherit; font-family: inherit; font-size: 13px;
+  transition: background 0.14s, border-color 0.14s;
+}
+.conv:hover { background: var(--surface-2); border-color: var(--border-strong); }
+.conv__main { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.conv__id { font-family: var(--mono); font-size: 12.5px; font-weight: 600; letter-spacing: 0.04em; }
+.conv__meta { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; justify-content: space-between; }
+.conv__counts { font-size: 11.5px; color: var(--ink-2); }
+.conv__time { font-family: var(--mono); font-size: 10.5px; color: var(--ink-muted); }
+
+/* Message viewer */
+.msgs { display: flex; flex-direction: column; gap: 9px; max-height: 56vh; overflow-y: auto; }
+.msg { border: 1px solid var(--border); border-radius: var(--r-sm); padding: 9px 11px; background: var(--surface-1); border-left-width: 3px; }
+.msg--user { border-left-color: var(--accent); }
+.msg--assistant { border-left-color: var(--ink-muted); background: var(--surface-2); }
+.msg__head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin-bottom: 6px; }
+.msg__role { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 600; }
+.msg--user .msg__role { color: var(--accent); }
+.msg--assistant .msg__role { color: var(--ink-2); }
+.msg__seq { font-family: var(--mono); font-size: 10.5px; color: var(--ink-muted); }
+.msg__time { font-family: var(--mono); font-size: 10.5px; color: var(--ink-muted); margin-left: auto; }
+.msg__text { font-family: var(--mono); font-size: 12px; line-height: 1.55; color: var(--ink); white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere; margin: 0; }
+
 /* ---------- Tables ---------- */
 .table-card { padding: 0; overflow: hidden; }
 .table-scroll { overflow-x: auto; }
@@ -277,7 +361,9 @@ button.legend__item.is-solo .legend__lbl { color: var(--ink); font-weight: 600; 
 .cell-id { display: block; font-family: var(--mono); font-size: 10.5px; color: var(--ink-muted); }
 .cell-warn { color: var(--critical); }
 td.actions { text-align: right; white-space: nowrap; }
-.row-actions { display: inline-flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+/* Keep actions on one line and let .table-scroll handle any overflow — wrapping
+   them turns every row into a multi-line block once a column is added. */
+.row-actions { display: inline-flex; gap: 4px; flex-wrap: nowrap; justify-content: flex-end; }
 
 /* ---------- Badges ---------- */
 .badge { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 11px; padding: 3px 9px 3px 8px; border-radius: 20px; border: 1px solid var(--border); text-transform: capitalize; }
@@ -403,8 +489,26 @@ td.actions { text-align: right; white-space: nowrap; }
   .outlet { padding: 16px 12px 44px; }
   .grid--cards { grid-template-columns: 1fr; }
 }
+@media (max-width: 560px) {
+  .modal-overlay { padding: 10px; align-items: flex-start; padding-top: 24px; }
+  .modal__head, .modal__foot { padding-left: 14px; padding-right: 14px; }
+  .modal__body { padding-left: 14px; padding-right: 14px; }
+  .prompt__head { flex-wrap: wrap; gap: 6px; }
+  .prompt__conv { margin-left: 0; }
+  .msg__time { margin-left: 0; }
+  /* Prev + range + Next still fit on one line down to ~360px; keep them there
+     so the controls never get pushed below the scroll area. */
+  .pager { gap: 6px; }
+  .pager .btn { padding: 7px 9px; }
+  .pager__range { font-size: 10.5px; }
+  .convs, .msgs, .prompts { max-height: 50vh; }
+  .switch__state { min-width: 0; }
+}
 @media (max-width: 380px) {
   .tiles { grid-template-columns: 1fr; }
+  .cap__bar { gap: 6px; }
+  .cap__bar-spacer { display: none; }
+  .conv__meta { flex-direction: column; gap: 2px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

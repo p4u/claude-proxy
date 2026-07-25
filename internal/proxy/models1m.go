@@ -169,7 +169,7 @@ func (h *Handler) serveModels(w http.ResponseWriter, r *http.Request, start time
 	r.Header.Del("Accept-Encoding")
 
 	rec := newBufferedRW()
-	status, rxBytes, _ := h.forward(rec, r, nil, cred, true)
+	status, rxBytes, _, _ := h.forward(rec, r, nil, cred, true, false)
 	latency := time.Since(start)
 	h.log.Info("models discovery",
 		"cred", cred.ID, "label", cred.Label, "status", status,
