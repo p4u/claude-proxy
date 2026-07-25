@@ -17,6 +17,17 @@ type userView struct {
 	CreatedAt   string  `json:"created_at"`
 	LastUsedAt  *string `json:"last_used_at"`
 	FullCapture bool    `json:"full_capture"`
+
+	// Usage limit (v4). 0/0 => unlimited, in which case usage_units and
+	// usage_pct are 0 and blocked_until is null.
+	LimitUnits         int64   `json:"limit_units"`
+	LimitWindowSeconds int64   `json:"limit_window_seconds"`
+	UsageUnits         float64 `json:"usage_units"`
+	UsagePct           float64 `json:"usage_pct"`
+	Blocked            bool    `json:"blocked"`
+	// BlockedUntil is non-null only while blocked: a rolling window has no
+	// reset instant, so no fake reset time is reported when under the cap.
+	BlockedUntil *string `json:"blocked_until"`
 }
 
 // handleUsers routes /users and /users/{id}/{action}. `rest` is the path after
@@ -63,6 +74,9 @@ func (s *Server) userAction(w http.ResponseWriter, r *http.Request, id, action s
 	case action == "capture" && r.Method == http.MethodPost:
 		s.setUserCapture(w, r, id)
 		return
+	case action == "limit" && r.Method == http.MethodPost:
+		s.setUserLimit(w, r, id)
+		return
 	case action == "" && r.Method == http.MethodDelete:
 		err = usertoken.Delete(ctx, s.db, id)
 	default:
@@ -90,18 +104,35 @@ func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	now := time.Now()
 	out := make([]userView, 0, len(list))
 	for _, ut := range list {
 		v := userView{
-			ID:          ut.ID,
-			Name:        ut.Name,
-			Status:      string(ut.Status),
-			CreatedAt:   ut.CreatedAt.Format(time.RFC3339),
-			FullCapture: ut.FullCapture,
+			ID:                 ut.ID,
+			Name:               ut.Name,
+			Status:             string(ut.Status),
+			CreatedAt:          ut.CreatedAt.Format(time.RFC3339),
+			FullCapture:        ut.FullCapture,
+			LimitUnits:         ut.LimitUnits,
+			LimitWindowSeconds: ut.LimitWindowSeconds,
 		}
 		if ut.LastUsedAt != nil {
 			s := ut.LastUsedAt.Format(time.RFC3339)
 			v.LastUsedAt = &s
+		}
+		// Skips the query entirely for unlimited users.
+		st, err := usertoken.LimitStatus(r.Context(), s.db, ut.ID,
+			ut.LimitUnits, ut.LimitWindowSeconds, now)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		v.UsageUnits = st.UsageUnits
+		v.UsagePct = st.UsagePct()
+		v.Blocked = st.Blocked
+		if st.Blocked {
+			bu := st.BlockedUntil.UTC().Format(time.RFC3339)
+			v.BlockedUntil = &bu
 		}
 		out = append(out, v)
 	}
@@ -129,6 +160,38 @@ func (s *Server) setUserCapture(w http.ResponseWriter, r *http.Request, id strin
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true, "full_capture": body.Full})
+}
+
+// setUserLimit configures or clears a user's rolling-window usage cap.
+// Both fields zero clears the limit; one zero and one non-zero is rejected,
+// since a limit is meaningless without both halves.
+func (s *Server) setUserLimit(w http.ResponseWriter, r *http.Request, id string) {
+	var body struct {
+		Units         int64 `json:"units"`
+		WindowSeconds int64 `json:"window_seconds"`
+	}
+	if err := decodeJSON(w, r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if body.Units < 0 || body.WindowSeconds < 0 {
+		writeErr(w, http.StatusBadRequest, "units and window_seconds must not be negative")
+		return
+	}
+	if (body.Units == 0) != (body.WindowSeconds == 0) {
+		writeErr(w, http.StatusBadRequest,
+			"both units and window_seconds are required to set a limit; send both as 0 to clear it")
+		return
+	}
+	if err := usertoken.SetLimit(r.Context(), s.db, id, body.Units, body.WindowSeconds); err != nil {
+		s.userErr(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{
+		"ok":                   true,
+		"limit_units":          body.Units,
+		"limit_window_seconds": body.WindowSeconds,
+	})
 }
 
 // pageParams reads limit/offset from the query string, clamped to sane bounds.

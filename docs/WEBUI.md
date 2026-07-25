@@ -266,3 +266,97 @@ captured for this conversation.
   whitespace-preserving; a **Download .md** button hitting the export endpoint
   via a normal anchor so the browser saves the file).
 - Message content is rendered with `textContent` (never `innerHTML`).
+
+## v4 additions — per-user usage limits (2026-07-24)
+
+Blocks a user once their recent usage exceeds a configured cap. Default is
+**no limit** (existing users unaffected).
+
+### Metric: weighted billable units
+
+Raw token counts understate cost asymmetry, so the limit counts *units*
+approximating Anthropic's price ratios:
+
+    units = output*5.0 + input*1.0 + cache_creation*1.25 + cache_read*0.1
+
+Computed from the `request_log` columns already populated by usagecapture.go.
+Export the weights as named constants from one Go location and reuse them in
+BOTH the enforcement query and the web UI display so they cannot drift.
+
+### Rolling window (not calendar)
+
+Usage = SUM(units) over `request_log` where `user_token_id = ?` AND
+`ts >= now - window`. Rolling, so there is no calendar-boundary burst hole, no
+counter state to drift, and `request_log` is never pruned so lookback is safe.
+The `(user_token_id, ts)` index already exists.
+
+**Unblock time** is exact and must be computed, not estimated: read the window's
+rows ascending by ts, accumulate their units, and find the first row where
+`total - accumulated < limit`. That row's `ts + window` (+1s) is when the user
+drops back under. This value goes in the error message and `Retry-After`.
+
+### Schema
+
+`user_tokens` gains (additive ALTER + CREATE TABLE, `0` = unlimited):
+
+    limit_units          INTEGER NOT NULL DEFAULT 0
+    limit_window_seconds INTEGER NOT NULL DEFAULT 0
+
+A limit is active only when BOTH are > 0. `usertoken.UserToken` and
+`usertoken.Identity` gain `LimitUnits int64` and `LimitWindowSeconds int64`,
+populated by the existing LookupByToken/List/Get (no extra query).
+
+### Enforcement
+
+In `internal/proxy` ServeHTTP, after identity is known and **before**
+`pool.Bind`, for `POST /v1/messages` ONLY (`count_tokens` is free; admin-token
+identity is exempt). When the identity carries no active limit, skip entirely —
+unlimited users must incur zero extra queries.
+
+Over the cap => respond **429** with:
+- header `Retry-After: <seconds until unblock>` (minimum 1)
+- header `X-Router-Reason: user-quota` (distinguishes this from an upstream 429;
+  it must NOT touch credential status or counters)
+- Anthropic-shaped body:
+
+    {"type":"error","error":{"type":"rate_limit_error","message":
+     "proxy: usage limit reached - 5,000,000 units per 24h (used 5,204,118). Resets at 2026-07-25 14:32 UTC (in 3h 12m)."}}
+
+Log the blocked attempt to `request_log` with status 429, empty `credential_id`
+and empty `conv_id`, `bytes_received` 0, and zero token columns — so it appears
+in per-user stats as an error, contributes nothing to usage, and never
+attributes to a credential.
+
+Known limitation to document: token counts are only known after a response
+completes, so a single large response can overshoot the cap; enforcement blocks
+the NEXT request. Do not mutate the client's `max_tokens` to compensate.
+
+### API
+
+- `GET /api/users` — each entry gains `limit_units`, `limit_window_seconds`,
+  `usage_units` (current rolling window, 0 when unlimited), `usage_pct`
+  (0-100+, 0 when unlimited), `blocked` (bool), `blocked_until` (RFC3339 or
+  null). Do NOT emit a fake reset time when the user is under the cap — rolling
+  windows have no reset instant; `blocked_until` is non-null only while blocked.
+- `POST /api/users/{id}/limit` `{"units": int, "window_seconds": int}` ->
+  `{"ok":true,"limit_units":int,"limit_window_seconds":int}`. Both 0 clears the
+  limit. Reject negatives with 400; reject one-zero-one-nonzero with 400 and a
+  message explaining both are required.
+
+### CLI
+
+`claude-proxy users limit <id> --units 5M --window 24h` (accept K/M/G suffixes
+and the existing period vocabulary) and `--none` to clear. Show the limit and
+current usage in `users list`.
+
+### Frontend (Users page)
+
+- New **Usage limit** column: a meter reusing the Subscriptions utilization-meter
+  styling — `3.7M / 5M units · 74%` — warning tint >=80%, critical >=100%, plus
+  `blocked until HH:MM` while blocked. Unlimited users show a muted "no limit".
+- Row action opens an **Edit limit** modal: units field accepting `5M`/`500K`
+  shorthand, window preset (1h/6h/24h/7d, matching the existing period
+  vocabulary), a "No limit" clear action, and a line stating the weighting
+  (`output x5, input x1, cache write x1.25, cache read x0.1`) so "units" is
+  never mysterious.
+- Mock coverage for: unlimited user, healthy user, >=80% user, blocked user.

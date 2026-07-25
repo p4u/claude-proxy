@@ -40,6 +40,7 @@ Usage:
   claude-proxy users enable <id>      [--db PATH]
   claude-proxy users rm <id>          [--db PATH]
   claude-proxy users refresh <id>     [--db PATH]
+  claude-proxy users limit <id>       --units 5M --window 24h | --none [--db PATH]
   claude-proxy tui                 [--db PATH]   # interactive management UI
   claude-proxy creds import        --from FILE [--label NAME] [--weight N]
   claude-proxy creds update <id>   --from FILE   # replace tokens from a fresh login
@@ -616,7 +617,7 @@ func printUsageBucket(label string, b *usage.Bucket) {
 
 func runUsers(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "users: missing subcommand (create|list|stats|token|disable|enable|rm|refresh)")
+		fmt.Fprintln(os.Stderr, "users: missing subcommand (create|list|stats|token|disable|enable|rm|refresh|limit)")
 		os.Exit(2)
 	}
 	ctx := context.Background()
@@ -637,6 +638,8 @@ func runUsers(args []string) {
 		usersRm(ctx, args[1:])
 	case "refresh":
 		usersRefresh(ctx, args[1:])
+	case "limit":
+		usersLimit(ctx, args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "users: unknown subcommand %q\n", args[0])
 		os.Exit(2)
@@ -677,16 +680,91 @@ func usersList(ctx context.Context, args []string) {
 		fmt.Println("(no user tokens)")
 		return
 	}
-	fmt.Printf("%-22s  %-20s  %-8s  %-25s  %s\n", "ID", "NAME", "STATUS", "CREATED", "LAST_USED")
+	now := time.Now()
+	fmt.Printf("%-22s  %-20s  %-8s  %-25s  %-25s  %-16s  %s\n",
+		"ID", "NAME", "STATUS", "CREATED", "LAST_USED", "LIMIT", "USAGE")
 	for _, ut := range list {
 		lastUsed := "-"
 		if ut.LastUsedAt != nil {
 			lastUsed = ut.LastUsedAt.Format(time.RFC3339)
 		}
-		fmt.Printf("%-22s  %-20s  %-8s  %-25s  %s\n",
+		limitCol, usageCol := "none", "-"
+		if usertoken.HasLimit(ut.LimitUnits, ut.LimitWindowSeconds) {
+			limitCol = fmt.Sprintf("%s/%s",
+				usertoken.FormatUnits(float64(ut.LimitUnits)),
+				usertoken.FormatWindow(time.Duration(ut.LimitWindowSeconds)*time.Second))
+			st, err := usertoken.LimitStatus(ctx, db, ut.ID, ut.LimitUnits, ut.LimitWindowSeconds, now)
+			if err != nil {
+				usageCol = "err"
+			} else {
+				usageCol = fmt.Sprintf("%s (%.0f%%)", usertoken.FormatUnits(st.UsageUnits), st.UsagePct())
+				if st.Blocked {
+					usageCol += " BLOCKED until " + st.BlockedUntil.UTC().Format("15:04 UTC")
+				}
+			}
+		}
+		fmt.Printf("%-22s  %-20s  %-8s  %-25s  %-25s  %-16s  %s\n",
 			ut.ID, ut.Name, string(ut.Status),
-			ut.CreatedAt.Format(time.RFC3339), lastUsed)
+			ut.CreatedAt.Format(time.RFC3339), lastUsed, limitCol, usageCol)
 	}
+}
+
+// usersLimit sets or clears a user's rolling-window usage limit.
+func usersLimit(ctx context.Context, args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "users limit <id> --units 5M --window 24h | --none")
+		os.Exit(2)
+	}
+	id := args[0]
+	fs := flag.NewFlagSet("users limit", flag.ExitOnError)
+	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
+	units := fs.String("units", "", "limit in weighted units (accepts K/M/G, e.g. 5M)")
+	window := fs.String("window", "", "rolling window: 1h, 6h, 24h, 7d, 30d")
+	none := fs.Bool("none", false, "clear the limit (unlimited)")
+	_ = fs.Parse(args[1:])
+
+	var limitUnits, windowSecs int64
+	switch {
+	case *none:
+		if *units != "" || *window != "" {
+			fmt.Fprintln(os.Stderr, "--none cannot be combined with --units/--window")
+			os.Exit(2)
+		}
+	case *units == "" || *window == "":
+		fmt.Fprintln(os.Stderr, "both --units and --window are required (or --none to clear)")
+		os.Exit(2)
+	default:
+		u, err := usertoken.ParseUnits(*units)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		dur, err := usage.ParsePeriod(*window)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		if u == 0 {
+			fmt.Fprintln(os.Stderr, "--units must be greater than 0 (use --none to clear)")
+			os.Exit(2)
+		}
+		limitUnits, windowSecs = u, int64(dur/time.Second)
+	}
+
+	db := openDB(*dbPath)
+	defer db.Close()
+	if err := usertoken.SetLimit(ctx, db, id, limitUnits, windowSecs); err != nil {
+		fmt.Fprintf(os.Stderr, "limit: %v\n", err)
+		os.Exit(1)
+	}
+	if limitUnits == 0 {
+		fmt.Printf("%s: limit cleared (unlimited)\n", id)
+		return
+	}
+	fmt.Printf("%s: limit set to %s units per %s  (%s)\n",
+		id, usertoken.FormatUnits(float64(limitUnits)),
+		usertoken.FormatWindow(time.Duration(windowSecs)*time.Second),
+		usertoken.WeightsDescription)
 }
 
 func usersStats(ctx context.Context, args []string) {

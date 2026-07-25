@@ -45,7 +45,11 @@ CREATE TABLE IF NOT EXISTS user_tokens (
   last_used_at INTEGER,
   -- 1 => the proxy stores the whole conversation (both roles) for this user
   -- in conversation_message, not just the last user prompt.
-  full_capture INTEGER NOT NULL DEFAULT 0
+  full_capture INTEGER NOT NULL DEFAULT 0,
+  -- Per-user usage cap in weighted billable units over a rolling window.
+  -- A limit is active only when BOTH are > 0; 0 => unlimited (the default).
+  limit_units          INTEGER NOT NULL DEFAULT 0,
+  limit_window_seconds INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_user_tokens_token  ON user_tokens(token);
 CREATE INDEX IF NOT EXISTS idx_user_tokens_status ON user_tokens(status);

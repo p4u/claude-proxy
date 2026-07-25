@@ -61,9 +61,11 @@ func AuthMiddleware(adminToken string, db *store.DB, uiEnabled bool, next http.H
 				}
 				go usertoken.MarkUsed(context.Background(), db, ut.ID)
 				ctx := usertoken.WithIdentity(r.Context(), &usertoken.Identity{
-					UserTokenID: ut.ID,
-					UserName:    ut.Name,
-					FullCapture: ut.FullCapture,
+					UserTokenID:        ut.ID,
+					UserName:           ut.Name,
+					FullCapture:        ut.FullCapture,
+					LimitUnits:         ut.LimitUnits,
+					LimitWindowSeconds: ut.LimitWindowSeconds,
 				})
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return

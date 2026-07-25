@@ -10,14 +10,43 @@ const CREDS = [
   { id: "cred_dz17", label: "enterprise-01", type: "enterprise", weight: 5, status: "active" },
   { id: "cred_er05", label: "pro-old", type: "pro", weight: 1, status: "disabled" },
 ];
-// full_capture is mutated in place by POST /users/{id}/capture so the toggle
-// stays stateful for the whole mock session.
+// full_capture and the usage limit are mutated in place by
+// POST /users/{id}/capture and POST /users/{id}/limit, so both toggles stay
+// stateful for the whole mock session.
+// `usage_units` is fixed traffic; the limit is what the operator edits, so
+// usage_pct/blocked are always derived — editing a limit visibly moves the meter.
+// The four users cover every limit state: healthy, near-limit, unlimited, blocked.
 const USERS = [
-  { id: "utok_alice", name: "alice", status: "active", full_capture: true },
-  { id: "utok_bob", name: "bob", status: "active", full_capture: false },
-  { id: "utok_carol", name: "carol", status: "disabled", full_capture: false },
-  { id: "utok_ci", name: "ci-runner", status: "active", full_capture: false },
+  { id: "utok_alice", name: "alice", status: "active", full_capture: true,
+    limit_units: 5_000_000, limit_window_seconds: 86400, usage_units: 1_512_400 },     // ~30%
+  { id: "utok_bob", name: "bob", status: "active", full_capture: false,
+    limit_units: 2_000_000, limit_window_seconds: 21600, usage_units: 1_724_900 },     // ~86%
+  { id: "utok_carol", name: "carol", status: "disabled", full_capture: false,
+    limit_units: 0, limit_window_seconds: 0, usage_units: 0 },                          // unlimited
+  { id: "utok_ci", name: "ci-runner", status: "active", full_capture: false,
+    limit_units: 500_000, limit_window_seconds: 3600, usage_units: 612_400 },          // ~122%, blocked
 ];
+
+// Derived limit fields, mirroring the backend contract: usage/pct/blocked are 0
+// or null when unlimited, and blocked_until is non-null ONLY while blocked
+// (rolling windows have no reset instant to report otherwise).
+function limitFields(u) {
+  const active = u.limit_units > 0 && u.limit_window_seconds > 0;
+  if (!active) {
+    return { limit_units: 0, limit_window_seconds: 0, usage_units: 0, usage_pct: 0, blocked: false, blocked_until: null };
+  }
+  const pct = (u.usage_units / u.limit_units) * 100;
+  const blocked = pct >= 100;
+  return {
+    limit_units: u.limit_units,
+    limit_window_seconds: u.limit_window_seconds,
+    usage_units: u.usage_units,
+    usage_pct: Math.round(pct * 10) / 10,
+    blocked,
+    // ~22 minutes out: near-future, so the HH:MM render is easy to eyeball.
+    blocked_until: blocked ? new Date((now + 1320) * 1000).toISOString() : null,
+  };
+}
 
 const now = Math.floor(Date.now() / 1000);
 const rand = (seed) => {
@@ -210,6 +239,7 @@ const DB = {
   "/users": () =>
     USERS.map((u, i) => ({
       id: u.id, name: u.name, status: u.status, full_capture: u.full_capture,
+      ...limitFields(u),
       created_at: now - 86400 * (20 - i * 3),
       last_used_at: u.status === "disabled" ? now - 86400 * 4 : now - 120 * (i + 1),
     })),
@@ -366,6 +396,29 @@ window.fetch = async (input, init = {}) => {
       if (u.id === "utok_carol") return json({ error: "user is disabled — enable it before changing capture mode" }, 409);
       u.full_capture = !!JSON.parse(init.body || "{}").full;
       return json({ ok: true, full_capture: u.full_capture });
+    }
+
+    // Per-user usage limit — stateful, and validated exactly like the backend:
+    // negatives are rejected, and units/window must be both set or both zero.
+    // (Entering units 0 with a window selected is the reachable path that
+    // exercises the inline 400 in the UI.)
+    const lm = path.match(/^\/users\/([^/]+)\/limit$/);
+    if (lm && method === "POST") {
+      const u = userById(decodeURIComponent(lm[1]));
+      if (!u) return json({ error: "unknown user" }, 404);
+      const b = JSON.parse(init.body || "{}");
+      const units = Math.trunc(Number(b.units) || 0);
+      const win = Math.trunc(Number(b.window_seconds) || 0);
+      if (units < 0 || win < 0) return json({ error: "units and window_seconds must not be negative" }, 400);
+      if ((units === 0) !== (win === 0)) {
+        return json(
+          { error: "both units and window_seconds are required to set a limit; send both as 0 to clear it" },
+          400
+        );
+      }
+      u.limit_units = units;
+      u.limit_window_seconds = win;
+      return json({ ok: true, limit_units: units, limit_window_seconds: win });
     }
     return json({ ok: true });
   }

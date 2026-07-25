@@ -2,9 +2,9 @@ import { api, conversationExportUrl } from "../api.js";
 import {
   el, clear, spinner, errorState, emptyState, statusBadge, toast, modal, confirmDialog, button, copyText,
 } from "../ui.js";
-import { periodControl, sectionHead, segmented } from "../components.js";
+import { periodControl, sectionHead, segmented, meter } from "../components.js";
 import { getWindow, setWindowPeriod, setWindowCustom } from "../store.js";
-import { compactNum, fullNum, ms, relTime, localTime } from "../format.js";
+import { compactNum, fullNum, ms, relTime, localTime, pct } from "../format.js";
 
 export async function render(root) {
   clear(root);
@@ -38,12 +38,123 @@ const CAPTURE_HELP =
   "Full capture stores both sides of every conversation, including pasted file contents. " +
   "Off (the default) keeps only the last user prompt of each request.";
 
+// The weighting is defined once on the backend; keep this string in sync with it.
+const UNITS_FORMULA = "units = output×5 + input×1 + cache write×1.25 + cache read×0.1";
+const LIMIT_HELP =
+  "Blocks a user once their weighted usage over a rolling window exceeds the cap. " +
+  UNITS_FORMULA + ". No limit by default.";
+
+// Window presets, matching the period vocabulary used elsewhere in the app.
+const LIMIT_WINDOWS = [
+  { value: 3600, label: "1H", short: "1h" },
+  { value: 21600, label: "6H", short: "6h" },
+  { value: 86400, label: "24H", short: "24h" },
+  { value: 604800, label: "7D", short: "7d" },
+];
+const DEFAULT_WINDOW = 86400;
+
+function windowShort(sec) {
+  const w = LIMIT_WINDOWS.find((x) => x.value === Number(sec));
+  if (w) return w.short;
+  const s = Number(sec) || 0;
+  if (s % 86400 === 0) return s / 86400 + "d";
+  if (s % 3600 === 0) return s / 3600 + "h";
+  return Math.max(0, Math.round(s / 60)) + "m";
+}
+
+// A limit is active only when BOTH units and window are > 0.
+function hasLimit(u) {
+  return Number(u.limit_units) > 0 && Number(u.limit_window_seconds) > 0;
+}
+
+// "5M" / "500k" / "1.5M" / "5,000,000" / "5000000" → integer units.
+// Returns {value} or {error}. Empty input is an error, not a silent zero.
+export function parseUnits(raw) {
+  const s = String(raw == null ? "" : raw).trim().replace(/[,_\s]/g, "");
+  if (!s) return { error: "Enter a number of units, e.g. 5M." };
+  const m = /^(-?\d+(?:\.\d+)?)([kmgKMG]?)$/.exec(s);
+  if (!m) return { error: "Use a plain number or a K/M/G shorthand, e.g. 5M or 500K." };
+  const mult = { k: 1e3, m: 1e6, g: 1e9 }[m[2].toLowerCase()] || 1;
+  const n = Number(m[1]) * mult;
+  if (!isFinite(n)) return { error: "That number is too large." };
+  if (n < 0) return { error: "Units can't be negative." };
+  return { value: Math.round(n) };
+}
+
+// Prefill text for the units input: shorthand when it round-trips exactly.
+function unitsToInput(n) {
+  const v = Number(n) || 0;
+  if (v <= 0) return "";
+  for (const [div, sfx] of [[1e9, "G"], [1e6, "M"], [1e3, "K"]]) {
+    if (v >= div && v % div === 0) return v / div + sfx;
+  }
+  return String(v);
+}
+
+// HH:MM (local) for a blocked_until instant.
+function clockTime(v) {
+  const ts = tsOf(v);
+  if (!ts) return "";
+  return new Date(ts * 1000).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+}
+
+// Usage-limit cell. Reuses the Subscriptions utilization meter verbatim so the
+// two read as one idiom. Rolling windows have no reset instant, so nothing is
+// rendered below the bar unless the user is actually blocked.
+function limitCell(u) {
+  if (!hasLimit(u)) {
+    return el("span", {
+      class: "limit-none",
+      text: "no limit",
+      title: "This user is unlimited — the default. Use Limit to cap their usage.",
+    });
+  }
+  const cap = Number(u.limit_units) || 0;
+  const used = Number(u.usage_units) || 0;
+  const rawPct = u.usage_pct != null ? Number(u.usage_pct) : cap ? (used / cap) * 100 : 0;
+  const blocked = !!u.blocked;
+  const tone = blocked || rawPct >= 100 ? "critical" : rawPct >= 80 ? "warning" : "good";
+  const until = blocked ? clockTime(u.blocked_until) : "";
+  const label = `${compactNum(used)} / ${compactNum(cap)} units`;
+  const bar = meter({
+    label,
+    value: rawPct,
+    tone,
+    segments: 14,
+    resets: blocked ? (until ? `blocked until ${until}` : "blocked") : null,
+  });
+  // The shared meter clamps its bar (and therefore its own readout) at 100%.
+  // Over the cap, the true overshoot is the interesting number, so restate it —
+  // the bar stays pinned full, which is the correct visual.
+  if (rawPct > 100) {
+    const pctEl = bar.querySelector(".meter__pct");
+    if (pctEl) pctEl.textContent = pct(rawPct);
+    const barEl = bar.querySelector(".meter__bar");
+    if (barEl) barEl.setAttribute("aria-label", `${label}, ${pct(rawPct)} of the limit`);
+  }
+  const wrap = el("div", { class: "limit-cell" + (blocked ? " is-blocked" : "") }, [
+    bar,
+    el("span", {
+      class: "limit-cell__win",
+      text: `per ${windowShort(u.limit_window_seconds)}`,
+    }),
+  ]);
+  wrap.title =
+    `${fullNum(used)} of ${fullNum(cap)} units used in the last ${windowShort(u.limit_window_seconds)}` +
+    (blocked && until ? ` — blocked until ${until}` : "");
+  return wrap;
+}
+
 function buildTable(users, statById, root) {
   const table = el("table", { class: "table" });
   table.append(el("thead", {}, el("tr", {}, [
     th("Name"), th("Status"),
     el("th", { title: CAPTURE_HELP }, [
       el("span", { text: "Full capture" }),
+      el("span", { class: "th-info", "aria-hidden": "true", text: "?" }),
+    ]),
+    el("th", { class: "limit-col", title: LIMIT_HELP }, [
+      el("span", { text: "Usage limit" }),
       el("span", { class: "th-info", "aria-hidden": "true", text: "?" }),
     ]),
     th("Requests", "num"), th("Errors", "num"),
@@ -71,6 +182,7 @@ function userRow(u, s, root) {
   const errTone = (s.errors || 0) > 0 ? "cell-warn" : "";
   const actions = el("div", { class: "row-actions" }, [
     button("Prompts", { onClick: () => promptsModal(u) }),
+    button("Limit", { onClick: () => limitModal(u, root), title: LIMIT_HELP }),
     button("Rotate", {
       onClick: async () => {
         const ok = await confirmDialog({
@@ -107,6 +219,7 @@ function userRow(u, s, root) {
     el("td", {}, [el("span", { class: "cell-strong", text: u.name }), el("span", { class: "cell-id", text: u.id })]),
     el("td", {}, statusBadge(u.status)),
     el("td", {}, captureToggle(u)),
+    el("td", { class: "limit-col" }, limitCell(u)),
     el("td", { class: "num", text: compactNum(s.requests || 0) }),
     el("td", { class: "num " + errTone, text: fullNum(s.errors || 0) }),
     el("td", { class: "num", text: compactNum(s.tokens_in || 0) }),
@@ -159,6 +272,135 @@ function createModal(root) {
       }),
     ],
   });
+}
+
+// Edit the rolling usage limit for one user.
+// Units accept K/M/G shorthand and echo the parsed value back so the operator
+// never has to guess what was understood. Only the two client-side rules are
+// enforced here (unparseable input, negatives) — everything else, including the
+// backend's both-or-neither rule, is surfaced inline from the server's 400.
+function limitModal(u, root) {
+  const active = hasLimit(u);
+  const err = el("p", { class: "form-err", role: "alert" });
+  const echo = el("p", { class: "limit-echo" });
+
+  const unitsInput = el("input", {
+    class: "input",
+    type: "text",
+    inputmode: "decimal",
+    autocomplete: "off",
+    spellcheck: "false",
+    id: "limit-units",
+    placeholder: "e.g. 5M",
+    value: active ? unitsToInput(u.limit_units) : "",
+  });
+
+  let windowSec = active ? Number(u.limit_window_seconds) || DEFAULT_WINDOW : DEFAULT_WINDOW;
+  const windowSeg = segmented(
+    LIMIT_WINDOWS.map((w) => ({ value: String(w.value), label: w.label })),
+    String(windowSec),
+    (v) => {
+      windowSec = Number(v);
+      clearErr();
+      paintEcho();
+    },
+    "Rolling window"
+  );
+
+  const clearErr = () => {
+    err.textContent = "";
+  };
+  const showErr = (msg) => {
+    err.textContent = msg;
+  };
+  const paintEcho = () => {
+    const raw = unitsInput.value.trim();
+    if (!raw) {
+      echo.textContent = "";
+      return;
+    }
+    const p = parseUnits(raw);
+    echo.textContent = p.error
+      ? ""
+      : `= ${fullNum(p.value)} units per ${windowShort(windowSec)}`;
+  };
+  unitsInput.addEventListener("input", () => {
+    clearErr();
+    paintEcho();
+  });
+  paintEcho();
+
+  const save = async () => {
+    const p = parseUnits(unitsInput.value);
+    if (p.error) return showErr(p.error);
+    await submit(p.value, windowSec, `Limit set for ${u.name}`);
+  };
+
+  async function submit(units, windowSeconds, okMsg) {
+    clearErr();
+    saveBtn.disabled = true;
+    clearBtn.disabled = true;
+    try {
+      const r = await api.setUserLimit(u.id, { units, windowSeconds });
+      u.limit_units = r && r.limit_units != null ? r.limit_units : units;
+      u.limit_window_seconds = r && r.limit_window_seconds != null ? r.limit_window_seconds : windowSeconds;
+      m.close();
+      toast(okMsg, "good");
+      render(root);
+    } catch (e) {
+      // Inline, not just a toast: the message explains what to change.
+      showErr(e.message);
+      unitsInput.focus();
+    } finally {
+      saveBtn.disabled = false;
+      clearBtn.disabled = false;
+    }
+  }
+
+  const saveBtn = button("Save limit", { kind: "primary", onClick: save });
+  const clearBtn = button("No limit", {
+    kind: "danger-ghost",
+    disabled: !active,
+    title: active ? "Remove the cap — this user becomes unlimited" : "This user is already unlimited",
+    onClick: () => submit(0, 0, `${u.name} is now unlimited`),
+  });
+
+  unitsInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      save();
+    }
+  });
+
+  const body = el("div", { class: "form limit-form" }, [
+    el("div", { class: "form-row" }, [
+      el("label", { class: "field-label", for: "limit-units", text: "Units" }),
+      unitsInput,
+      echo,
+    ]),
+    el("div", { class: "form-row" }, [
+      el("span", { class: "field-label", text: "Rolling window" }),
+      windowSeg,
+      el("p", {
+        class: "limit-hint",
+        text: "Usage is summed over the trailing window. There is no reset moment — the oldest usage simply ages out.",
+      }),
+    ]),
+    el("p", { class: "limit-formula", text: UNITS_FORMULA }),
+    err,
+  ]);
+
+  const m = modal({
+    title: `Usage limit · ${u.name}`,
+    subtitle: active
+      ? `Currently ${compactNum(u.limit_units)} units per ${windowShort(u.limit_window_seconds)} — ` +
+        `${compactNum(u.usage_units || 0)} used so far` +
+        (u.blocked ? `, blocked until ${clockTime(u.blocked_until) || "the window clears"}.` : ".")
+      : "This user has no limit. Set one to cap their weighted usage.",
+    body,
+    actions: [button("Cancel", { onClick: () => m.close() }), clearBtn, saveBtn],
+  });
+  requestAnimationFrame(() => unitsInput.focus());
 }
 
 // Per-user capture switch. Optimistic: flip immediately, revert on failure.

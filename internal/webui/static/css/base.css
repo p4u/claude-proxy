@@ -287,6 +287,32 @@ button.legend__item.is-solo .legend__lbl { color: var(--ink); font-weight: 600; 
 .switch__input:focus-visible + .switch__track { outline: 2px solid var(--accent); outline-offset: 2px; }
 .switch.is-busy { opacity: 0.6; cursor: progress; }
 
+/* ---------- Usage limit cell (Users table) ---------- */
+/* Reuses .meter wholesale — no second meter idiom. Only the surrounding
+   layout, the unlimited default and the blocked tint live here. */
+.limit-col { min-width: 168px; }
+.limit-cell { display: flex; flex-direction: column; gap: 3px; max-width: 220px; }
+.limit-cell .meter__label { font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); white-space: nowrap; }
+.limit-cell .meter__top { gap: 10px; }
+.limit-cell__win { font-family: var(--mono); font-size: 10px; color: var(--ink-muted); letter-spacing: 0.04em; }
+/* Blocked is the one state with a time in it: rolling windows have no reset
+   instant, so nothing time-like is shown while the user is under the cap. */
+.limit-cell.is-blocked .meter__resets { color: var(--critical); font-weight: 600; }
+/* Unlimited is the default, not a fault — muted, never tinted like a warning. */
+.limit-none { font-family: var(--mono); font-size: 11.5px; color: var(--ink-muted); }
+
+/* ---------- Limit editor ---------- */
+/* Sized to its presets rather than stretched across the dialog. */
+.limit-form .seg { flex-wrap: wrap; align-self: flex-start; }
+.limit-echo { font-family: var(--mono); font-size: 11.5px; color: var(--accent); margin: 0; min-height: 17px; }
+.limit-hint { font-size: 11.5px; color: var(--ink-2); margin: 2px 0 0; line-height: 1.45; }
+.limit-formula {
+  font-family: var(--mono); font-size: 11px; color: var(--ink-2); margin: 0;
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-left: 3px solid var(--accent); border-radius: var(--r-sm);
+  padding: 8px 11px; line-height: 1.5; overflow-wrap: anywhere;
+}
+
 .th-info {
   display: inline-flex; align-items: center; justify-content: center;
   width: 13px; height: 13px; margin-left: 5px; border-radius: 50%;
@@ -503,12 +529,20 @@ td.actions { text-align: right; white-space: nowrap; }
   .pager__range { font-size: 10.5px; }
   .convs, .msgs, .prompts { max-height: 50vh; }
   .switch__state { min-width: 0; }
+  /* The window presets get their own line rather than squeezing to 4 tiny hit
+     targets. */
+  .limit-form .seg { width: 100%; }
+  .limit-form .seg__btn { flex: 1; padding: 6px 8px; }
 }
 @media (max-width: 380px) {
   .tiles { grid-template-columns: 1fr; }
   .cap__bar { gap: 6px; }
   .cap__bar-spacer { display: none; }
   .conv__meta { flex-direction: column; gap: 2px; }
+  /* The table already scrolls horizontally; keep the meter legible rather than
+     letting the column collapse under it. */
+  .limit-col { min-width: 150px; }
+  .limit-cell { max-width: 180px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

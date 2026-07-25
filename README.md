@@ -241,6 +241,58 @@ make token               # prints the new value
 > reachable beyond loopback. Without it, anyone who can reach the listener
 > can spend your subscription quota.
 
+## Per-user usage limits
+
+Any user token can be capped: once their usage over a **rolling window** exceeds
+the cap, the proxy answers their requests with a 429 until enough old usage ages
+out. Users start with **no limit**, so this changes nothing until you set one.
+
+**Set a limit** from the web UI (Users page → *Edit limit*), or from the CLI:
+
+```bash
+claude-proxy users limit utok_xxx --units 5M --window 24h   # 5 million units per rolling 24h
+claude-proxy users limit utok_xxx --none                     # remove the limit
+claude-proxy users list                                      # LIMIT and USAGE columns
+```
+
+`--units` accepts `K`/`M`/`G` shorthand (`500K`, `5M`, `1.5M`); `--window` uses
+the usual period vocabulary (`1h`, `6h`, `24h`, `7d`, `30d`).
+
+**What is a "unit"?** Tokens are not equally expensive, so the cap counts
+weighted units rather than raw tokens:
+
+```
+units = output × 5    +  input × 1
+      + cache write × 1.25  +  cache read × 0.1
+```
+
+That is, a limit of `5M` units is roughly a million output tokens' worth of
+spend, or five million input tokens' worth, or any mix in between. The window is
+rolling — there is no reset hour to burst against; usage falls off continuously
+as individual requests pass out of the window.
+
+**What the user sees** when they are over the cap — a standard Anthropic-shaped
+rate-limit error, so Claude Code handles it the way it handles any 429:
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 11520
+X-Router-Reason: user-quota
+
+{"type":"error","error":{"type":"rate_limit_error","message":
+ "proxy: usage limit reached - 5,000,000 units per 24h (used 5,204,118). Resets at 2026-07-25 14:32 UTC (in 3h 12m)."}}
+```
+
+`Retry-After` and the reset time are computed exactly — they are the moment
+enough earlier requests age out of the window, not an estimate. The
+`X-Router-Reason: user-quota` header distinguishes a proxy-side quota block from
+an upstream rate limit; a quota block never consumes or penalizes a credential.
+
+> [!NOTE]
+> Token counts are only known once a response finishes, so a single very large
+> response can push a user past their cap; the *next* request is what gets
+> blocked. The proxy never rewrites your `max_tokens` to prevent this.
+
 ## HTTPS via Traefik + Let's Encrypt (optional)
 
 `docker-compose.yml` ships a Traefik service that terminates HTTPS for the
@@ -405,8 +457,9 @@ mounted).
 - **Credentials** — the same actions as the TUI (import, enable/disable,
   refresh, re-weight, update tokens, delete), from a browser.
 - **Users** — create/rotate/disable/delete per-user bearer tokens, with
-  per-user stats, a per-user prompt history, and an opt-in full-conversation
-  capture toggle with a message viewer and markdown export (see below).
+  per-user stats, a per-user prompt history, an opt-in full-conversation
+  capture toggle with a message viewer and markdown export (see below), and a
+  per-user usage limit with a live meter (see below).
 
 **Prompt logging:** when `PROMPT_RETENTION_DAYS` is non-zero (default `7`), the
 proxy stores the last user message of each `POST /v1/messages` request — never
@@ -494,6 +547,7 @@ User tokens (per-user bearer auth)
   make user-stats [ID=...] [PERIOD=24h]   Per-user request stats
   make user-token ID=utok_xxx   Print a user's bearer token
   make user-disable / user-enable / user-rm / user-refresh ID=utok_xxx
+  (usage limits are set via the CLI or the web UI — see "Per-user usage limits")
 
 Credential backup / restore
   make export-credentials   Dump all credentials (with current tokens) to stdout
@@ -543,6 +597,7 @@ claude-proxy users list
 claude-proxy users stats         [<id>] [--period 1h|6h|24h|7d|30d]
 claude-proxy users token         <id>
 claude-proxy users disable|enable|rm|refresh  <id>
+claude-proxy users limit         <id> --units 5M --window 24h | --none
 ```
 
 `--auth-token` falls back to `CLAUDE_PROXY_AUTH_TOKEN` env var. All `creds`
@@ -633,6 +688,11 @@ conversations(
 )
 
 rr_cursor(k, idx)
+
+user_tokens(
+  id, name, token, status, created_at, last_used_at, full_capture,
+  limit_units, limit_window_seconds   -- per-user usage cap; 0/0 = unlimited
+)
 ```
 
 Tokens are stored in plaintext (file mode 0600). KMS / vault integration is

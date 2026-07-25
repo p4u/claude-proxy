@@ -101,6 +101,15 @@ export const api = {
   // Per-user capture mode. `full` true ⇒ store both sides of every conversation.
   setUserCapture: (id, full) => request("POST", `/users/${enc(id)}/capture`, { full: !!full }),
 
+  // Per-user rolling usage limit. Both values 0 clears the limit; the backend
+  // rejects a negative value, or one set and the other zero, with a 400 whose
+  // message is meant to be shown to the operator verbatim.
+  setUserLimit: (id, { units = 0, windowSeconds = 0 } = {}) =>
+    request("POST", `/users/${enc(id)}/limit`, {
+      units: Math.trunc(Number(units) || 0),
+      window_seconds: Math.trunc(Number(windowSeconds) || 0),
+    }),
+
   // Paginated envelopes: {items, total, limit, offset, has_more}.
   userPrompts: (id, { limit = 50, offset = 0 } = {}) =>
     request("GET", `/users/${enc(id)}/prompts?${page(limit, offset)}`),
