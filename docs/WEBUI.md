@@ -267,44 +267,50 @@ captured for this conversation.
   via a normal anchor so the browser saves the file).
 - Message content is rendered with `textContent` (never `innerHTML`).
 
-## v4 additions — per-user usage limits (2026-07-24)
+## v4 additions — per-user usage limits (2026-07-26)
 
 Blocks a user once their recent usage exceeds a configured cap. Default is
 **no limit** (existing users unaffected).
 
-### Metric: weighted billable units
+### Metric: output tokens only
 
-Raw token counts understate cost asymmetry, so the limit counts *units*
-approximating Anthropic's price ratios:
+    usage = SUM(output_tokens) over the rolling window
 
-    units = output*5.0 + input*1.0 + cache_creation*1.25 + cache_read*0.1
-
-Computed from the `request_log` columns already populated by usagecapture.go.
-Export the weights as named constants from one Go location and reuse them in
-BOTH the enforcement query and the web UI display so they cannot drift.
+Input, cache-creation and cache-read tokens are deliberately NOT counted. An
+earlier revision of this contract specified weighted "billable units"
+(`output*5 + input*1 + cache_creation*1.25 + cache_read*0.1`); real traffic
+showed cache reads dominating by roughly two orders of magnitude (~380M cache
+reads against ~948K output tokens in 24h), which made the cap tens of times
+larger than any number on the dashboard and impossible to set sensibly. Output
+tokens are already displayed everywhere, so a cap can be reasoned about.
+Computed from the `request_log` columns populated by usagecapture.go.
 
 ### Rolling window (not calendar)
 
-Usage = SUM(units) over `request_log` where `user_token_id = ?` AND
+Usage = SUM(output_tokens) over `request_log` where `user_token_id = ?` AND
 `ts >= now - window`. Rolling, so there is no calendar-boundary burst hole, no
 counter state to drift, and `request_log` is never pruned so lookback is safe.
 The `(user_token_id, ts)` index already exists.
 
 **Unblock time** is exact and must be computed, not estimated: read the window's
-rows ascending by ts, accumulate their units, and find the first row where
-`total - accumulated < limit`. That row's `ts + window` (+1s) is when the user
-drops back under. This value goes in the error message and `Retry-After`.
+rows ascending by ts, accumulate their output tokens, and find the first row
+where `total - accumulated < limit`. That row's `ts + window` (+1s) is when the
+user drops back under. This value goes in the error message and `Retry-After`.
 
 ### Schema
 
 `user_tokens` gains (additive ALTER + CREATE TABLE, `0` = unlimited):
 
-    limit_units          INTEGER NOT NULL DEFAULT 0
+    limit_output_tokens  INTEGER NOT NULL DEFAULT 0
     limit_window_seconds INTEGER NOT NULL DEFAULT 0
 
 A limit is active only when BOTH are > 0. `usertoken.UserToken` and
-`usertoken.Identity` gain `LimitUnits int64` and `LimitWindowSeconds int64`,
-populated by the existing LookupByToken/List/Get (no extra query).
+`usertoken.Identity` gain `LimitOutputTokens int64` and `LimitWindowSeconds
+int64`, populated by the existing LookupByToken/List/Get (no extra query).
+
+No deployed database ever carried the earlier `limit_units` column, so it was
+renamed rather than migrated. A database that happens to have `limit_units`
+simply keeps it as an unused column.
 
 ### Enforcement
 
@@ -320,7 +326,7 @@ Over the cap => respond **429** with:
 - Anthropic-shaped body:
 
     {"type":"error","error":{"type":"rate_limit_error","message":
-     "proxy: usage limit reached - 5,000,000 units per 24h (used 5,204,118). Resets at 2026-07-25 14:32 UTC (in 3h 12m)."}}
+     "proxy: usage limit reached - 1,000,000 output tokens per 24h (used 1,043,882). Resets at 2026-07-25 14:32 UTC (in 3h 12m)."}}
 
 Log the blocked attempt to `request_log` with status 429, empty `credential_id`
 and empty `conv_id`, `bytes_received` 0, and zero token columns — so it appears
@@ -333,30 +339,48 @@ the NEXT request. Do not mutate the client's `max_tokens` to compensate.
 
 ### API
 
-- `GET /api/users` — each entry gains `limit_units`, `limit_window_seconds`,
-  `usage_units` (current rolling window, 0 when unlimited), `usage_pct`
-  (0-100+, 0 when unlimited), `blocked` (bool), `blocked_until` (RFC3339 or
-  null). Do NOT emit a fake reset time when the user is under the cap — rolling
-  windows have no reset instant; `blocked_until` is non-null only while blocked.
-- `POST /api/users/{id}/limit` `{"units": int, "window_seconds": int}` ->
-  `{"ok":true,"limit_units":int,"limit_window_seconds":int}`. Both 0 clears the
-  limit. Reject negatives with 400; reject one-zero-one-nonzero with 400 and a
-  message explaining both are required.
+- `GET /api/users` — each entry gains `limit_output_tokens`,
+  `limit_window_seconds`, `usage_output_tokens` (current rolling window, 0 when
+  unlimited), `usage_pct` (0-100+, 0 when unlimited), `blocked` (bool),
+  `blocked_until` (RFC3339 or null). Do NOT emit a fake reset time when the user
+  is under the cap — rolling windows have no reset instant; `blocked_until` is
+  non-null only while blocked.
+- `POST /api/users/{id}/limit` `{"output_tokens": int, "window_seconds": int}`
+  -> `{"ok":true,"limit_output_tokens":int,"limit_window_seconds":int}`. Both 0
+  clears the limit. Reject negatives with 400; reject one-zero-one-nonzero with
+  400 and a message explaining both are required.
+- `GET /api/users/{id}/usage?window_seconds=N` ->
+  `{"id":string,"window_seconds":int,"output_tokens":int}`. The same rolling sum
+  for an arbitrary window, whether or not a limit is configured. 400 when
+  `window_seconds` is missing, non-numeric or <= 0; 404 for an unknown user.
+  This exists so the limit editor can show real usage before a cap is chosen.
 
 ### CLI
 
-`claude-proxy users limit <id> --units 5M --window 24h` (accept K/M/G suffixes
-and the existing period vocabulary) and `--none` to clear. Show the limit and
-current usage in `users list`.
+`claude-proxy users limit <id> --tokens 1M --window 24h` (accept K/M/G suffixes
+and the existing period vocabulary) and `--none` to clear. `users list` shows
+`LIMIT (OUT TOK)` and `USED (OUT TOK)` columns.
 
 ### Frontend (Users page)
 
-- New **Usage limit** column: a meter reusing the Subscriptions utilization-meter
-  styling — `3.7M / 5M units · 74%` — warning tint >=80%, critical >=100%, plus
-  `blocked until HH:MM` while blocked. Unlimited users show a muted "no limit".
-- Row action opens an **Edit limit** modal: units field accepting `5M`/`500K`
-  shorthand, window preset (1h/6h/24h/7d, matching the existing period
-  vocabulary), a "No limit" clear action, and a line stating the weighting
-  (`output x5, input x1, cache write x1.25, cache read x0.1`) so "units" is
-  never mysterious.
-- Mock coverage for: unlimited user, healthy user, >=80% user, blocked user.
+- **Usage limit** column: a meter reusing the Subscriptions utilization-meter
+  styling — `740K / 1M out tok · 74%` — warning tint >=80%, critical >=100%,
+  plus `blocked until HH:MM` while blocked. Unlimited users show a muted
+  "no limit".
+- **Cache read** column next to Tokens in/out, sourced from the existing
+  `GET /api/stats/users` `cache_read` field, with a tooltip stating it is not
+  counted towards the limit. Cache reads being invisible is what made the
+  original units metric so confusing; they must be on screen.
+- Row action opens an **Edit limit** modal: an output-token field accepting
+  `1M`/`500K` shorthand, window presets (1h/6h/24h/7d), a "No limit" clear
+  action, and the caption "Counts output tokens only — input and cache tokens
+  are ignored."
+- The modal MUST show the user's current usage for the selected window before
+  saving — "alice used 948K output tokens in the last 24h" — refetched from
+  `GET /api/users/{id}/usage` whenever the window preset changes, with
+  out-of-order responses discarded. Without this the operator has no basis for
+  a number and the feature is unusable.
+- Labels everywhere say "output tokens", never "units".
+- Mock coverage for: unlimited user, healthy user, >=80% user, blocked user,
+  plus the arbitrary-window usage route (scaled sub-linearly with the window so
+  switching presets visibly changes the number).

@@ -2,55 +2,11 @@ package usertoken
 
 import (
 	"context"
-	"math"
 	"testing"
 	"time"
 
 	"github.com/p4u/claude-proxy/internal/store"
 )
-
-func TestUnitsWeighting(t *testing.T) {
-	// output*5 + input*1 + cache_creation*1.25 + cache_read*0.1
-	got := Units(100, 10, 40, 1000)
-	want := 100*1.0 + 10*5.0 + 40*1.25 + 1000*0.1
-	if got != want {
-		t.Fatalf("Units = %v, want %v", got, want)
-	}
-	if Units(0, 0, 0, 0) != 0 {
-		t.Fatal("zero tokens must be zero units")
-	}
-	// Weights must match the documented ratios exactly.
-	if UnitWeightOutput != 5.0 || UnitWeightInput != 1.0 ||
-		UnitWeightCacheCreation != 1.25 || UnitWeightCacheRead != 0.1 {
-		t.Fatal("unit weights drifted from the contract")
-	}
-}
-
-// TestUnitsSQLMatchesGo proves the SQL expression and the Go function agree,
-// which is the whole point of deriving UnitsSQL from the constants.
-func TestUnitsSQLMatchesGo(t *testing.T) {
-	ctx := context.Background()
-	db := testDB(t)
-	ut, err := Create(ctx, db, "alice")
-	if err != nil {
-		t.Fatal(err)
-	}
-	cases := [][4]int64{{100, 10, 40, 1000}, {0, 0, 0, 0}, {7, 3, 1, 9}, {1e6, 5e5, 2e5, 4e6}}
-	var want float64
-	for _, c := range cases {
-		addUsage(t, db, ut.ID, time.Now(), c[0], c[1], c[2], c[3])
-		want += Units(c[0], c[1], c[2], c[3])
-	}
-	var got float64
-	if err := db.QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(`+UnitsSQL+`),0) FROM request_log WHERE user_token_id=?`,
-		ut.ID).Scan(&got); err != nil {
-		t.Fatal(err)
-	}
-	if math.Abs(got-want) > 1e-6 {
-		t.Fatalf("SQL units = %v, Go units = %v", got, want)
-	}
-}
 
 // addUsage inserts one request_log row with the given tokens at ts.
 func addUsage(t *testing.T, db *store.DB, userID string, ts time.Time, in, out, cc, cr int64) {
@@ -63,6 +19,34 @@ func addUsage(t *testing.T, db *store.DB, userID string, ts time.Time, in, out, 
 		userID, ts.Unix(), in, out, cc, cr)
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Only output tokens are metered. Input, cache writes and (above all) cache
+// reads are ignored: cache reads dwarf everything else, which is what made the
+// earlier weighted-units metric unusable.
+func TestOnlyOutputTokensCount(t *testing.T) {
+	ctx := context.Background()
+	db := testDB(t)
+	ut, err := Create(ctx, db, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	addUsage(t, db, ut.ID, now.Add(-time.Minute), 5_000_000, 100, 2_000_000, 380_000_000)
+
+	st, err := LimitStatus(ctx, db, ut.ID, 1000, 3600, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.UsageOutputTokens != 100 || st.Blocked {
+		t.Fatalf("usage = %d (blocked=%v), want 100 output tokens and no block",
+			st.UsageOutputTokens, st.Blocked)
+	}
+
+	got, err := OutputTokensInWindow(ctx, db, ut.ID, time.Hour, now)
+	if err != nil || got != 100 {
+		t.Fatalf("OutputTokensInWindow = %d, %v; want 100", got, err)
 	}
 }
 
@@ -80,7 +64,7 @@ func TestLimitStatusUnlimitedSkipsEverything(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if st.Active || st.Blocked || st.UsageUnits != 0 || st.UsagePct() != 0 {
+		if st.Active || st.Blocked || st.UsageOutputTokens != 0 || st.UsagePct() != 0 {
 			t.Fatalf("limit %v: expected inactive empty state, got %+v", c, st)
 		}
 	}
@@ -94,8 +78,7 @@ func TestLimitStatusUnderAndOverCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now()
-	// 1000 input = 1000 units.
-	addUsage(t, db, ut.ID, now.Add(-time.Minute), 1000, 0, 0, 0)
+	addUsage(t, db, ut.ID, now.Add(-time.Minute), 0, 1000, 0, 0)
 
 	st, err := LimitStatus(ctx, db, ut.ID, 5000, 3600, now)
 	if err != nil {
@@ -104,21 +87,21 @@ func TestLimitStatusUnderAndOverCap(t *testing.T) {
 	if !st.Active || st.Blocked {
 		t.Fatalf("under cap should not block: %+v", st)
 	}
-	if st.UsageUnits != 1000 || st.UsagePct() != 20 {
-		t.Fatalf("usage = %v (%.1f%%), want 1000 (20%%)", st.UsageUnits, st.UsagePct())
+	if st.UsageOutputTokens != 1000 || st.UsagePct() != 20 {
+		t.Fatalf("usage = %d (%.1f%%), want 1000 (20%%)", st.UsageOutputTokens, st.UsagePct())
 	}
 	if !st.BlockedUntil.IsZero() {
 		t.Fatal("must not report a reset time while under the cap")
 	}
 
-	// Push over: 1000 output = 5000 units, total 6000 >= 5000.
-	addUsage(t, db, ut.ID, now.Add(-30*time.Second), 0, 1000, 0, 0)
+	// Push over the cap: 1000 + 5000 = 6000 >= 5000.
+	addUsage(t, db, ut.ID, now.Add(-30*time.Second), 0, 5000, 0, 0)
 	st, err = LimitStatus(ctx, db, ut.ID, 5000, 3600, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !st.Blocked || st.UsageUnits != 6000 {
-		t.Fatalf("expected blocked at 6000 units, got %+v", st)
+	if !st.Blocked || st.UsageOutputTokens != 6000 {
+		t.Fatalf("expected blocked at 6000 output tokens, got %+v", st)
 	}
 	if st.BlockedUntil.IsZero() {
 		t.Fatal("blocked state must carry an unblock time")
@@ -131,14 +114,14 @@ func TestLimitStatusWindowExcludesOldRows(t *testing.T) {
 	db := testDB(t)
 	ut, _ := Create(ctx, db, "alice")
 	now := time.Now()
-	addUsage(t, db, ut.ID, now.Add(-2*time.Hour), 100000, 0, 0, 0) // outside 1h window
-	addUsage(t, db, ut.ID, now.Add(-10*time.Minute), 50, 0, 0, 0)
+	addUsage(t, db, ut.ID, now.Add(-2*time.Hour), 0, 100000, 0, 0) // outside 1h window
+	addUsage(t, db, ut.ID, now.Add(-10*time.Minute), 0, 50, 0, 0)
 
 	st, err := LimitStatus(ctx, db, ut.ID, 1000, 3600, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Blocked || st.UsageUnits != 50 {
+	if st.Blocked || st.UsageOutputTokens != 50 {
 		t.Fatalf("old rows leaked into the window: %+v", st)
 	}
 }
@@ -152,7 +135,7 @@ func TestUnblockTimeExactMultiRowAging(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	window := int64(3600)
 
-	// Four rows of 1000 units each (input tokens), total 4000, limit 2500.
+	// Four rows of 1000 output tokens each, total 4000, limit 2500.
 	// Dropping row1 -> 3000 (still >= 2500). Dropping row1+row2 -> 2000 (< 2500).
 	// So the answer is row2's ts + window + 1s.
 	tss := []time.Time{
@@ -162,14 +145,14 @@ func TestUnblockTimeExactMultiRowAging(t *testing.T) {
 		now.Add(-20 * time.Minute),
 	}
 	for _, ts := range tss {
-		addUsage(t, db, ut.ID, ts, 1000, 0, 0, 0)
+		addUsage(t, db, ut.ID, ts, 0, 1000, 0, 0)
 	}
 
 	st, err := LimitStatus(ctx, db, ut.ID, 2500, window, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !st.Blocked || st.UsageUnits != 4000 {
+	if !st.Blocked || st.UsageOutputTokens != 4000 {
 		t.Fatalf("expected blocked at 4000, got %+v", st)
 	}
 	want := tss[1].Add(time.Duration(window) * time.Second).Add(time.Second)
@@ -182,15 +165,12 @@ func TestUnblockTimeExactMultiRowAging(t *testing.T) {
 	// it must still be at or over it.
 	assertUsageAt := func(at time.Time, wantUnder bool) {
 		t.Helper()
-		var sum float64
-		if err := db.QueryRowContext(ctx,
-			`SELECT COALESCE(SUM(`+UnitsSQL+`),0) FROM request_log
-			 WHERE user_token_id=? AND ts >= ?`,
-			ut.ID, at.Add(-time.Duration(window)*time.Second).Unix()).Scan(&sum); err != nil {
+		sum, err := OutputTokensInWindow(ctx, db, ut.ID, time.Duration(window)*time.Second, at)
+		if err != nil {
 			t.Fatal(err)
 		}
 		if under := sum < 2500; under != wantUnder {
-			t.Fatalf("at %v usage=%v under=%v want under=%v", at.UTC(), sum, under, wantUnder)
+			t.Fatalf("at %v usage=%d under=%v want under=%v", at.UTC(), sum, under, wantUnder)
 		}
 	}
 	assertUsageAt(st.BlockedUntil, true)
@@ -204,7 +184,7 @@ func TestUnblockTimeSingleRow(t *testing.T) {
 	ut, _ := Create(ctx, db, "alice")
 	now := time.Now().Truncate(time.Second)
 	ts := now.Add(-10 * time.Minute)
-	addUsage(t, db, ut.ID, ts, 0, 2000, 0, 0) // 10000 units
+	addUsage(t, db, ut.ID, ts, 0, 10000, 0, 0)
 
 	st, err := LimitStatus(ctx, db, ut.ID, 5000, 3600, now)
 	if err != nil {
@@ -214,7 +194,7 @@ func TestUnblockTimeSingleRow(t *testing.T) {
 	if !st.BlockedUntil.Equal(want) {
 		t.Fatalf("BlockedUntil = %v, want %v", st.BlockedUntil.UTC(), want.UTC())
 	}
-	if got := st.RetryAfterSeconds(now); got != int(time.Until(want).Seconds())+1 && got < 1 {
+	if got := st.RetryAfterSeconds(now); got < 1 {
 		t.Fatalf("RetryAfterSeconds = %d, want >= 1", got)
 	}
 }
@@ -233,35 +213,35 @@ func TestSetLimitRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	db := testDB(t)
 	ut, _ := Create(ctx, db, "alice")
-	if ut.LimitUnits != 0 || ut.LimitWindowSeconds != 0 {
+	if ut.LimitOutputTokens != 0 || ut.LimitWindowSeconds != 0 {
 		t.Fatal("new users must default to unlimited")
 	}
-	if err := SetLimit(ctx, db, ut.ID, 5_000_000, 86400); err != nil {
+	if err := SetLimit(ctx, db, ut.ID, 1_000_000, 86400); err != nil {
 		t.Fatal(err)
 	}
 	got, err := Get(ctx, db, ut.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.LimitUnits != 5_000_000 || got.LimitWindowSeconds != 86400 {
-		t.Fatalf("Get limit = %d/%d", got.LimitUnits, got.LimitWindowSeconds)
+	if got.LimitOutputTokens != 1_000_000 || got.LimitWindowSeconds != 86400 {
+		t.Fatalf("Get limit = %d/%d", got.LimitOutputTokens, got.LimitWindowSeconds)
 	}
 	byTok, err := LookupByToken(ctx, db, ut.Token)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if byTok.LimitUnits != 5_000_000 || byTok.LimitWindowSeconds != 86400 {
+	if byTok.LimitOutputTokens != 1_000_000 || byTok.LimitWindowSeconds != 86400 {
 		t.Fatal("LookupByToken must carry the limit (hot path, no extra query)")
 	}
 	list, err := List(ctx, db)
-	if err != nil || len(list) != 1 || list[0].LimitUnits != 5_000_000 {
+	if err != nil || len(list) != 1 || list[0].LimitOutputTokens != 1_000_000 {
 		t.Fatalf("List must carry the limit: %+v %v", list, err)
 	}
 	if err := SetLimit(ctx, db, ut.ID, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = Get(ctx, db, ut.ID)
-	if HasLimit(got.LimitUnits, got.LimitWindowSeconds) {
+	if HasLimit(got.LimitOutputTokens, got.LimitWindowSeconds) {
 		t.Fatal("both zero must clear the limit")
 	}
 	if err := SetLimit(ctx, db, "utok_nope", 1, 1); err != ErrNotFound {
@@ -269,29 +249,29 @@ func TestSetLimitRoundTrip(t *testing.T) {
 	}
 }
 
-func TestParseAndFormatUnits(t *testing.T) {
+func TestParseAndFormatTokens(t *testing.T) {
 	ok := map[string]int64{
 		"100": 100, "5M": 5_000_000, "500k": 500_000, "1.5M": 1_500_000,
 		"2G": 2_000_000_000, " 42 ": 42, "0": 0,
 	}
 	for in, want := range ok {
-		got, err := ParseUnits(in)
+		got, err := ParseTokens(in)
 		if err != nil || got != want {
-			t.Fatalf("ParseUnits(%q) = %d, %v; want %d", in, got, err, want)
+			t.Fatalf("ParseTokens(%q) = %d, %v; want %d", in, got, err, want)
 		}
 	}
 	for _, bad := range []string{"", "abc", "-5", "-1M", "5X2"} {
-		if _, err := ParseUnits(bad); err == nil {
-			t.Fatalf("ParseUnits(%q) should fail", bad)
+		if _, err := ParseTokens(bad); err == nil {
+			t.Fatalf("ParseTokens(%q) should fail", bad)
 		}
 	}
-	fmts := map[float64]string{
+	fmts := map[int64]string{
 		5_000_000: "5M", 3_700_000: "3.7M", 812_000: "812K", 940: "940", 0: "0",
 		2_000_000_000: "2G",
 	}
 	for in, want := range fmts {
-		if got := FormatUnits(in); got != want {
-			t.Fatalf("FormatUnits(%v) = %q, want %q", in, got, want)
+		if got := FormatTokens(in); got != want {
+			t.Fatalf("FormatTokens(%v) = %q, want %q", in, got, want)
 		}
 	}
 }
@@ -320,8 +300,8 @@ func TestFormatWindowAndCountdown(t *testing.T) {
 }
 
 func TestFormatGroupedAndQuotaMessage(t *testing.T) {
-	g := map[int64]string{0: "0", 999: "999", 1000: "1,000", 5204118: "5,204,118",
-		5000000: "5,000,000", -1234: "-1,234"}
+	g := map[int64]string{0: "0", 999: "999", 1000: "1,000", 1043882: "1,043,882",
+		1000000: "1,000,000", -1234: "-1,234"}
 	for in, want := range g {
 		if got := FormatGrouped(in); got != want {
 			t.Fatalf("FormatGrouped(%d) = %q, want %q", in, got, want)
@@ -329,11 +309,11 @@ func TestFormatGroupedAndQuotaMessage(t *testing.T) {
 	}
 	now := time.Date(2026, 7, 25, 11, 20, 0, 0, time.UTC)
 	st := LimitState{
-		Active: true, LimitUnits: 5_000_000, Window: 24 * time.Hour,
-		UsageUnits: 5_204_118, Blocked: true,
+		Active: true, LimitOutputTokens: 1_000_000, Window: 24 * time.Hour,
+		UsageOutputTokens: 1_043_882, Blocked: true,
 		BlockedUntil: time.Date(2026, 7, 25, 14, 32, 0, 0, time.UTC),
 	}
-	want := "proxy: usage limit reached - 5,000,000 units per 24h (used 5,204,118). " +
+	want := "proxy: usage limit reached - 1,000,000 output tokens per 24h (used 1,043,882). " +
 		"Resets at 2026-07-25 14:32 UTC (in 3h 12m)."
 	if got := st.QuotaMessage(now); got != want {
 		t.Fatalf("QuotaMessage:\n got %q\nwant %q", got, want)

@@ -38,7 +38,7 @@ func Open(path string) (*DB, error) {
 		`ALTER TABLE request_log ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE request_log ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE user_tokens ADD COLUMN full_capture INTEGER NOT NULL DEFAULT 0`,
-		`ALTER TABLE user_tokens ADD COLUMN limit_units INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE user_tokens ADD COLUMN limit_output_tokens INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE user_tokens ADD COLUMN limit_window_seconds INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := sdb.Exec(alter); err != nil && !isDuplicateColumn(err) {

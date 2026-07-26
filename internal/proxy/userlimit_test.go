@@ -26,18 +26,18 @@ func limitUpstream(hits *int32) http.HandlerFunc {
 	}
 }
 
-func mkUser(t *testing.T, db *store.DB, name string, units, window int64) *usertoken.UserToken {
+func mkUser(t *testing.T, db *store.DB, name string, outTokens, window int64) *usertoken.UserToken {
 	t.Helper()
 	ut, err := usertoken.Create(context.Background(), db, name)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if units > 0 || window > 0 {
-		if err := usertoken.SetLimit(context.Background(), db, ut.ID, units, window); err != nil {
+	if outTokens > 0 || window > 0 {
+		if err := usertoken.SetLimit(context.Background(), db, ut.ID, outTokens, window); err != nil {
 			t.Fatal(err)
 		}
 	}
-	ut.LimitUnits, ut.LimitWindowSeconds = units, window
+	ut.LimitOutputTokens, ut.LimitWindowSeconds = outTokens, window
 	return ut
 }
 
@@ -68,7 +68,7 @@ func identityFor(ut *usertoken.UserToken) *usertoken.Identity {
 	return &usertoken.Identity{
 		UserTokenID:        ut.ID,
 		UserName:           ut.Name,
-		LimitUnits:         ut.LimitUnits,
+		LimitOutputTokens:  ut.LimitOutputTokens,
 		LimitWindowSeconds: ut.LimitWindowSeconds,
 	}
 }
@@ -77,9 +77,9 @@ func TestUserLimitBlocksOverCap(t *testing.T) {
 	var hits int32
 	h, cs, db, _ := setupProxy(t, limitUpstream(&hits))
 
-	// 5000 unit cap over 1h; seed 1200 output tokens = 6000 units.
+	// 5000 output-token cap over 1h; seed 6000 output tokens.
 	ut := mkUser(t, db, "alice", 5000, 3600)
-	addUsageRow(t, db, ut.ID, time.Now().Add(-10*time.Minute), 0, 1200)
+	addUsageRow(t, db, ut.ID, time.Now().Add(-10*time.Minute), 0, 6000)
 
 	// Snapshot credential counters so we can prove they are untouched.
 	type credState struct {
@@ -182,7 +182,7 @@ func TestUserLimitAllowsUnderCap(t *testing.T) {
 	h, _, db, _ := setupProxy(t, limitUpstream(&hits))
 
 	ut := mkUser(t, db, "bob", 100000, 3600)
-	addUsageRow(t, db, ut.ID, time.Now().Add(-time.Minute), 100, 10) // 150 units
+	addUsageRow(t, db, ut.ID, time.Now().Add(-time.Minute), 100, 10) // 10 output tokens
 
 	rw := httptest.NewRecorder()
 	h.ServeHTTP(rw, msgRequest("/v1/messages", identityFor(ut)))
@@ -223,13 +223,13 @@ func TestUserLimitUnlimitedUserNeverBlocked(t *testing.T) {
 	}
 
 	// A half-configured limit (one side zero) is not a limit either.
-	ut.LimitUnits, ut.LimitWindowSeconds = 1, 0
+	ut.LimitOutputTokens, ut.LimitWindowSeconds = 1, 0
 	rw = httptest.NewRecorder()
 	h.ServeHTTP(rw, msgRequest("/v1/messages", identityFor(ut)))
 	if rw.Code != 200 {
 		t.Fatalf("half-configured limit blocked: %d", rw.Code)
 	}
-	ut.LimitUnits, ut.LimitWindowSeconds = 0, 3600
+	ut.LimitOutputTokens, ut.LimitWindowSeconds = 0, 3600
 	rw = httptest.NewRecorder()
 	h.ServeHTTP(rw, msgRequest("/v1/messages", identityFor(ut)))
 	if rw.Code != 200 {

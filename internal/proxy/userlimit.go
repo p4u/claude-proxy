@@ -29,13 +29,13 @@ func (h *Handler) enforceUserLimit(w http.ResponseWriter, r *http.Request, start
 	if id == nil || id.IsAdmin || id.UserTokenID == "" {
 		return false
 	}
-	if !usertoken.HasLimit(id.LimitUnits, id.LimitWindowSeconds) {
+	if !usertoken.HasLimit(id.LimitOutputTokens, id.LimitWindowSeconds) {
 		return false
 	}
 
 	now := time.Now()
 	st, err := usertoken.LimitStatus(r.Context(), h.db, id.UserTokenID,
-		id.LimitUnits, id.LimitWindowSeconds, now)
+		id.LimitOutputTokens, id.LimitWindowSeconds, now)
 	if err != nil {
 		// Fail open: a metering hiccup must not take the proxy down.
 		h.log.Error("usage limit check failed; allowing request",
@@ -50,7 +50,7 @@ func (h *Handler) enforceUserLimit(w http.ResponseWriter, r *http.Request, start
 	msg := st.QuotaMessage(now)
 	h.log.Warn("user over usage limit; blocked",
 		"user", id.UserTokenID, "name", id.UserName,
-		"limit_units", st.LimitUnits, "usage_units", int64(st.UsageUnits),
+		"limit_output_tokens", st.LimitOutputTokens, "usage_output_tokens", st.UsageOutputTokens,
 		"window", usertoken.FormatWindow(st.Window),
 		"retry_after_s", retryAfter,
 		"blocked_until", st.BlockedUntil.UTC().Format(time.RFC3339))

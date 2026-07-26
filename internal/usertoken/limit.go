@@ -11,47 +11,26 @@ import (
 	"github.com/p4u/claude-proxy/internal/store"
 )
 
-// Weighted billable units.
+// Per-user usage limits meter OUTPUT TOKENS ONLY.
 //
-// Raw token counts understate cost asymmetry between token kinds, so per-user
-// limits count "units" approximating Anthropic's price ratios. These constants
-// are the single source of truth: the enforcement query, the web UI display and
-// the CLI all derive from them so they cannot drift.
-const (
-	UnitWeightOutput        = 5.0
-	UnitWeightInput         = 1.0
-	UnitWeightCacheCreation = 1.25
-	UnitWeightCacheRead     = 0.1
-)
-
-// Units returns the weighted billable units for one request's token counts.
-func Units(input, output, cacheCreation, cacheRead int64) float64 {
-	return float64(output)*UnitWeightOutput +
-		float64(input)*UnitWeightInput +
-		float64(cacheCreation)*UnitWeightCacheCreation +
-		float64(cacheRead)*UnitWeightCacheRead
-}
-
-// UnitsSQL is the SQL expression computing Units() for a request_log row. Built
-// from the same constants so SQL and Go can never disagree.
-var UnitsSQL = fmt.Sprintf(
-	"(output_tokens*%v + input_tokens*%v + cache_creation_tokens*%v + cache_read_tokens*%v)",
-	UnitWeightOutput, UnitWeightInput, UnitWeightCacheCreation, UnitWeightCacheRead)
-
-// WeightsDescription is the human-readable weighting, for UI/CLI captions.
-const WeightsDescription = "output x5, input x1, cache write x1.25, cache read x0.1"
+// An earlier version counted weighted "billable units" across all four token
+// kinds. In practice cache reads dwarf everything else (hundreds of millions a
+// day against a million output tokens), so the number an operator had to cap
+// was tens of times larger than anything shown on the dashboard and impossible
+// to set sensibly. Output tokens are the figure people already recognise, so
+// that is the metric.
 
 // LimitState is the evaluation of a user's rolling-window usage against their
 // configured cap.
 type LimitState struct {
 	// Active reports whether the user has a limit configured at all.
 	Active bool
-	// LimitUnits and Window echo the configured limit.
-	LimitUnits int64
-	Window     time.Duration
-	// UsageUnits is the weighted usage inside the rolling window.
-	UsageUnits float64
-	// Blocked is true when UsageUnits >= LimitUnits.
+	// LimitOutputTokens and Window echo the configured limit.
+	LimitOutputTokens int64
+	Window            time.Duration
+	// UsageOutputTokens is the output tokens produced inside the rolling window.
+	UsageOutputTokens int64
+	// Blocked is true when UsageOutputTokens >= LimitOutputTokens.
 	Blocked bool
 	// BlockedUntil is the exact instant the user drops back under the cap as
 	// old rows age out of the window. Zero when not blocked — a rolling window
@@ -61,45 +40,59 @@ type LimitState struct {
 
 // UsagePct is usage as a percentage of the limit (0 when unlimited, may exceed 100).
 func (s LimitState) UsagePct() float64 {
-	if !s.Active || s.LimitUnits <= 0 {
+	if !s.Active || s.LimitOutputTokens <= 0 {
 		return 0
 	}
-	return s.UsageUnits / float64(s.LimitUnits) * 100
+	return float64(s.UsageOutputTokens) / float64(s.LimitOutputTokens) * 100
 }
 
 // HasLimit reports whether both halves of a limit are set (0 => unlimited).
-func HasLimit(limitUnits, windowSeconds int64) bool {
-	return limitUnits > 0 && windowSeconds > 0
+func HasLimit(limitOutputTokens, windowSeconds int64) bool {
+	return limitOutputTokens > 0 && windowSeconds > 0
+}
+
+// OutputTokensInWindow sums a user's output tokens over the rolling window
+// ending at now. The UI uses it to show current usage while an operator picks a
+// cap, independently of whether a limit is configured.
+func OutputTokensInWindow(ctx context.Context, db *store.DB, userID string, window time.Duration, now time.Time) (int64, error) {
+	if userID == "" || window <= 0 {
+		return 0, nil
+	}
+	var total int64
+	err := db.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(output_tokens), 0) FROM request_log
+		 WHERE user_token_id = ? AND ts >= ?`, userID, now.Add(-window).Unix()).Scan(&total)
+	return total, err
 }
 
 // LimitStatus evaluates userID's usage over the rolling window ending at now.
 //
 // When no limit is configured it returns an inactive state and performs ZERO
 // queries — unlimited users must not pay for this feature. When a limit exists
-// it sums the window's units; only if the user is over the cap does it do the
-// second, exact pass computing the unblock instant.
-func LimitStatus(ctx context.Context, db *store.DB, userID string, limitUnits, windowSeconds int64, now time.Time) (LimitState, error) {
-	if userID == "" || !HasLimit(limitUnits, windowSeconds) {
+// it sums the window's output tokens; only if the user is over the cap does it
+// do the second, exact pass computing the unblock instant.
+func LimitStatus(ctx context.Context, db *store.DB, userID string, limitOutputTokens, windowSeconds int64, now time.Time) (LimitState, error) {
+	if userID == "" || !HasLimit(limitOutputTokens, windowSeconds) {
 		return LimitState{}, nil
 	}
 	window := time.Duration(windowSeconds) * time.Second
-	st := LimitState{Active: true, LimitUnits: limitUnits, Window: window}
+	st := LimitState{Active: true, LimitOutputTokens: limitOutputTokens, Window: window}
 	since := now.Add(-window).Unix()
 
-	var total float64
+	var total int64
 	err := db.QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(`+UnitsSQL+`), 0) FROM request_log
+		`SELECT COALESCE(SUM(output_tokens), 0) FROM request_log
 		 WHERE user_token_id = ? AND ts >= ?`, userID, since).Scan(&total)
 	if err != nil {
 		return st, err
 	}
-	st.UsageUnits = total
-	if total < float64(limitUnits) {
+	st.UsageOutputTokens = total
+	if total < limitOutputTokens {
 		return st, nil
 	}
 	st.Blocked = true
 
-	until, err := unblockAt(ctx, db, userID, since, total, float64(limitUnits))
+	until, err := unblockAt(ctx, db, userID, since, total, limitOutputTokens)
 	if err != nil {
 		return st, err
 	}
@@ -107,30 +100,29 @@ func LimitStatus(ctx context.Context, db *store.DB, userID string, limitUnits, w
 	return st, nil
 }
 
-// unblockAt walks the window's rows ascending by ts, accumulating units, and
-// returns the ts of the first row whose expiry drops the running total below
-// the limit. The caller adds the window (+1s) to turn it into an instant.
+// unblockAt walks the window's rows ascending by ts, accumulating output
+// tokens, and returns the ts of the first row whose expiry drops the running
+// total below the limit. The caller adds the window (+1s) to turn it into an
+// instant.
 //
 // This is exact, not estimated: usage only falls when a specific row leaves the
 // window, so the answer is always one of the rows' timestamps.
-func unblockAt(ctx context.Context, db *store.DB, userID string, since int64, total, limit float64) (time.Time, error) {
+func unblockAt(ctx context.Context, db *store.DB, userID string, since, total, limit int64) (time.Time, error) {
 	rows, err := db.QueryContext(ctx,
-		`SELECT ts, `+UnitsSQL+` FROM request_log
+		`SELECT ts, output_tokens FROM request_log
 		 WHERE user_token_id = ? AND ts >= ? ORDER BY ts ASC, id ASC`, userID, since)
 	if err != nil {
 		return time.Time{}, err
 	}
 	defer rows.Close()
-	var acc float64
-	var last int64
+	var acc, last int64
 	for rows.Next() {
-		var ts int64
-		var units float64
-		if err := rows.Scan(&ts, &units); err != nil {
+		var ts, out int64
+		if err := rows.Scan(&ts, &out); err != nil {
 			return time.Time{}, err
 		}
 		last = ts
-		acc += units
+		acc += out
 		if total-acc < limit {
 			return time.Unix(ts, 0), nil
 		}
@@ -157,10 +149,10 @@ func (s LimitState) RetryAfterSeconds(now time.Time) int {
 }
 
 // SetLimit configures (or clears, with both zero) a user's usage limit.
-func SetLimit(ctx context.Context, db *store.DB, id string, units, windowSeconds int64) error {
+func SetLimit(ctx context.Context, db *store.DB, id string, outputTokens, windowSeconds int64) error {
 	res, err := db.ExecContext(ctx,
-		`UPDATE user_tokens SET limit_units=?, limit_window_seconds=? WHERE id=?`,
-		units, windowSeconds, id)
+		`UPDATE user_tokens SET limit_output_tokens=?, limit_window_seconds=? WHERE id=?`,
+		outputTokens, windowSeconds, id)
 	if err != nil {
 		return err
 	}
@@ -170,12 +162,12 @@ func SetLimit(ctx context.Context, db *store.DB, id string, units, windowSeconds
 	return nil
 }
 
-// ParseUnits accepts a plain integer or a K/M/G-suffixed shorthand ("5M",
+// ParseTokens accepts a plain integer or a K/M/G-suffixed shorthand ("1M",
 // "500k", "1.5M"). Returns an error for negative or unparseable input.
-func ParseUnits(s string) (int64, error) {
+func ParseTokens(s string) (int64, error) {
 	t := strings.TrimSpace(s)
 	if t == "" {
-		return 0, fmt.Errorf("empty units value")
+		return 0, fmt.Errorf("empty token count")
 	}
 	mult := float64(1)
 	switch t[len(t)-1] {
@@ -188,26 +180,27 @@ func ParseUnits(s string) (int64, error) {
 	}
 	f, err := strconv.ParseFloat(strings.TrimSpace(t), 64)
 	if err != nil {
-		return 0, fmt.Errorf("invalid units %q — use a number, optionally with K/M/G", s)
+		return 0, fmt.Errorf("invalid token count %q — use a number, optionally with K/M/G", s)
 	}
 	if f < 0 {
-		return 0, fmt.Errorf("units must not be negative")
+		return 0, fmt.Errorf("token count must not be negative")
 	}
 	return int64(f * mult), nil
 }
 
-// FormatUnits renders a unit count compactly ("5M", "3.7M", "812K", "940").
-func FormatUnits(v float64) string {
-	abs := math.Abs(v)
+// FormatTokens renders a token count compactly ("5M", "3.7M", "812K", "940").
+func FormatTokens(v int64) string {
+	f := float64(v)
+	abs := math.Abs(f)
 	switch {
 	case abs >= 1e9:
-		return trimZero(v/1e9) + "G"
+		return trimZero(f/1e9) + "G"
 	case abs >= 1e6:
-		return trimZero(v/1e6) + "M"
+		return trimZero(f/1e6) + "M"
 	case abs >= 1e3:
-		return trimZero(v/1e3) + "K"
+		return trimZero(f/1e3) + "K"
 	default:
-		return strconv.FormatFloat(v, 'f', 0, 64)
+		return strconv.FormatInt(v, 10)
 	}
 }
 
@@ -251,8 +244,8 @@ func FormatCountdown(d time.Duration) string {
 	}
 }
 
-// FormatGrouped renders an integer with thousands separators (5204118 =>
-// "5,204,118") for the user-facing quota message.
+// FormatGrouped renders an integer with thousands separators (1043882 =>
+// "1,043,882") for the user-facing quota message.
 func FormatGrouped(v int64) string {
 	neg := v < 0
 	if neg {
@@ -275,9 +268,9 @@ func FormatGrouped(v int64) string {
 // QuotaMessage is the client-facing 429 message for a blocked user.
 func (s LimitState) QuotaMessage(now time.Time) string {
 	return fmt.Sprintf(
-		"proxy: usage limit reached - %s units per %s (used %s). Resets at %s (in %s).",
-		FormatGrouped(s.LimitUnits), FormatWindow(s.Window),
-		FormatGrouped(int64(s.UsageUnits)),
+		"proxy: usage limit reached - %s output tokens per %s (used %s). Resets at %s (in %s).",
+		FormatGrouped(s.LimitOutputTokens), FormatWindow(s.Window),
+		FormatGrouped(s.UsageOutputTokens),
 		s.BlockedUntil.UTC().Format("2006-01-02 15:04 UTC"),
 		FormatCountdown(s.BlockedUntil.Sub(now)))
 }

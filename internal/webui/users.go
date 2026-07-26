@@ -18,11 +18,11 @@ type userView struct {
 	LastUsedAt  *string `json:"last_used_at"`
 	FullCapture bool    `json:"full_capture"`
 
-	// Usage limit (v4). 0/0 => unlimited, in which case usage_units and
-	// usage_pct are 0 and blocked_until is null.
-	LimitUnits         int64   `json:"limit_units"`
+	// Usage limit (v4). 0/0 => unlimited, in which case usage_output_tokens
+	// and usage_pct are 0 and blocked_until is null.
+	LimitOutputTokens  int64   `json:"limit_output_tokens"`
 	LimitWindowSeconds int64   `json:"limit_window_seconds"`
-	UsageUnits         float64 `json:"usage_units"`
+	UsageOutputTokens  int64   `json:"usage_output_tokens"`
 	UsagePct           float64 `json:"usage_pct"`
 	Blocked            bool    `json:"blocked"`
 	// BlockedUntil is non-null only while blocked: a rolling window has no
@@ -77,6 +77,9 @@ func (s *Server) userAction(w http.ResponseWriter, r *http.Request, id, action s
 	case action == "limit" && r.Method == http.MethodPost:
 		s.setUserLimit(w, r, id)
 		return
+	case action == "usage" && r.Method == http.MethodGet:
+		s.userWindowUsage(w, r, id)
+		return
 	case action == "" && r.Method == http.MethodDelete:
 		err = usertoken.Delete(ctx, s.db, id)
 	default:
@@ -113,7 +116,7 @@ func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {
 			Status:             string(ut.Status),
 			CreatedAt:          ut.CreatedAt.Format(time.RFC3339),
 			FullCapture:        ut.FullCapture,
-			LimitUnits:         ut.LimitUnits,
+			LimitOutputTokens:  ut.LimitOutputTokens,
 			LimitWindowSeconds: ut.LimitWindowSeconds,
 		}
 		if ut.LastUsedAt != nil {
@@ -122,12 +125,12 @@ func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {
 		}
 		// Skips the query entirely for unlimited users.
 		st, err := usertoken.LimitStatus(r.Context(), s.db, ut.ID,
-			ut.LimitUnits, ut.LimitWindowSeconds, now)
+			ut.LimitOutputTokens, ut.LimitWindowSeconds, now)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		v.UsageUnits = st.UsageUnits
+		v.UsageOutputTokens = st.UsageOutputTokens
 		v.UsagePct = st.UsagePct()
 		v.Blocked = st.Blocked
 		if st.Blocked {
@@ -167,30 +170,57 @@ func (s *Server) setUserCapture(w http.ResponseWriter, r *http.Request, id strin
 // since a limit is meaningless without both halves.
 func (s *Server) setUserLimit(w http.ResponseWriter, r *http.Request, id string) {
 	var body struct {
-		Units         int64 `json:"units"`
+		OutputTokens  int64 `json:"output_tokens"`
 		WindowSeconds int64 `json:"window_seconds"`
 	}
 	if err := decodeJSON(w, r, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if body.Units < 0 || body.WindowSeconds < 0 {
-		writeErr(w, http.StatusBadRequest, "units and window_seconds must not be negative")
+	if body.OutputTokens < 0 || body.WindowSeconds < 0 {
+		writeErr(w, http.StatusBadRequest, "output_tokens and window_seconds must not be negative")
 		return
 	}
-	if (body.Units == 0) != (body.WindowSeconds == 0) {
+	if (body.OutputTokens == 0) != (body.WindowSeconds == 0) {
 		writeErr(w, http.StatusBadRequest,
-			"both units and window_seconds are required to set a limit; send both as 0 to clear it")
+			"both output_tokens and window_seconds are required to set a limit; send both as 0 to clear it")
 		return
 	}
-	if err := usertoken.SetLimit(r.Context(), s.db, id, body.Units, body.WindowSeconds); err != nil {
+	if err := usertoken.SetLimit(r.Context(), s.db, id, body.OutputTokens, body.WindowSeconds); err != nil {
 		s.userErr(w, err)
 		return
 	}
 	writeJSON(w, map[string]any{
 		"ok":                   true,
-		"limit_units":          body.Units,
+		"limit_output_tokens":  body.OutputTokens,
 		"limit_window_seconds": body.WindowSeconds,
+	})
+}
+
+// userWindowUsage reports a user's output tokens over an arbitrary rolling
+// window, regardless of whether a limit is configured. The Edit limit modal
+// calls it so an operator can see what this user actually produces over the
+// window they are about to cap, instead of guessing a number.
+func (s *Server) userWindowUsage(w http.ResponseWriter, r *http.Request, id string) {
+	secs, err := strconv.ParseInt(r.URL.Query().Get("window_seconds"), 10, 64)
+	if err != nil || secs <= 0 {
+		writeErr(w, http.StatusBadRequest, "window_seconds must be a positive integer")
+		return
+	}
+	if _, err := usertoken.Get(r.Context(), s.db, id); err != nil {
+		s.userErr(w, err)
+		return
+	}
+	total, err := usertoken.OutputTokensInWindow(r.Context(), s.db, id,
+		time.Duration(secs)*time.Second, time.Now())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{
+		"id":             id,
+		"window_seconds": secs,
+		"output_tokens":  total,
 	})
 }
 

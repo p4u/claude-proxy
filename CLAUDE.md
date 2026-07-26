@@ -78,7 +78,7 @@ Claude Code (ANTHROPIC_BASE_URL → proxy)
 | `internal/store/` | SQLite wrapper, schema, migrations (WAL mode) |
 | `internal/ingest/` | OAuth `.credentials.json` parser/importer |
 | `internal/admin/` | Admin REST API (`/admin/*` routes) |
-| `internal/usertoken/` | Named per-user bearer tokens; request identity (`Identity{IsAdmin,FullCapture,...}` in context); weighted-unit usage limits (`limit.go`) |
+| `internal/usertoken/` | Named per-user bearer tokens; request identity (`Identity{IsAdmin,FullCapture,...}` in context); output-token usage limits (`limit.go`) |
 | `internal/usage/` | Anthropic usage API client, background poller, history storage + asciigraph chart |
 | `internal/prettylog/` | Custom slog handler with per-credential color output |
 
@@ -100,7 +100,7 @@ Claude Code (ANTHROPIC_BASE_URL → proxy)
 
 ### Storage Schema (SQLite)
 
-Eight tables (`internal/store/schema.go`): `credentials`, `conversations`, `rr_cursor` (legacy round-robin state), `user_tokens` (named bearer tokens, plus the per-user usage cap `limit_units` / `limit_window_seconds`, `0` = unlimited), `request_log` (one row per forwarded request, for per-user stats), `usage_history` (utilization snapshots driving selection), `prompt_log` (last user prompt per `POST /v1/messages`, `user_token_id` FK `ON DELETE SET NULL`; never stores responses, gated + retained by `CLAUDE_PROXY_PROMPT_RETENTION_DAYS`, captured in `internal/proxy/promptcapture.go` and pruned by its hourly janitor), `conversation_message` (opt-in whole-conversation capture: `UNIQUE(conv_id, seq)` where `seq` is the message's index in the request's `messages` array, so re-sent history is idempotent; same retention window and janitor as `prompt_log`). Deleting a credential cascades to `usage_history` (`ON DELETE CASCADE`); `conversations` bindings are cleared inside `creds.Delete`'s transaction, since older DBs created that FK without a cascade clause. `request_log` additionally carries per-request token usage columns (`model`, `input_tokens`, `output_tokens`, `cache_creation_tokens`, `cache_read_tokens`), added via the existing swallow-duplicate `ALTER TABLE` migration mechanism and populated by `internal/proxy/usagecapture.go` from the tee'd response stream (SSE and non-streaming JSON) — this feeds the web UI's token stats and never affects what the client receives. Core dependency: `modernc.org/sqlite` (pure Go, no CGO required); `guptarohit/asciigraph` for usage charts and `charmbracelet/bubbletea`+`lipgloss`+`bubbles` for the management TUI.
+Eight tables (`internal/store/schema.go`): `credentials`, `conversations`, `rr_cursor` (legacy round-robin state), `user_tokens` (named bearer tokens, plus the per-user usage cap `limit_output_tokens` / `limit_window_seconds`, `0` = unlimited), `request_log` (one row per forwarded request, for per-user stats), `usage_history` (utilization snapshots driving selection), `prompt_log` (last user prompt per `POST /v1/messages`, `user_token_id` FK `ON DELETE SET NULL`; never stores responses, gated + retained by `CLAUDE_PROXY_PROMPT_RETENTION_DAYS`, captured in `internal/proxy/promptcapture.go` and pruned by its hourly janitor), `conversation_message` (opt-in whole-conversation capture: `UNIQUE(conv_id, seq)` where `seq` is the message's index in the request's `messages` array, so re-sent history is idempotent; same retention window and janitor as `prompt_log`). Deleting a credential cascades to `usage_history` (`ON DELETE CASCADE`); `conversations` bindings are cleared inside `creds.Delete`'s transaction, since older DBs created that FK without a cascade clause. `request_log` additionally carries per-request token usage columns (`model`, `input_tokens`, `output_tokens`, `cache_creation_tokens`, `cache_read_tokens`), added via the existing swallow-duplicate `ALTER TABLE` migration mechanism and populated by `internal/proxy/usagecapture.go` from the tee'd response stream (SSE and non-streaming JSON) — this feeds the web UI's token stats and never affects what the client receives. Core dependency: `modernc.org/sqlite` (pure Go, no CGO required); `guptarohit/asciigraph` for usage charts and `charmbracelet/bubbletea`+`lipgloss`+`bubbles` for the management TUI.
 
 ## Configuration
 
@@ -172,32 +172,33 @@ Each user token can carry a cap on how much they may spend over a **rolling
 window**. Default is no limit; existing users are unaffected.
 
 ```bash
-claude-proxy users limit utok_xxx --units 5M --window 24h   # set
+claude-proxy users limit utok_xxx --tokens 1M --window 24h  # set
 claude-proxy users limit utok_xxx --none                     # clear
-claude-proxy users list                                      # shows LIMIT + USAGE
+claude-proxy users list                                      # shows LIMIT + USED
 ```
 
-**Metric — weighted billable units.** Raw token counts understate the cost
-asymmetry between token kinds, so the cap counts *units*:
-
-    units = output*5.0 + input*1.0 + cache_creation*1.25 + cache_read*0.1
-
-The weights live in exactly one place — `internal/usertoken/limit.go` — as
-exported constants, with `usertoken.UnitsSQL` built from them via `fmt.Sprintf`
-so the enforcement query, the web UI display and the CLI cannot drift apart.
+**Metric — output tokens only.** `SUM(output_tokens)`; input, cache creation and
+cache read are ignored. An earlier version counted weighted "billable units"
+across all four token kinds, but cache reads dominate real traffic by two orders
+of magnitude, which made the cap unrelatable to anything on the dashboard.
 Values come from the `request_log` token columns populated by `usagecapture.go`.
+Because no deployed database ever carried the old `limit_units` column, it was
+renamed to `limit_output_tokens` rather than migrated.
 
-**Rolling window, not calendar.** Usage is `SUM(units)` over `request_log` where
+**Rolling window, not calendar.** Usage is `SUM(output_tokens)` over `request_log` where
 `user_token_id = ?` and `ts >= now - window` (the `(user_token_id, ts)` index
 already exists). There is no counter state to drift and no calendar-boundary
 burst hole; `request_log` is never pruned, so lookback is always safe.
 
 **Unblock time is computed exactly, never estimated.** `usertoken.LimitStatus`
-reads the window's rows ascending by `ts`, accumulates their units, and finds
+reads the window's rows ascending by `ts`, accumulates their output tokens, and finds
 the first row where `total - accumulated < limit`; that row's `ts + window + 1s`
 is the instant the user drops back under. It feeds both the `Retry-After` header
 and the error message. This second pass only runs when the user is actually
 blocked; a user with no limit configured performs **zero** queries.
+`GET /api/users/{id}/usage?window_seconds=N` exposes the same rolling sum for an
+arbitrary window (no limit required), which is what the web UI's *Edit limit*
+modal shows so an operator can size a cap against real traffic.
 
 Enforcement sits in `ServeHTTP` after the identity is known and *before*
 `pool.Bind`, so a blocked request never touches credential state — no binding,

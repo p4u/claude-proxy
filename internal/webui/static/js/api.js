@@ -101,14 +101,20 @@ export const api = {
   // Per-user capture mode. `full` true ⇒ store both sides of every conversation.
   setUserCapture: (id, full) => request("POST", `/users/${enc(id)}/capture`, { full: !!full }),
 
-  // Per-user rolling usage limit. Both values 0 clears the limit; the backend
-  // rejects a negative value, or one set and the other zero, with a 400 whose
-  // message is meant to be shown to the operator verbatim.
-  setUserLimit: (id, { units = 0, windowSeconds = 0 } = {}) =>
+  // Per-user rolling usage limit, in output tokens. Both values 0 clears the
+  // limit; the backend rejects a negative value, or one set and the other zero,
+  // with a 400 whose message is meant to be shown to the operator verbatim.
+  setUserLimit: (id, { outputTokens = 0, windowSeconds = 0 } = {}) =>
     request("POST", `/users/${enc(id)}/limit`, {
-      units: Math.trunc(Number(units) || 0),
+      output_tokens: Math.trunc(Number(outputTokens) || 0),
       window_seconds: Math.trunc(Number(windowSeconds) || 0),
     }),
+
+  // Output tokens this user produced over an arbitrary rolling window,
+  // whether or not a limit is configured. Lets the limit editor show real
+  // usage for the window being capped instead of asking for a blind guess.
+  userWindowUsage: (id, windowSeconds) =>
+    request("GET", `/users/${enc(id)}/usage?window_seconds=${Math.trunc(Number(windowSeconds) || 0)}`),
 
   // Paginated envelopes: {items, total, limit, offset, has_more}.
   userPrompts: (id, { limit = 50, offset = 0 } = {}) =>

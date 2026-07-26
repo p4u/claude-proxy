@@ -250,26 +250,24 @@ out. Users start with **no limit**, so this changes nothing until you set one.
 **Set a limit** from the web UI (Users page → *Edit limit*), or from the CLI:
 
 ```bash
-claude-proxy users limit utok_xxx --units 5M --window 24h   # 5 million units per rolling 24h
+claude-proxy users limit utok_xxx --tokens 1M --window 24h  # 1M output tokens per rolling 24h
 claude-proxy users limit utok_xxx --none                     # remove the limit
-claude-proxy users list                                      # LIMIT and USAGE columns
+claude-proxy users list                                      # LIMIT and USED columns
 ```
 
-`--units` accepts `K`/`M`/`G` shorthand (`500K`, `5M`, `1.5M`); `--window` uses
+`--tokens` accepts `K`/`M`/`G` shorthand (`500K`, `1M`, `1.5M`); `--window` uses
 the usual period vocabulary (`1h`, `6h`, `24h`, `7d`, `30d`).
 
-**What is a "unit"?** Tokens are not equally expensive, so the cap counts
-weighted units rather than raw tokens:
+**What is counted?** Output tokens, and nothing else. Input, cache writes and
+cache reads are ignored — cache reads in particular run hundreds of times larger
+than output on a normal Claude Code workload, so including them produced a
+number nobody could reason about. Output tokens are the figure already shown on
+the dashboard, so a cap can be picked by looking at it. The *Edit limit* modal
+shows the user's current output tokens over the selected window while you type,
+so the cap is set against real traffic rather than a guess.
 
-```
-units = output × 5    +  input × 1
-      + cache write × 1.25  +  cache read × 0.1
-```
-
-That is, a limit of `5M` units is roughly a million output tokens' worth of
-spend, or five million input tokens' worth, or any mix in between. The window is
-rolling — there is no reset hour to burst against; usage falls off continuously
-as individual requests pass out of the window.
+The window is rolling — there is no reset hour to burst against; usage falls off
+continuously as individual requests pass out of the window.
 
 **What the user sees** when they are over the cap — a standard Anthropic-shaped
 rate-limit error, so Claude Code handles it the way it handles any 429:
@@ -280,7 +278,7 @@ Retry-After: 11520
 X-Router-Reason: user-quota
 
 {"type":"error","error":{"type":"rate_limit_error","message":
- "proxy: usage limit reached - 5,000,000 units per 24h (used 5,204,118). Resets at 2026-07-25 14:32 UTC (in 3h 12m)."}}
+ "proxy: usage limit reached - 1,000,000 output tokens per 24h (used 1,043,882). Resets at 2026-07-25 14:32 UTC (in 3h 12m)."}}
 ```
 
 `Retry-After` and the reset time are computed exactly — they are the moment
@@ -597,7 +595,7 @@ claude-proxy users list
 claude-proxy users stats         [<id>] [--period 1h|6h|24h|7d|30d]
 claude-proxy users token         <id>
 claude-proxy users disable|enable|rm|refresh  <id>
-claude-proxy users limit         <id> --units 5M --window 24h | --none
+claude-proxy users limit         <id> --tokens 1M --window 24h | --none
 ```
 
 `--auth-token` falls back to `CLAUDE_PROXY_AUTH_TOKEN` env var. All `creds`

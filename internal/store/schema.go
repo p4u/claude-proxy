@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS user_tokens (
   full_capture INTEGER NOT NULL DEFAULT 0,
   -- Per-user usage cap in weighted billable units over a rolling window.
   -- A limit is active only when BOTH are > 0; 0 => unlimited (the default).
-  limit_units          INTEGER NOT NULL DEFAULT 0,
+  limit_output_tokens  INTEGER NOT NULL DEFAULT 0,
   limit_window_seconds INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_user_tokens_token  ON user_tokens(token);

@@ -34,15 +34,18 @@ export async function render(root) {
   }
 }
 
+const CACHE_READ_HELP =
+  "Cache-read tokens over the selected period. Usually the largest number here by far, " +
+  "and deliberately NOT counted towards the usage limit.";
+
 const CAPTURE_HELP =
   "Full capture stores both sides of every conversation, including pasted file contents. " +
   "Off (the default) keeps only the last user prompt of each request.";
 
-// The weighting is defined once on the backend; keep this string in sync with it.
-const UNITS_FORMULA = "units = output×5 + input×1 + cache write×1.25 + cache read×0.1";
+const LIMIT_METRIC = "Counts output tokens only — input and cache tokens are ignored.";
 const LIMIT_HELP =
-  "Blocks a user once their weighted usage over a rolling window exceeds the cap. " +
-  UNITS_FORMULA + ". No limit by default.";
+  "Blocks a user once their output tokens over a rolling window exceed the cap. " +
+  LIMIT_METRIC + " No limit by default.";
 
 // Window presets, matching the period vocabulary used elsewhere in the app.
 const LIMIT_WINDOWS = [
@@ -62,27 +65,27 @@ function windowShort(sec) {
   return Math.max(0, Math.round(s / 60)) + "m";
 }
 
-// A limit is active only when BOTH units and window are > 0.
+// A limit is active only when BOTH the token cap and the window are > 0.
 function hasLimit(u) {
-  return Number(u.limit_units) > 0 && Number(u.limit_window_seconds) > 0;
+  return Number(u.limit_output_tokens) > 0 && Number(u.limit_window_seconds) > 0;
 }
 
-// "5M" / "500k" / "1.5M" / "5,000,000" / "5000000" → integer units.
+// "1M" / "500k" / "1.5M" / "1,000,000" / "1000000" → integer output tokens.
 // Returns {value} or {error}. Empty input is an error, not a silent zero.
-export function parseUnits(raw) {
+export function parseTokens(raw) {
   const s = String(raw == null ? "" : raw).trim().replace(/[,_\s]/g, "");
-  if (!s) return { error: "Enter a number of units, e.g. 5M." };
+  if (!s) return { error: "Enter a number of output tokens, e.g. 1M." };
   const m = /^(-?\d+(?:\.\d+)?)([kmgKMG]?)$/.exec(s);
-  if (!m) return { error: "Use a plain number or a K/M/G shorthand, e.g. 5M or 500K." };
+  if (!m) return { error: "Use a plain number or a K/M/G shorthand, e.g. 1M or 500K." };
   const mult = { k: 1e3, m: 1e6, g: 1e9 }[m[2].toLowerCase()] || 1;
   const n = Number(m[1]) * mult;
   if (!isFinite(n)) return { error: "That number is too large." };
-  if (n < 0) return { error: "Units can't be negative." };
+  if (n < 0) return { error: "The cap can't be negative." };
   return { value: Math.round(n) };
 }
 
-// Prefill text for the units input: shorthand when it round-trips exactly.
-function unitsToInput(n) {
+// Prefill text for the token input: shorthand when it round-trips exactly.
+function tokensToInput(n) {
   const v = Number(n) || 0;
   if (v <= 0) return "";
   for (const [div, sfx] of [[1e9, "G"], [1e6, "M"], [1e3, "K"]]) {
@@ -109,13 +112,13 @@ function limitCell(u) {
       title: "This user is unlimited — the default. Use Limit to cap their usage.",
     });
   }
-  const cap = Number(u.limit_units) || 0;
-  const used = Number(u.usage_units) || 0;
+  const cap = Number(u.limit_output_tokens) || 0;
+  const used = Number(u.usage_output_tokens) || 0;
   const rawPct = u.usage_pct != null ? Number(u.usage_pct) : cap ? (used / cap) * 100 : 0;
   const blocked = !!u.blocked;
   const tone = blocked || rawPct >= 100 ? "critical" : rawPct >= 80 ? "warning" : "good";
   const until = blocked ? clockTime(u.blocked_until) : "";
-  const label = `${compactNum(used)} / ${compactNum(cap)} units`;
+  const label = `${compactNum(used)} / ${compactNum(cap)} output`;
   const bar = meter({
     label,
     value: rawPct,
@@ -140,7 +143,7 @@ function limitCell(u) {
     }),
   ]);
   wrap.title =
-    `${fullNum(used)} of ${fullNum(cap)} units used in the last ${windowShort(u.limit_window_seconds)}` +
+    `${fullNum(used)} of ${fullNum(cap)} output tokens used in the last ${windowShort(u.limit_window_seconds)}` +
     (blocked && until ? ` — blocked until ${until}` : "");
   return wrap;
 }
@@ -158,7 +161,12 @@ function buildTable(users, statById, root) {
       el("span", { class: "th-info", "aria-hidden": "true", text: "?" }),
     ]),
     th("Requests", "num"), th("Errors", "num"),
-    th("Tokens in", "num"), th("Tokens out", "num"), th("Avg latency", "num"),
+    th("Tokens in", "num"), th("Tokens out", "num"),
+    el("th", { class: "num", title: CACHE_READ_HELP }, [
+      el("span", { text: "Cache read" }),
+      el("span", { class: "th-info", "aria-hidden": "true", text: "?" }),
+    ]),
+    th("Avg latency", "num"),
     th("Last used"), th("", "actions"),
   ])));
   const tb = el("tbody");
@@ -224,6 +232,11 @@ function userRow(u, s, root) {
     el("td", { class: "num " + errTone, text: fullNum(s.errors || 0) }),
     el("td", { class: "num", text: compactNum(s.tokens_in || 0) }),
     el("td", { class: "num", text: compactNum(s.tokens_out || 0) }),
+    el("td", {
+      class: "num cell-muted",
+      text: compactNum(s.cache_read || 0),
+      title: `${fullNum(s.cache_read || 0)} cache-read tokens — not counted towards the usage limit`,
+    }),
     el("td", { class: "num", text: s.avg_latency_ms ? ms(s.avg_latency_ms) : "—" }),
     el("td", { text: u.last_used_at ? relTime(tsOf(u.last_used_at)) : "never" }),
     el("td", { class: "actions" }, actions),
@@ -275,24 +288,28 @@ function createModal(root) {
 }
 
 // Edit the rolling usage limit for one user.
-// Units accept K/M/G shorthand and echo the parsed value back so the operator
-// never has to guess what was understood. Only the two client-side rules are
-// enforced here (unparseable input, negatives) — everything else, including the
-// backend's both-or-neither rule, is surfaced inline from the server's 400.
+// The cap accepts K/M/G shorthand and echoes the parsed value back so the
+// operator never has to guess what was understood. Crucially it also shows what
+// this user ACTUALLY produces over the selected window, refetched whenever the
+// window changes: without that number a cap is a blind guess. Only the two
+// client-side rules are enforced here (unparseable input, negatives) —
+// everything else, including the backend's both-or-neither rule, is surfaced
+// inline from the server's 400.
 function limitModal(u, root) {
   const active = hasLimit(u);
   const err = el("p", { class: "form-err", role: "alert" });
   const echo = el("p", { class: "limit-echo" });
+  const usageLine = el("p", { class: "limit-usage", "aria-live": "polite" });
 
-  const unitsInput = el("input", {
+  const capInput = el("input", {
     class: "input",
     type: "text",
     inputmode: "decimal",
     autocomplete: "off",
     spellcheck: "false",
-    id: "limit-units",
-    placeholder: "e.g. 5M",
-    value: active ? unitsToInput(u.limit_units) : "",
+    id: "limit-output-tokens",
+    placeholder: "e.g. 1M",
+    value: active ? tokensToInput(u.limit_output_tokens) : "",
   });
 
   let windowSec = active ? Number(u.limit_window_seconds) || DEFAULT_WINDOW : DEFAULT_WINDOW;
@@ -303,6 +320,7 @@ function limitModal(u, root) {
       windowSec = Number(v);
       clearErr();
       paintEcho();
+      loadUsage();
     },
     "Rolling window"
   );
@@ -314,35 +332,59 @@ function limitModal(u, root) {
     err.textContent = msg;
   };
   const paintEcho = () => {
-    const raw = unitsInput.value.trim();
+    const raw = capInput.value.trim();
     if (!raw) {
       echo.textContent = "";
       return;
     }
-    const p = parseUnits(raw);
+    const p = parseTokens(raw);
     echo.textContent = p.error
       ? ""
-      : `= ${fullNum(p.value)} units per ${windowShort(windowSec)}`;
+      : `= ${fullNum(p.value)} output tokens per ${windowShort(windowSec)}`;
   };
-  unitsInput.addEventListener("input", () => {
+  capInput.addEventListener("input", () => {
     clearErr();
     paintEcho();
   });
   paintEcho();
 
+  // Current usage for the selected window. `seq` drops out-of-order responses
+  // when the operator flips presets faster than the requests come back.
+  let seq = 0;
+  async function loadUsage() {
+    const mine = ++seq;
+    const win = windowSec;
+    usageLine.classList.remove("is-error");
+    usageLine.textContent = `Checking usage over the last ${windowShort(win)}…`;
+    try {
+      const r = await api.userWindowUsage(u.id, win);
+      if (mine !== seq) return;
+      const used = Number(r && r.output_tokens) || 0;
+      usageLine.textContent =
+        `${u.name} used ${compactNum(used)} output tokens in the last ${windowShort(win)}` +
+        ` (${fullNum(used)}). Pick a cap above that if you only want to stop runaways.`;
+    } catch (e) {
+      if (mine !== seq) return;
+      usageLine.classList.add("is-error");
+      usageLine.textContent = `Couldn't read current usage: ${e.message}`;
+    }
+  }
+  loadUsage();
+
   const save = async () => {
-    const p = parseUnits(unitsInput.value);
+    const p = parseTokens(capInput.value);
     if (p.error) return showErr(p.error);
     await submit(p.value, windowSec, `Limit set for ${u.name}`);
   };
 
-  async function submit(units, windowSeconds, okMsg) {
+  async function submit(outputTokens, windowSeconds, okMsg) {
     clearErr();
     saveBtn.disabled = true;
     clearBtn.disabled = true;
     try {
-      const r = await api.setUserLimit(u.id, { units, windowSeconds });
-      u.limit_units = r && r.limit_units != null ? r.limit_units : units;
+      const r = await api.setUserLimit(u.id, { outputTokens, windowSeconds });
+      u.limit_output_tokens =
+        r && r.limit_output_tokens != null ? r.limit_output_tokens : outputTokens;
       u.limit_window_seconds = r && r.limit_window_seconds != null ? r.limit_window_seconds : windowSeconds;
       m.close();
       toast(okMsg, "good");
@@ -350,7 +392,7 @@ function limitModal(u, root) {
     } catch (e) {
       // Inline, not just a toast: the message explains what to change.
       showErr(e.message);
-      unitsInput.focus();
+      capInput.focus();
     } finally {
       saveBtn.disabled = false;
       clearBtn.disabled = false;
@@ -365,7 +407,7 @@ function limitModal(u, root) {
     onClick: () => submit(0, 0, `${u.name} is now unlimited`),
   });
 
-  unitsInput.addEventListener("keydown", (e) => {
+  capInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
       e.preventDefault();
       save();
@@ -374,33 +416,34 @@ function limitModal(u, root) {
 
   const body = el("div", { class: "form limit-form" }, [
     el("div", { class: "form-row" }, [
-      el("label", { class: "field-label", for: "limit-units", text: "Units" }),
-      unitsInput,
+      el("label", { class: "field-label", for: "limit-output-tokens", text: "Output tokens" }),
+      capInput,
       echo,
     ]),
     el("div", { class: "form-row" }, [
       el("span", { class: "field-label", text: "Rolling window" }),
       windowSeg,
+      usageLine,
       el("p", {
         class: "limit-hint",
         text: "Usage is summed over the trailing window. There is no reset moment — the oldest usage simply ages out.",
       }),
     ]),
-    el("p", { class: "limit-formula", text: UNITS_FORMULA }),
+    el("p", { class: "limit-formula", text: LIMIT_METRIC }),
     err,
   ]);
 
   const m = modal({
     title: `Usage limit · ${u.name}`,
     subtitle: active
-      ? `Currently ${compactNum(u.limit_units)} units per ${windowShort(u.limit_window_seconds)} — ` +
-        `${compactNum(u.usage_units || 0)} used so far` +
+      ? `Currently ${compactNum(u.limit_output_tokens)} output tokens per ${windowShort(u.limit_window_seconds)} — ` +
+        `${compactNum(u.usage_output_tokens || 0)} used so far` +
         (u.blocked ? `, blocked until ${clockTime(u.blocked_until) || "the window clears"}.` : ".")
-      : "This user has no limit. Set one to cap their weighted usage.",
+      : "This user has no limit. Set one to cap the output tokens they can produce.",
     body,
     actions: [button("Cancel", { onClick: () => m.close() }), clearBtn, saveBtn],
   });
-  requestAnimationFrame(() => unitsInput.focus());
+  requestAnimationFrame(() => capInput.focus());
 }
 
 // Per-user capture switch. Optimistic: flip immediately, revert on failure.

@@ -31,9 +31,9 @@ type UserToken struct {
 	// FullCapture opts this user into whole-conversation capture (both roles,
 	// stored in conversation_message). Default false = last-user-prompt only.
 	FullCapture bool
-	// LimitUnits / LimitWindowSeconds cap the user's weighted billable units
-	// over a rolling window. A limit is active only when BOTH are > 0.
-	LimitUnits         int64
+	// LimitOutputTokens / LimitWindowSeconds cap the user's output tokens over
+	// a rolling window. A limit is active only when BOTH are > 0.
+	LimitOutputTokens  int64
 	LimitWindowSeconds int64
 }
 
@@ -50,7 +50,7 @@ type Identity struct {
 	FullCapture bool // user opted into whole-conversation capture
 	// Usage limit carried through from the token row so enforcement needs no
 	// extra lookup. Both > 0 => a limit is active.
-	LimitUnits         int64
+	LimitOutputTokens  int64
 	LimitWindowSeconds int64
 }
 
@@ -101,7 +101,7 @@ func Create(ctx context.Context, db *store.DB, name string) (*UserToken, error) 
 func List(ctx context.Context, db *store.DB) ([]*UserToken, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT id, name, token, status, created_at, last_used_at, full_capture,
-		       limit_units, limit_window_seconds
+		       limit_output_tokens, limit_window_seconds
 		FROM user_tokens ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -122,7 +122,7 @@ func List(ctx context.Context, db *store.DB) ([]*UserToken, error) {
 func Get(ctx context.Context, db *store.DB, id string) (*UserToken, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT id, name, token, status, created_at, last_used_at, full_capture,
-		       limit_units, limit_window_seconds
+		       limit_output_tokens, limit_window_seconds
 		FROM user_tokens WHERE id=?`, id)
 	if err != nil {
 		return nil, err
@@ -138,7 +138,7 @@ func Get(ctx context.Context, db *store.DB, id string) (*UserToken, error) {
 func LookupByToken(ctx context.Context, db *store.DB, token string) (*UserToken, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT id, name, token, status, created_at, last_used_at, full_capture,
-		       limit_units, limit_window_seconds
+		       limit_output_tokens, limit_window_seconds
 		FROM user_tokens WHERE token=?`, token)
 	if err != nil {
 		return nil, err
@@ -228,7 +228,7 @@ func scan(rs interface{ Scan(...any) error }) (*UserToken, error) {
 	var lu sql.NullInt64
 	var status string
 	if err := rs.Scan(&ut.ID, &ut.Name, &ut.Token, &status, &created, &lu, &ut.FullCapture,
-		&ut.LimitUnits, &ut.LimitWindowSeconds); err != nil {
+		&ut.LimitOutputTokens, &ut.LimitWindowSeconds); err != nil {
 		return nil, err
 	}
 	ut.Status = Status(status)

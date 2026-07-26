@@ -13,34 +13,35 @@ const CREDS = [
 // full_capture and the usage limit are mutated in place by
 // POST /users/{id}/capture and POST /users/{id}/limit, so both toggles stay
 // stateful for the whole mock session.
-// `usage_units` is fixed traffic; the limit is what the operator edits, so
-// usage_pct/blocked are always derived — editing a limit visibly moves the meter.
-// The four users cover every limit state: healthy, near-limit, unlimited, blocked.
+// `usage_output_tokens` is fixed traffic; the limit is what the operator edits,
+// so usage_pct/blocked are always derived — editing a limit visibly moves the
+// meter. The four users cover every limit state: healthy, near-limit,
+// unlimited, blocked.
 const USERS = [
   { id: "utok_alice", name: "alice", status: "active", full_capture: true,
-    limit_units: 5_000_000, limit_window_seconds: 86400, usage_units: 1_512_400 },     // ~30%
+    limit_output_tokens: 1_000_000, limit_window_seconds: 86400, usage_output_tokens: 302_400 },  // ~30%
   { id: "utok_bob", name: "bob", status: "active", full_capture: false,
-    limit_units: 2_000_000, limit_window_seconds: 21600, usage_units: 1_724_900 },     // ~86%
+    limit_output_tokens: 400_000, limit_window_seconds: 21600, usage_output_tokens: 344_900 },    // ~86%
   { id: "utok_carol", name: "carol", status: "disabled", full_capture: false,
-    limit_units: 0, limit_window_seconds: 0, usage_units: 0 },                          // unlimited
+    limit_output_tokens: 0, limit_window_seconds: 0, usage_output_tokens: 0 },                     // unlimited
   { id: "utok_ci", name: "ci-runner", status: "active", full_capture: false,
-    limit_units: 500_000, limit_window_seconds: 3600, usage_units: 612_400 },          // ~122%, blocked
+    limit_output_tokens: 100_000, limit_window_seconds: 3600, usage_output_tokens: 122_400 },     // ~122%, blocked
 ];
 
 // Derived limit fields, mirroring the backend contract: usage/pct/blocked are 0
 // or null when unlimited, and blocked_until is non-null ONLY while blocked
 // (rolling windows have no reset instant to report otherwise).
 function limitFields(u) {
-  const active = u.limit_units > 0 && u.limit_window_seconds > 0;
+  const active = u.limit_output_tokens > 0 && u.limit_window_seconds > 0;
   if (!active) {
-    return { limit_units: 0, limit_window_seconds: 0, usage_units: 0, usage_pct: 0, blocked: false, blocked_until: null };
+    return { limit_output_tokens: 0, limit_window_seconds: 0, usage_output_tokens: 0, usage_pct: 0, blocked: false, blocked_until: null };
   }
-  const pct = (u.usage_units / u.limit_units) * 100;
+  const pct = (u.usage_output_tokens / u.limit_output_tokens) * 100;
   const blocked = pct >= 100;
   return {
-    limit_units: u.limit_units,
+    limit_output_tokens: u.limit_output_tokens,
     limit_window_seconds: u.limit_window_seconds,
-    usage_units: u.usage_units,
+    usage_output_tokens: u.usage_output_tokens,
     usage_pct: Math.round(pct * 10) / 10,
     blocked,
     // ~22 minutes out: near-future, so the HH:MM render is easy to eyeball.
@@ -399,26 +400,26 @@ window.fetch = async (input, init = {}) => {
     }
 
     // Per-user usage limit — stateful, and validated exactly like the backend:
-    // negatives are rejected, and units/window must be both set or both zero.
-    // (Entering units 0 with a window selected is the reachable path that
-    // exercises the inline 400 in the UI.)
+    // negatives are rejected, and tokens/window must be both set or both zero.
+    // (Entering 0 output tokens with a window selected is the reachable path
+    // that exercises the inline 400 in the UI.)
     const lm = path.match(/^\/users\/([^/]+)\/limit$/);
     if (lm && method === "POST") {
       const u = userById(decodeURIComponent(lm[1]));
       if (!u) return json({ error: "unknown user" }, 404);
       const b = JSON.parse(init.body || "{}");
-      const units = Math.trunc(Number(b.units) || 0);
+      const out = Math.trunc(Number(b.output_tokens) || 0);
       const win = Math.trunc(Number(b.window_seconds) || 0);
-      if (units < 0 || win < 0) return json({ error: "units and window_seconds must not be negative" }, 400);
-      if ((units === 0) !== (win === 0)) {
+      if (out < 0 || win < 0) return json({ error: "output_tokens and window_seconds must not be negative" }, 400);
+      if ((out === 0) !== (win === 0)) {
         return json(
-          { error: "both units and window_seconds are required to set a limit; send both as 0 to clear it" },
+          { error: "both output_tokens and window_seconds are required to set a limit; send both as 0 to clear it" },
           400
         );
       }
-      u.limit_units = units;
+      u.limit_output_tokens = out;
       u.limit_window_seconds = win;
-      return json({ ok: true, limit_units: units, limit_window_seconds: win });
+      return json({ ok: true, limit_output_tokens: out, limit_window_seconds: win });
     }
     return json({ ok: true });
   }
@@ -436,6 +437,22 @@ window.fetch = async (input, init = {}) => {
     if (!usr) return json({ error: "unknown user" }, 404);
     // carol has no traffic → exercises the empty state.
     return json(envelope(PROMPT_TOTALS[usr.id] || 0, u.searchParams, 50, (i) => promptRow(usr, i)));
+  }
+
+  // Dynamic route: output tokens over an arbitrary rolling window, used by the
+  // Edit limit modal. Scaled from the fixture's own window so switching the
+  // preset visibly changes the number.
+  const um = path.match(/^\/users\/([^/]+)\/usage$/);
+  if (um) {
+    const usr = userById(decodeURIComponent(um[1]));
+    if (!usr) return json({ error: "unknown user" }, 404);
+    const secs = Math.trunc(Number(u.searchParams.get("window_seconds")) || 0);
+    if (secs <= 0) return json({ error: "window_seconds must be a positive integer" }, 400);
+    const baseWin = usr.limit_window_seconds || 86400;
+    const baseUse = usr.usage_output_tokens || Math.round(baseWin * 4.2);
+    // Sub-linear with window length: traffic is bursty, not uniform.
+    const scaled = Math.round(baseUse * Math.pow(secs / baseWin, 0.7));
+    return json({ id: usr.id, window_seconds: secs, output_tokens: scaled });
   }
 
   // Dynamic route: per-user conversations, newest last_ts first.
