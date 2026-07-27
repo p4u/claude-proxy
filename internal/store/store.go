@@ -3,20 +3,56 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+// maxOpenConns bounds how many connections may contend for the single write
+// lock. SQLite serialises writers regardless, so an unbounded pool does not buy
+// throughput — it just deepens the queue every writer must outwait within
+// busyTimeout. The cap sits comfortably above the number of concurrent readers
+// the dashboard's aggregation queries need.
+const maxOpenConns = 8
+
+// busyTimeout is how long a blocked writer retries before returning
+// SQLITE_BUSY. It must exceed the longest single write in the system; the
+// retention janitor deletes in bounded batches specifically so that holds.
+const busyTimeout = 15 * time.Second
 
 type DB struct {
 	*sql.DB
 }
 
 func Open(path string) (*DB, error) {
-	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)", path)
+	// _txlock=immediate makes every explicit transaction take the write lock at
+	// BEGIN. Without it, a transaction that reads before it writes (pool.Bind,
+	// creds.Delete) pins a read snapshot, and any commit by another connection
+	// in the gap makes the later write fail with SQLITE_BUSY_SNAPSHOT —
+	// immediately and unconditionally, because no amount of waiting can rescue
+	// a stale snapshot. busy_timeout is never consulted for that error, so
+	// taking the lock up front is the only fix.
+	//
+	// synchronous=NORMAL is the standard pairing for WAL: commits stop fsyncing
+	// individually (durability narrows to "the last commits may be lost on
+	// power loss", never corruption), which shortens every write-lock hold and
+	// so shrinks the window in which anyone else can collide.
+	dsn := fmt.Sprintf(
+		"file:%s?_txlock=immediate"+
+			"&_pragma=journal_mode(WAL)"+
+			"&_pragma=synchronous(NORMAL)"+
+			"&_pragma=busy_timeout(%d)"+
+			"&_pragma=foreign_keys(1)",
+		path, busyTimeout.Milliseconds())
 	sdb, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
+	sdb.SetMaxOpenConns(maxOpenConns)
+	// Idle count matches the open cap: every new connection re-runs the DSN
+	// pragmas, so recycling connections is pure overhead here.
+	sdb.SetMaxIdleConns(maxOpenConns)
+	sdb.SetConnMaxIdleTime(5 * time.Minute)
 	if err := sdb.Ping(); err != nil {
 		_ = sdb.Close()
 		return nil, err

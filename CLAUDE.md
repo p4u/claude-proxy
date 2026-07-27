@@ -75,7 +75,7 @@ Claude Code (ANTHROPIC_BASE_URL → proxy)
 | `internal/pool/` | Usage-aware weighted-random selection + sticky conversation→credential binding |
 | `internal/creds/` | Credential model, status management, proactive/reactive token refresh |
 | `internal/router/` | Conversation key derivation |
-| `internal/store/` | SQLite wrapper, schema, migrations (WAL mode) |
+| `internal/store/` | SQLite wrapper, schema, migrations (WAL mode), lock-contention retry |
 | `internal/ingest/` | OAuth `.credentials.json` parser/importer |
 | `internal/admin/` | Admin REST API (`/admin/*` routes) |
 | `internal/usertoken/` | Named per-user bearer tokens; request identity (`Identity{IsAdmin,FullCapture,...}` in context); output-token usage limits (`limit.go`) |
@@ -101,6 +101,43 @@ Claude Code (ANTHROPIC_BASE_URL → proxy)
 ### Storage Schema (SQLite)
 
 Eight tables (`internal/store/schema.go`): `credentials`, `conversations`, `rr_cursor` (legacy round-robin state), `user_tokens` (named bearer tokens, plus the per-user usage cap `limit_output_tokens` / `limit_window_seconds`, `0` = unlimited), `request_log` (one row per forwarded request, for per-user stats), `usage_history` (utilization snapshots driving selection), `prompt_log` (last user prompt per `POST /v1/messages`, `user_token_id` FK `ON DELETE SET NULL`; never stores responses, gated + retained by `CLAUDE_PROXY_PROMPT_RETENTION_DAYS`, captured in `internal/proxy/promptcapture.go` and pruned by its hourly janitor), `conversation_message` (opt-in whole-conversation capture: `UNIQUE(conv_id, seq)` where `seq` is the message's index in the request's `messages` array, so re-sent history is idempotent; same retention window and janitor as `prompt_log`). Deleting a credential cascades to `usage_history` (`ON DELETE CASCADE`); `conversations` bindings are cleared inside `creds.Delete`'s transaction, since older DBs created that FK without a cascade clause. `request_log` additionally carries per-request token usage columns (`model`, `input_tokens`, `output_tokens`, `cache_creation_tokens`, `cache_read_tokens`), added via the existing swallow-duplicate `ALTER TABLE` migration mechanism and populated by `internal/proxy/usagecapture.go` from the tee'd response stream (SSE and non-streaming JSON) — this feeds the web UI's token stats and never affects what the client receives. Core dependency: `modernc.org/sqlite` (pure Go, no CGO required); `guptarohit/asciigraph` for usage charts and `charmbracelet/bubbletea`+`lipgloss`+`bubbles` for the management TUI.
+
+### Write contention (`internal/store/store.go`, `retry.go`)
+
+SQLite allows exactly one writer at a time, and this proxy has many: the request
+logger, the prompt/conversation capture writers, the usage poller, the pool and
+credential janitors, and any `claude-proxy` CLI or TUI run against the same file
+from another process. Losing a write race is normal; the connection is
+configured so that losing one is survivable.
+
+**`_txlock=immediate` is the load-bearing setting.** Every explicit transaction
+takes the write lock at `BEGIN`. Without it, a transaction that reads before it
+writes — `pool.Bind`, `creds.Delete` — pins a read snapshot, and any commit by
+another connection in the gap makes the later write fail with
+`SQLITE_BUSY_SNAPSHOT`. That error is returned **instantly and unconditionally**:
+`busy_timeout` is never consulted, because no amount of waiting can make a stale
+snapshot valid again. It surfaced to clients as `502 proxy: database is locked`,
+since `Bind` is the only DB failure `failBind` maps to a 502. Taking the lock up
+front converts that unretryable error into an ordinary wait.
+`TestDeferredTxFailsOnConcurrentCommit` pins the hazard and
+`TestConcurrentBindShapedWritesSucceed` pins the fix — the latter fails within
+seconds if the DSN reverts to deferred.
+
+Supporting settings: `synchronous=NORMAL` (the standard WAL pairing — durability
+narrows to "the last commits may be lost on power loss", never corruption — and
+dropping the per-commit fsync shortens every lock hold), `busy_timeout` 15s,
+`SetMaxOpenConns(8)` (writers serialise anyway, so an unbounded pool only
+deepens the queue each writer must outwait). `store.Retry` re-runs a
+self-contained transaction on `store.IsBusy` with jittered backoff — jitter
+matters, since writers backing off on identical schedules keep colliding on
+identical schedules. `Bind` is wrapped in it; `ErrNoCredentials` and
+`ErrCredentialOrphaned` are not busy errors, so they still fail fast.
+
+**Deletes are batched, not unbounded.** `purgeExpired` removes retention-expired
+rows `purgeBatch` at a time with a pause between batches. One unbounded `DELETE`
+over a retention window holds the write lock for as long as it takes to finish,
+which is precisely how a background janitor starves live requests past their
+busy timeout.
 
 ## Configuration
 

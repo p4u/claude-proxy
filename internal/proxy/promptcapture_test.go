@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -102,5 +103,60 @@ func TestExtractPromptNoUser(t *testing.T) {
 	}
 	if _, _, ok := extractPrompt([]byte(`{"messages":[{"role":"user","content":[{"type":"image"}]}]}`)); ok {
 		t.Fatal("expected ok=false when no text block present")
+	}
+}
+
+// The retention purge deletes in bounded batches so it never holds the write
+// lock long enough to starve in-flight requests. Batching is only correct if it
+// still removes everything expired, including the rows past the first batch,
+// and still leaves everything inside the window alone.
+func TestPurgeExpiredDeletesAcrossBatches(t *testing.T) {
+	_, _, db, _ := setupProxy(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := context.Background()
+
+	const (
+		expired = purgeBatch*2 + 37 // spans three batches, the last one short
+		fresh   = 10
+	)
+	cutoff := int64(1_000_000)
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	for i := range expired {
+		if _, err := tx.Exec(
+			`INSERT INTO prompt_log (conv_id, ts, model, prompt) VALUES (?, ?, 'm', 'p')`,
+			fmt.Sprintf("old-%d", i), cutoff-1); err != nil {
+			t.Fatalf("seed expired: %v", err)
+		}
+	}
+	for i := range fresh {
+		if _, err := tx.Exec(
+			`INSERT INTO prompt_log (conv_id, ts, model, prompt) VALUES (?, ?, 'm', 'p')`,
+			fmt.Sprintf("new-%d", i), cutoff); err != nil {
+			t.Fatalf("seed fresh: %v", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	if err := purgeExpired(ctx, db, "prompt_log", cutoff); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+
+	var remaining, stale int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM prompt_log`).Scan(&remaining); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM prompt_log WHERE ts < ?`, cutoff).Scan(&stale); err != nil {
+		t.Fatalf("count stale: %v", err)
+	}
+	if stale != 0 {
+		t.Fatalf("%d expired rows survived the purge", stale)
+	}
+	if remaining != fresh {
+		t.Fatalf("remaining = %d, want %d (rows inside the window must be kept)", remaining, fresh)
 	}
 }

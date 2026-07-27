@@ -36,10 +36,30 @@ func NewWithLogger(db *store.DB, log *slog.Logger) *Pool {
 
 // Bind returns the credential to use for this conversation, creating the
 // sticky binding on first sight. It also bumps last_seen_at + request_count.
+//
+// A lock error here is the one database failure the proxy reports to the client
+// as a 502, so it is retried rather than surfaced. p.mu only serialises this
+// process; the request logger, the capture writers, the usage poller and any
+// concurrently running CLI or TUI all write to the same file, so losing a race
+// is normal and transient. bindOnce is a self-contained transaction that rolls
+// back whole, which is what makes re-running it safe.
 func (p *Pool) Bind(ctx context.Context, convID string) (*creds.Credential, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	var (
+		c     *creds.Credential
+		isNew bool
+	)
+	err := store.Retry(ctx, func() error {
+		var err error
+		c, isNew, err = p.bindOnce(ctx, convID)
+		return err
+	})
+	return c, isNew, err
+}
+
+func (p *Pool) bindOnce(ctx context.Context, convID string) (*creds.Credential, bool, error) {
 	tx, err := p.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, false, err

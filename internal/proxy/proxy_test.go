@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -73,6 +74,56 @@ func setupProxy(t *testing.T, upstreamHandler http.HandlerFunc) (*Handler, []*cr
 	h := New(db, pool.New(db), creds.NewRefresher(db), logger)
 	withUpstream(h, ts)
 	return h, cs, db, ts
+}
+
+// The symptom users reported: "502 proxy: database is locked (5) (SQLITE_BUSY)".
+// pool.Bind is the only database failure failBind maps to a 502, and it loses
+// lock races against every other writer in the process. Concurrent traffic
+// across many conversations must never produce one.
+func TestConcurrentRequestsNeverReturn502DatabaseLocked(t *testing.T) {
+	h, _, _, _ := setupProxy(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		fmt.Fprintln(w, `{"ok":true}`)
+	})
+	// Prompt capture on, so each request also writes prompt_log — more writers
+	// contending, which is the realistic configuration.
+	h.PromptRetentionDays = 7
+
+	const (
+		workers      = 8
+		perWorker    = 15
+		bodyTemplate = `{"model":"claude-y","metadata":{"user_id":%q},"messages":[{"role":"user","content":"hi"}]}`
+	)
+	var (
+		wg  sync.WaitGroup
+		mu  sync.Mutex
+		bad []string
+	)
+	for w := range workers {
+		wg.Go(func() {
+			for i := range perWorker {
+				// Distinct conversations force new bindings (the INSERT path),
+				// which is where the read-then-write transaction bites.
+				payload := fmt.Sprintf(bodyTemplate, fmt.Sprintf("conv-%d-%d", w, i))
+				rw := httptest.NewRecorder()
+				h.ServeHTTP(rw, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(payload)))
+				if rw.Code != 200 {
+					mu.Lock()
+					bad = append(bad, fmt.Sprintf("status=%d body=%s", rw.Code, strings.TrimSpace(rw.Body.String())))
+					mu.Unlock()
+				}
+			}
+		})
+	}
+	wg.Wait()
+
+	if len(bad) > 0 {
+		for _, b := range bad[:min(len(bad), 5)] {
+			t.Errorf("request failed: %s", b)
+		}
+		t.Fatalf("%d of %d concurrent requests failed", len(bad), workers*perWorker)
+	}
 }
 
 func TestForwardSuccessAndStickyBind(t *testing.T) {

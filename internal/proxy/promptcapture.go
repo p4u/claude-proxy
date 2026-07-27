@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -241,6 +242,39 @@ func (h *Handler) insertMessage(ctx context.Context, convID string, seq int, rol
 	}
 }
 
+// purgeBatch is how many expired rows one DELETE removes. A single unbounded
+// DELETE over a retention window's worth of rows holds the write lock for as
+// long as it takes to remove them all, and every proxied request needs that
+// same lock — long enough and they exhaust their busy timeout and fail. Small
+// batches keep each lock hold short and let live traffic interleave; the pause
+// between them guarantees waiting writers actually get a turn rather than
+// losing every race to the janitor's next batch.
+const purgeBatch = 2000
+
+// purgeExpired deletes rows older than cutoff in bounded batches, returning
+// once the table holds nothing older. Deleting by rowid keeps each statement's
+// work proportional to the batch rather than to the table.
+func purgeExpired(ctx context.Context, db *store.DB, table string, cutoff int64) error {
+	q := fmt.Sprintf(
+		`DELETE FROM %s WHERE rowid IN (SELECT rowid FROM %s WHERE ts < ? LIMIT %d)`,
+		table, table, purgeBatch)
+	for {
+		res, err := db.ExecContext(ctx, q, cutoff)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil || n < purgeBatch {
+			return err // short batch: nothing older left
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
 // PromptJanitor deletes prompt_log and conversation_message rows older than
 // retentionDays every hour. It runs only when prompt logging is enabled
 // (retentionDays > 0).
@@ -252,11 +286,10 @@ func PromptJanitor(ctx context.Context, db *store.DB, retentionDays int, log *sl
 	defer t.Stop()
 	purge := func() {
 		cutoff := time.Now().Add(-time.Duration(retentionDays) * 24 * time.Hour).Unix()
-		if _, err := db.ExecContext(ctx, `DELETE FROM prompt_log WHERE ts < ?`, cutoff); err != nil {
-			log.Warn("prompt_log retention purge failed", "err", err)
-		}
-		if _, err := db.ExecContext(ctx, `DELETE FROM conversation_message WHERE ts < ?`, cutoff); err != nil {
-			log.Warn("conversation_message retention purge failed", "err", err)
+		for _, table := range []string{"prompt_log", "conversation_message"} {
+			if err := purgeExpired(ctx, db, table, cutoff); err != nil && ctx.Err() == nil {
+				log.Warn("retention purge failed", "table", table, "err", err)
+			}
 		}
 	}
 	purge() // sweep once at startup
