@@ -17,6 +17,9 @@ type userView struct {
 	CreatedAt   string  `json:"created_at"`
 	LastUsedAt  *string `json:"last_used_at"`
 	FullCapture bool    `json:"full_capture"`
+	// BlockSuggestions => the proxy answers Claude Code's prompt-suggestion
+	// requests locally instead of spending quota on them.
+	BlockSuggestions bool `json:"block_suggestions"`
 
 	// Usage limit (v4). 0/0 => unlimited, in which case usage_output_tokens
 	// and usage_pct are 0 and blocked_until is null.
@@ -74,6 +77,9 @@ func (s *Server) userAction(w http.ResponseWriter, r *http.Request, id, action s
 	case action == "capture" && r.Method == http.MethodPost:
 		s.setUserCapture(w, r, id)
 		return
+	case action == "suggestions" && r.Method == http.MethodPost:
+		s.setUserSuggestions(w, r, id)
+		return
 	case action == "limit" && r.Method == http.MethodPost:
 		s.setUserLimit(w, r, id)
 		return
@@ -116,6 +122,7 @@ func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {
 			Status:             string(ut.Status),
 			CreatedAt:          ut.CreatedAt.Format(time.RFC3339),
 			FullCapture:        ut.FullCapture,
+			BlockSuggestions:   ut.BlockSuggestions,
 			LimitOutputTokens:  ut.LimitOutputTokens,
 			LimitWindowSeconds: ut.LimitWindowSeconds,
 		}
@@ -163,6 +170,22 @@ func (s *Server) setUserCapture(w http.ResponseWriter, r *http.Request, id strin
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true, "full_capture": body.Full})
+}
+
+// setUserSuggestions toggles local handling of prompt-suggestion requests.
+func (s *Server) setUserSuggestions(w http.ResponseWriter, r *http.Request, id string) {
+	var body struct {
+		Block bool `json:"block"`
+	}
+	if err := decodeJSON(w, r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := usertoken.SetBlockSuggestions(r.Context(), s.db, id, body.Block); err != nil {
+		s.userErr(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "block_suggestions": body.Block})
 }
 
 // setUserLimit configures or clears a user's rolling-window usage cap.

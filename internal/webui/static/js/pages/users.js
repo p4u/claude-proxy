@@ -42,6 +42,12 @@ const CAPTURE_HELP =
   "Full capture stores both sides of every conversation, including pasted file contents. " +
   "Off (the default) keeps only the last user prompt of each request.";
 
+const SUGGESTIONS_HELP =
+  "Claude Code sends a separate request per turn asking what you might type next, " +
+  "carrying the whole conversation. On, the proxy answers those itself with an empty " +
+  "reply: no quota spent, nothing forwarded, and they stop cluttering captured prompts. " +
+  "The only visible effect for the user is that typing suggestions stop appearing.";
+
 const LIMIT_METRIC = "Counts output tokens only — input and cache tokens are ignored.";
 const LIMIT_HELP =
   "Blocks a user once their output tokens over a rolling window exceed the cap. " +
@@ -156,6 +162,10 @@ function buildTable(users, statById, root) {
       el("span", { text: "Full capture" }),
       el("span", { class: "th-info", "aria-hidden": "true", text: "?" }),
     ]),
+    el("th", { title: SUGGESTIONS_HELP }, [
+      el("span", { text: "Block suggestions" }),
+      el("span", { class: "th-info", "aria-hidden": "true", text: "?" }),
+    ]),
     el("th", { class: "limit-col", title: LIMIT_HELP }, [
       el("span", { text: "Usage limit" }),
       el("span", { class: "th-info", "aria-hidden": "true", text: "?" }),
@@ -227,6 +237,7 @@ function userRow(u, s, root) {
     el("td", {}, [el("span", { class: "cell-strong", text: u.name }), el("span", { class: "cell-id", text: u.id })]),
     el("td", {}, statusBadge(u.status)),
     el("td", {}, captureToggle(u)),
+    el("td", {}, suggestionsToggle(u)),
     el("td", { class: "limit-col" }, limitCell(u)),
     el("td", { class: "num", text: compactNum(s.requests || 0) }),
     el("td", { class: "num " + errTone, text: fullNum(s.errors || 0) }),
@@ -446,18 +457,22 @@ function limitModal(u, root) {
   requestAnimationFrame(() => capInput.focus());
 }
 
-// Per-user capture switch. Optimistic: flip immediately, revert on failure.
-function captureToggle(u) {
+// Shared on/off switch. Optimistic: flip immediately, revert on failure.
+//
+// `save(want)` performs the request and resolves to the value the server
+// actually stored, which is what gets painted — the server is the authority,
+// not the click.
+function switchToggle({ initial, ariaLabel, help, save, announce, failure }) {
   const input = el("input", {
     type: "checkbox",
     class: "switch__input",
     role: "switch",
-    checked: !!u.full_capture,
-    "aria-label": `Full conversation capture for ${u.name}`,
-    "aria-checked": u.full_capture ? "true" : "false",
+    checked: !!initial,
+    "aria-label": ariaLabel,
+    "aria-checked": initial ? "true" : "false",
   });
-  const state = el("span", { class: "switch__state", text: u.full_capture ? "On" : "Off" });
-  const wrap = el("label", { class: "switch", title: CAPTURE_HELP }, [
+  const state = el("span", { class: "switch__state", text: initial ? "On" : "Off" });
+  const wrap = el("label", { class: "switch", title: help }, [
     input,
     el("span", { class: "switch__track", "aria-hidden": "true" }, el("span", { class: "switch__thumb" })),
     state,
@@ -468,32 +483,68 @@ function captureToggle(u) {
     state.textContent = on ? "On" : "Off";
     wrap.classList.toggle("is-on", on);
   };
-  paint(!!u.full_capture);
+  paint(!!initial);
   input.addEventListener("change", async () => {
     const want = input.checked;
     paint(want);
     input.disabled = true;
     wrap.classList.add("is-busy");
     try {
-      const r = await api.setUserCapture(u.id, want);
-      const applied = r && typeof r.full_capture === "boolean" ? r.full_capture : want;
-      u.full_capture = applied;
+      const applied = await save(want);
       paint(applied);
-      toast(
-        applied
-          ? `Full capture on for ${u.name} — both sides of every conversation are now stored.`
-          : `Full capture off for ${u.name} — only the last prompt per request is stored.`,
-        applied ? "warning" : "good"
-      );
+      const [msg, tone] = announce(applied);
+      toast(msg, tone);
     } catch (e) {
       paint(!want); // revert to the last known-good value
-      toast(`Couldn't change capture mode: ${e.message}`, "critical", 6000);
+      toast(`${failure}: ${e.message}`, "critical", 6000);
     } finally {
       input.disabled = false;
       wrap.classList.remove("is-busy");
     }
   });
   return wrap;
+}
+
+function captureToggle(u) {
+  return switchToggle({
+    initial: u.full_capture,
+    ariaLabel: `Full conversation capture for ${u.name}`,
+    help: CAPTURE_HELP,
+    save: async (want) => {
+      const r = await api.setUserCapture(u.id, want);
+      const applied = r && typeof r.full_capture === "boolean" ? r.full_capture : want;
+      u.full_capture = applied;
+      return applied;
+    },
+    announce: (on) => [
+      on
+        ? `Full capture on for ${u.name} — both sides of every conversation are now stored.`
+        : `Full capture off for ${u.name} — only the last prompt per request is stored.`,
+      on ? "warning" : "good",
+    ],
+    failure: "Couldn't change capture mode",
+  });
+}
+
+function suggestionsToggle(u) {
+  return switchToggle({
+    initial: u.block_suggestions,
+    ariaLabel: `Block prompt-suggestion requests for ${u.name}`,
+    help: SUGGESTIONS_HELP,
+    save: async (want) => {
+      const r = await api.setUserSuggestions(u.id, want);
+      const applied = r && typeof r.block_suggestions === "boolean" ? r.block_suggestions : want;
+      u.block_suggestions = applied;
+      return applied;
+    },
+    announce: (on) => [
+      on
+        ? `Suggestions blocked for ${u.name} — the proxy answers them without spending quota.`
+        : `Suggestions forwarded for ${u.name} — they count against usage again.`,
+      on ? "good" : "warning",
+    ],
+    failure: "Couldn't change suggestion handling",
+  });
 }
 
 const PROMPT_LIMIT = 25;

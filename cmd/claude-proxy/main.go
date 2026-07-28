@@ -617,7 +617,7 @@ func printUsageBucket(label string, b *usage.Bucket) {
 
 func runUsers(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "users: missing subcommand (create|list|stats|token|disable|enable|rm|refresh|limit)")
+		fmt.Fprintln(os.Stderr, "users: missing subcommand (create|list|stats|token|disable|enable|rm|refresh|limit|suggestions)")
 		os.Exit(2)
 	}
 	ctx := context.Background()
@@ -640,6 +640,8 @@ func runUsers(args []string) {
 		usersRefresh(ctx, args[1:])
 	case "limit":
 		usersLimit(ctx, args[1:])
+	case "suggestions":
+		usersSuggestions(ctx, args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "users: unknown subcommand %q\n", args[0])
 		os.Exit(2)
@@ -681,8 +683,8 @@ func usersList(ctx context.Context, args []string) {
 		return
 	}
 	now := time.Now()
-	fmt.Printf("%-22s  %-20s  %-8s  %-25s  %-25s  %-16s  %s\n",
-		"ID", "NAME", "STATUS", "CREATED", "LAST_USED", "LIMIT (OUT TOK)", "USED (OUT TOK)")
+	fmt.Printf("%-22s  %-20s  %-8s  %-25s  %-25s  %-6s  %-16s  %s\n",
+		"ID", "NAME", "STATUS", "CREATED", "LAST_USED", "SUGG", "LIMIT (OUT TOK)", "USED (OUT TOK)")
 	for _, ut := range list {
 		lastUsed := "-"
 		if ut.LastUsedAt != nil {
@@ -703,9 +705,15 @@ func usersList(ctx context.Context, args []string) {
 				}
 			}
 		}
-		fmt.Printf("%-22s  %-20s  %-8s  %-25s  %-25s  %-16s  %s\n",
+		// SUGG reads "blocked" when the proxy answers this user's
+		// prompt-suggestion requests instead of forwarding them.
+		sugg := "fwd"
+		if ut.BlockSuggestions {
+			sugg = "block"
+		}
+		fmt.Printf("%-22s  %-20s  %-8s  %-25s  %-25s  %-6s  %-16s  %s\n",
 			ut.ID, ut.Name, string(ut.Status),
-			ut.CreatedAt.Format(time.RFC3339), lastUsed, limitCol, usageCol)
+			ut.CreatedAt.Format(time.RFC3339), lastUsed, sugg, limitCol, usageCol)
 	}
 }
 
@@ -844,6 +852,41 @@ func usersToken(ctx context.Context, args []string) {
 		os.Exit(1)
 	}
 	fmt.Println(ut.Token)
+}
+
+// usersSuggestions toggles whether the proxy answers Claude Code's
+// prompt-suggestion requests locally instead of forwarding them upstream.
+func usersSuggestions(ctx context.Context, args []string) {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "users suggestions <id> on|off")
+		fmt.Fprintln(os.Stderr, "  on  = answer suggestion requests locally, spending no quota")
+		fmt.Fprintln(os.Stderr, "  off = forward them to Anthropic (default)")
+		os.Exit(2)
+	}
+	var block bool
+	switch strings.ToLower(args[1]) {
+	case "on", "block", "true", "1":
+		block = true
+	case "off", "allow", "false", "0":
+		block = false
+	default:
+		fmt.Fprintf(os.Stderr, "users suggestions: expected on|off, got %q\n", args[1])
+		os.Exit(2)
+	}
+	fs := flag.NewFlagSet("users suggestions", flag.ExitOnError)
+	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
+	_ = fs.Parse(args[2:])
+	db := openDB(*dbPath)
+	defer db.Close()
+	if err := usertoken.SetBlockSuggestions(ctx, db, args[0], block); err != nil {
+		fmt.Fprintf(os.Stderr, "suggestions: %v\n", err)
+		os.Exit(1)
+	}
+	if block {
+		fmt.Println("blocking prompt suggestions for", args[0])
+	} else {
+		fmt.Println("forwarding prompt suggestions for", args[0])
+	}
 }
 
 func usersDisable(ctx context.Context, args []string) {

@@ -764,6 +764,35 @@ existing ones, auto-rebind on permanent failure, end-to-end forwarding
 through a fake upstream, 429 → limited, 401 → refresh → retry → 200 with
 token rotation, and downstream auth behavior on `/v1/*`, `/admin/*`, `/health`.
 
+### Blocking prompt suggestions (per user, opt-in)
+
+Claude Code sends an **extra** `POST /v1/messages` per turn asking the model to
+guess what you might type next — the request whose prompt opens
+`[SUGGESTION MODE: ...]`. It carries the whole conversation, so it costs a real
+round trip, and because the proxy records the last user message of each request,
+these blocks also crowd out your actual prompts in the capture log.
+
+Each user token carries a `block_suggestions` flag, **off** by default. When on,
+the proxy answers those requests itself with an empty completion: nothing is
+forwarded to Anthropic, no credential is bound, no quota is spent, and nothing
+is captured. Claude Code already handles an empty suggestion as a normal
+outcome, so nothing errors — the only visible change is that typing suggestions
+stop appearing for that user.
+
+```bash
+claude-proxy users suggestions utok_xxx on    # stop forwarding them
+claude-proxy users suggestions utok_xxx off   # back to the default
+claude-proxy users list                       # SUGG column: block | fwd
+```
+
+Or flip the **Block suggestions** switch on the Users page. Suppressed requests
+are still written to `request_log` with zero tokens and no credential, so you
+can see how many were blocked.
+
+Only requests whose *last* message opens with the marker match, so quoting the
+suggestion prompt inside a real question is unaffected. If Anthropic renames the
+marker the match stops firing and requests are forwarded as before.
+
 ## Operational gotchas
 
 - **Don't reuse a `credentials.json` after import** — see [Generating credentials](#generating-credentials-do-this-once-per-account) for the full explanation. Short version: the proxy owns the token chain after import; any other consumer of the same file causes immediate revocation.

@@ -101,6 +101,11 @@ export const api = {
   // Per-user capture mode. `full` true ⇒ store both sides of every conversation.
   setUserCapture: (id, full) => request("POST", `/users/${enc(id)}/capture`, { full: !!full }),
 
+  // Per-user prompt-suggestion handling. `block` true ⇒ the proxy answers
+  // Claude Code's suggestion requests itself instead of forwarding them.
+  setUserSuggestions: (id, block) =>
+    request("POST", `/users/${enc(id)}/suggestions`, { block: !!block }),
+
   // Per-user rolling usage limit, in output tokens. Both values 0 clears the
   // limit; the backend rejects a negative value, or one set and the other zero,
   // with a 400 whose message is meant to be shown to the operator verbatim.

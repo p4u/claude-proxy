@@ -43,6 +43,10 @@ make down           # Stop and remove containers
 Claude Code (ANTHROPIC_BASE_URL → proxy)
   → AuthMiddleware (internal/proxy/auth.go): admin token OR per-user bearer token
   → proxy handler (internal/proxy/)
+      → blockSuggestion(): POST /v1/messages only — for users with
+        block_suggestions set, Claude Code's prompt-suggestion requests are
+        answered locally with an empty completion + X-Router-Reason:
+        suggestion-blocked, never forwarded (internal/proxy/suggestions.go)
       → enforceUserLimit(): POST /v1/messages only — 429 + X-Router-Reason: user-quota
         when the user is over their rolling usage cap (internal/proxy/userlimit.go)
       → router.Derive(): compute stable conversation key (4-priority algorithm)
@@ -100,7 +104,7 @@ Claude Code (ANTHROPIC_BASE_URL → proxy)
 
 ### Storage Schema (SQLite)
 
-Eight tables (`internal/store/schema.go`): `credentials`, `conversations`, `rr_cursor` (legacy round-robin state), `user_tokens` (named bearer tokens, plus the per-user usage cap `limit_output_tokens` / `limit_window_seconds`, `0` = unlimited), `request_log` (one row per forwarded request, for per-user stats), `usage_history` (utilization snapshots driving selection), `prompt_log` (last user prompt per `POST /v1/messages`, `user_token_id` FK `ON DELETE SET NULL`; never stores responses, gated + retained by `CLAUDE_PROXY_PROMPT_RETENTION_DAYS`, captured in `internal/proxy/promptcapture.go` and pruned by its hourly janitor), `conversation_message` (opt-in whole-conversation capture: `UNIQUE(conv_id, seq)` where `seq` is the message's index in the request's `messages` array, so re-sent history is idempotent; same retention window and janitor as `prompt_log`). Deleting a credential cascades to `usage_history` (`ON DELETE CASCADE`); `conversations` bindings are cleared inside `creds.Delete`'s transaction, since older DBs created that FK without a cascade clause. `request_log` additionally carries per-request token usage columns (`model`, `input_tokens`, `output_tokens`, `cache_creation_tokens`, `cache_read_tokens`), added via the existing swallow-duplicate `ALTER TABLE` migration mechanism and populated by `internal/proxy/usagecapture.go` from the tee'd response stream (SSE and non-streaming JSON) — this feeds the web UI's token stats and never affects what the client receives. Core dependency: `modernc.org/sqlite` (pure Go, no CGO required); `guptarohit/asciigraph` for usage charts and `charmbracelet/bubbletea`+`lipgloss`+`bubbles` for the management TUI.
+Eight tables (`internal/store/schema.go`): `credentials`, `conversations`, `rr_cursor` (legacy round-robin state), `user_tokens` (named bearer tokens, plus the per-user usage cap `limit_output_tokens` / `limit_window_seconds`, `0` = unlimited, and `block_suggestions` = suppress Claude Code's prompt-suggestion requests), `request_log` (one row per forwarded request, for per-user stats), `usage_history` (utilization snapshots driving selection), `prompt_log` (last user prompt per `POST /v1/messages`, `user_token_id` FK `ON DELETE SET NULL`; never stores responses, gated + retained by `CLAUDE_PROXY_PROMPT_RETENTION_DAYS`, captured in `internal/proxy/promptcapture.go` and pruned by its hourly janitor), `conversation_message` (opt-in whole-conversation capture: `UNIQUE(conv_id, seq)` where `seq` is the message's index in the request's `messages` array, so re-sent history is idempotent; same retention window and janitor as `prompt_log`). Deleting a credential cascades to `usage_history` (`ON DELETE CASCADE`); `conversations` bindings are cleared inside `creds.Delete`'s transaction, since older DBs created that FK without a cascade clause. `request_log` additionally carries per-request token usage columns (`model`, `input_tokens`, `output_tokens`, `cache_creation_tokens`, `cache_read_tokens`), added via the existing swallow-duplicate `ALTER TABLE` migration mechanism and populated by `internal/proxy/usagecapture.go` from the tee'd response stream (SSE and non-streaming JSON) — this feeds the web UI's token stats and never affects what the client receives. Core dependency: `modernc.org/sqlite` (pure Go, no CGO required); `guptarohit/asciigraph` for usage charts and `charmbracelet/bubbletea`+`lipgloss`+`bubbles` for the management TUI.
 
 ### Write contention (`internal/store/store.go`, `retry.go`)
 
@@ -201,7 +205,18 @@ make user-token ID=utok_xxx          # Print a user's bearer token
 make user-disable / user-enable / user-rm / user-refresh ID=utok_xxx
 ```
 
-CLI equivalents live under `claude-proxy users <create|list|stats|token|disable|enable|rm|refresh|limit>`.
+CLI equivalents live under `claude-proxy users <create|list|stats|token|disable|enable|rm|refresh|limit|suggestions>`.
+
+### Blocking prompt suggestions per user
+
+```bash
+claude-proxy users suggestions utok_xxx on    # answer them locally, no quota spent
+claude-proxy users suggestions utok_xxx off   # forward to Anthropic (default)
+claude-proxy users list                       # SUGG column shows block/fwd
+```
+
+Also a switch in the web UI's Users table. See the section below for what these
+requests are and why suppressing them is safe.
 
 ### Per-user usage limits
 
@@ -248,6 +263,37 @@ errors fail open.
 > so one large response can overshoot the cap — enforcement blocks the *next*
 > request rather than truncating the current one. The client's `max_tokens` is
 > deliberately never mutated to compensate.
+
+## Blocking prompt-suggestion traffic (`internal/proxy/suggestions.go`)
+
+Claude Code emits an extra `POST /v1/messages` per turn asking the model to
+guess what the user will type next. In the CLI bundle it is
+`querySource:"prompt_suggestion"`: a fork of the conversation with one appended
+user message opening `[SUGGESTION MODE:`. It therefore carries the **entire
+history**, costs a real round trip, and — because `promptcapture.go` records the
+last user message — buries the user's actual prompts in the capture log.
+
+`user_tokens.block_suggestions` opts a user out. The check sits in `ServeHTTP`
+before both `enforceUserLimit` and `pool.Bind`, so a suppressed request spends
+no quota, binds no credential, and is never captured. Users without the flag pay
+one cheap body check.
+
+Detection requires the marker to open the **last** message and that message to
+be from the user — the exact shape the CLI produces. Quoting the marker later in
+a prompt (asking about it, say) is deliberately left alone; `TestIsSuggestionRequest`
+pins both directions.
+
+The reply is a well-formed but empty completion — SSE or JSON, matching the
+request's `stream` flag — reporting zero tokens, which is true since nothing was
+sent upstream. Claude Code already treats an empty answer as a normal outcome
+(it looks for a text block, finds none, and records `suppressed`, the same branch
+as when its own filter rejects a too-long or evaluative suggestion), so nothing
+errors and nothing retries. The user simply stops seeing typing suggestions.
+
+Matching only the opening marker rather than the whole prompt means a reworded
+body still matches; a **renamed** marker stops matching and requests are
+forwarded exactly as before. That is the intended failure direction — a miss
+costs one request, a false positive would silently swallow a real prompt.
 
 ## Admin API
 

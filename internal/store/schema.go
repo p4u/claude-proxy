@@ -46,10 +46,13 @@ CREATE TABLE IF NOT EXISTS user_tokens (
   -- 1 => the proxy stores the whole conversation (both roles) for this user
   -- in conversation_message, not just the last user prompt.
   full_capture INTEGER NOT NULL DEFAULT 0,
-  -- Per-user usage cap in weighted billable units over a rolling window.
+  -- Per-user usage cap in output tokens over a rolling window.
   -- A limit is active only when BOTH are > 0; 0 => unlimited (the default).
   limit_output_tokens  INTEGER NOT NULL DEFAULT 0,
-  limit_window_seconds INTEGER NOT NULL DEFAULT 0
+  limit_window_seconds INTEGER NOT NULL DEFAULT 0,
+  -- 1 => answer Claude Code's prompt-suggestion requests locally with an empty
+  -- completion instead of forwarding them upstream. Default 0 = forward.
+  block_suggestions INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_user_tokens_token  ON user_tokens(token);
 CREATE INDEX IF NOT EXISTS idx_user_tokens_status ON user_tokens(status);

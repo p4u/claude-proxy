@@ -87,6 +87,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"ua", r.Header.Get("User-Agent"),
 		"beta", r.Header.Get("Anthropic-Beta"))
 
+	// Prompt-suggestion traffic the user opted out of: answered locally, before
+	// metering and before any credential is bound (see suggestions.go).
+	if h.blockSuggestion(w, r, body, start) {
+		return
+	}
+
 	// Per-user usage cap: checked before any credential is bound so a blocked
 	// request never touches credential state (see userlimit.go).
 	if h.enforceUserLimit(w, r, start, int64(len(body))) {

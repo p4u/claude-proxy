@@ -384,3 +384,48 @@ and the existing period vocabulary) and `--none` to clear. `users list` shows
 - Mock coverage for: unlimited user, healthy user, >=80% user, blocked user,
   plus the arbitrary-window usage route (scaled sub-linearly with the window so
   switching presets visibly changes the number).
+
+## v5 additions — blocking prompt-suggestion traffic
+
+### Schema
+
+`user_tokens` gains `block_suggestions INTEGER NOT NULL DEFAULT 0` (additive
+ALTER, same swallow-duplicate mechanism as `full_capture`). Existing rows read
+as 0, i.e. unchanged behaviour.
+
+### Model
+
+`usertoken.UserToken` and `usertoken.Identity` gain `BlockSuggestions bool`;
+`usertoken.SetBlockSuggestions(ctx, db, id, block)` writes it. `auth.go` copies
+it into the request identity, so enforcement needs no extra lookup.
+
+### API
+
+- `GET /api/users` — each entry gains `"block_suggestions": bool`.
+- `POST /api/users/{id}/suggestions` `{"block": bool}` ->
+  `{"ok":true,"block_suggestions":bool}`. 404 for an unknown user, mirroring
+  `/capture`.
+
+### Frontend
+
+- Users table gains a **Block suggestions** column between *Full capture* and
+  *Usage limit*, using the same switch component. `captureToggle` and
+  `suggestionsToggle` are now thin wrappers over a shared `switchToggle`
+  helper — optimistic flip, painted from the server's returned value, reverted
+  on failure.
+- Column header carries the explanation: these are the per-turn requests that
+  ask what you might type next, they carry the whole conversation, and blocking
+  them costs only the typing suggestions themselves.
+- Mock backend: `block_suggestions` on all four fixture users (bob and
+  ci-runner on, so both states render) plus a stateful
+  `POST /users/{id}/suggestions` route.
+
+### Proxy behaviour
+
+`internal/proxy/suggestions.go` short-circuits in `ServeHTTP` before
+`enforceUserLimit` and `pool.Bind`. Detection requires the `[SUGGESTION MODE:`
+marker to open the LAST message and that message to be from the user. The
+response is an empty completion matching the request's `stream` flag (SSE or
+JSON), reporting zero tokens. The attempt is logged to `request_log` with an
+empty `credential_id`/`conv_id` and zero tokens, and carries
+`X-Router-Reason: suggestion-blocked`.

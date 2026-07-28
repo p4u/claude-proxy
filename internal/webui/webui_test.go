@@ -721,6 +721,37 @@ func TestUserCaptureToggle(t *testing.T) {
 	if w := do(t, h, http.MethodPost, "/api/users/nope/capture", `{"full":true}`, cookie); w.Code != http.StatusNotFound {
 		t.Fatalf("unknown user capture = %d, want 404", w.Code)
 	}
+
+	// Prompt-suggestion blocking rides the same shape: off by default, settable,
+	// visible in the list, and readable by the proxy's identity lookup.
+	if got := users(); got[0].BlockSuggestions {
+		t.Fatalf("default block_suggestions should be false: %+v", got)
+	}
+	w = do(t, h, http.MethodPost, "/api/users/"+ut.ID+"/suggestions", `{"block":true}`, cookie)
+	if w.Code != http.StatusOK {
+		t.Fatalf("suggestions = %d: %s", w.Code, w.Body.String())
+	}
+	var sres struct {
+		OK               bool `json:"ok"`
+		BlockSuggestions bool `json:"block_suggestions"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &sres)
+	if !sres.OK || !sres.BlockSuggestions {
+		t.Fatalf("suggestions response = %+v", sres)
+	}
+	if got := users(); !got[0].BlockSuggestions {
+		t.Fatal("block_suggestions not reflected in users list")
+	}
+	if reloaded, err := usertoken.Get(ctx, db, ut.ID); err != nil || !reloaded.BlockSuggestions {
+		t.Fatalf("usertoken.Get block_suggestions = %v (err %v)", reloaded, err)
+	}
+	do(t, h, http.MethodPost, "/api/users/"+ut.ID+"/suggestions", `{"block":false}`, cookie)
+	if got := users(); got[0].BlockSuggestions {
+		t.Fatal("block_suggestions not cleared")
+	}
+	if w := do(t, h, http.MethodPost, "/api/users/nope/suggestions", `{"block":true}`, cookie); w.Code != http.StatusNotFound {
+		t.Fatalf("unknown user suggestions = %d, want 404", w.Code)
+	}
 }
 
 func TestUserConversationsList(t *testing.T) {

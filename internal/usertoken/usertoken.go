@@ -35,6 +35,10 @@ type UserToken struct {
 	// a rolling window. A limit is active only when BOTH are > 0.
 	LimitOutputTokens  int64
 	LimitWindowSeconds int64
+	// BlockSuggestions opts this user out of Claude Code's prompt-suggestion
+	// traffic: the proxy answers those requests itself instead of forwarding
+	// them. Default false = forward, matching pre-existing behaviour.
+	BlockSuggestions bool
 }
 
 // contextKey is unexported to prevent collisions across packages.
@@ -52,6 +56,9 @@ type Identity struct {
 	// extra lookup. Both > 0 => a limit is active.
 	LimitOutputTokens  int64
 	LimitWindowSeconds int64
+	// BlockSuggestions => answer Claude Code's prompt-suggestion requests
+	// locally instead of forwarding them upstream.
+	BlockSuggestions bool
 }
 
 // FromContext returns the identity attached by the auth middleware, or nil.
@@ -101,7 +108,7 @@ func Create(ctx context.Context, db *store.DB, name string) (*UserToken, error) 
 func List(ctx context.Context, db *store.DB) ([]*UserToken, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT id, name, token, status, created_at, last_used_at, full_capture,
-		       limit_output_tokens, limit_window_seconds
+		       limit_output_tokens, limit_window_seconds, block_suggestions
 		FROM user_tokens ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -122,7 +129,7 @@ func List(ctx context.Context, db *store.DB) ([]*UserToken, error) {
 func Get(ctx context.Context, db *store.DB, id string) (*UserToken, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT id, name, token, status, created_at, last_used_at, full_capture,
-		       limit_output_tokens, limit_window_seconds
+		       limit_output_tokens, limit_window_seconds, block_suggestions
 		FROM user_tokens WHERE id=?`, id)
 	if err != nil {
 		return nil, err
@@ -138,7 +145,7 @@ func Get(ctx context.Context, db *store.DB, id string) (*UserToken, error) {
 func LookupByToken(ctx context.Context, db *store.DB, token string) (*UserToken, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT id, name, token, status, created_at, last_used_at, full_capture,
-		       limit_output_tokens, limit_window_seconds
+		       limit_output_tokens, limit_window_seconds, block_suggestions
 		FROM user_tokens WHERE token=?`, token)
 	if err != nil {
 		return nil, err
@@ -167,6 +174,19 @@ func SetStatus(ctx context.Context, db *store.DB, id string, s Status) error {
 func SetFullCapture(ctx context.Context, db *store.DB, id string, full bool) error {
 	res, err := db.ExecContext(ctx,
 		`UPDATE user_tokens SET full_capture=? WHERE id=?`, boolToInt(full), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetBlockSuggestions toggles local handling of prompt-suggestion requests.
+func SetBlockSuggestions(ctx context.Context, db *store.DB, id string, block bool) error {
+	res, err := db.ExecContext(ctx,
+		`UPDATE user_tokens SET block_suggestions=? WHERE id=?`, boolToInt(block), id)
 	if err != nil {
 		return err
 	}
@@ -228,7 +248,7 @@ func scan(rs interface{ Scan(...any) error }) (*UserToken, error) {
 	var lu sql.NullInt64
 	var status string
 	if err := rs.Scan(&ut.ID, &ut.Name, &ut.Token, &status, &created, &lu, &ut.FullCapture,
-		&ut.LimitOutputTokens, &ut.LimitWindowSeconds); err != nil {
+		&ut.LimitOutputTokens, &ut.LimitWindowSeconds, &ut.BlockSuggestions); err != nil {
 		return nil, err
 	}
 	ut.Status = Status(status)

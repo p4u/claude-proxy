@@ -18,13 +18,13 @@ const CREDS = [
 // meter. The four users cover every limit state: healthy, near-limit,
 // unlimited, blocked.
 const USERS = [
-  { id: "utok_alice", name: "alice", status: "active", full_capture: true,
+  { id: "utok_alice", name: "alice", status: "active", full_capture: true, block_suggestions: false,
     limit_output_tokens: 1_000_000, limit_window_seconds: 86400, usage_output_tokens: 302_400 },  // ~30%
-  { id: "utok_bob", name: "bob", status: "active", full_capture: false,
+  { id: "utok_bob", name: "bob", status: "active", full_capture: false, block_suggestions: true,
     limit_output_tokens: 400_000, limit_window_seconds: 21600, usage_output_tokens: 344_900 },    // ~86%
-  { id: "utok_carol", name: "carol", status: "disabled", full_capture: false,
+  { id: "utok_carol", name: "carol", status: "disabled", full_capture: false, block_suggestions: false,
     limit_output_tokens: 0, limit_window_seconds: 0, usage_output_tokens: 0 },                     // unlimited
-  { id: "utok_ci", name: "ci-runner", status: "active", full_capture: false,
+  { id: "utok_ci", name: "ci-runner", status: "active", full_capture: false, block_suggestions: true,
     limit_output_tokens: 100_000, limit_window_seconds: 3600, usage_output_tokens: 122_400 },     // ~122%, blocked
 ];
 
@@ -240,6 +240,7 @@ const DB = {
   "/users": () =>
     USERS.map((u, i) => ({
       id: u.id, name: u.name, status: u.status, full_capture: u.full_capture,
+      block_suggestions: u.block_suggestions,
       ...limitFields(u),
       created_at: now - 86400 * (20 - i * 3),
       last_used_at: u.status === "disabled" ? now - 86400 * 4 : now - 120 * (i + 1),
@@ -397,6 +398,15 @@ window.fetch = async (input, init = {}) => {
       if (u.id === "utok_carol") return json({ error: "user is disabled — enable it before changing capture mode" }, 409);
       u.full_capture = !!JSON.parse(init.body || "{}").full;
       return json({ ok: true, full_capture: u.full_capture });
+    }
+
+    // Per-user prompt-suggestion handling — stateful for the session.
+    const sm = path.match(/^\/users\/([^/]+)\/suggestions$/);
+    if (sm && method === "POST") {
+      const u = userById(decodeURIComponent(sm[1]));
+      if (!u) return json({ error: "unknown user" }, 404);
+      u.block_suggestions = !!JSON.parse(init.body || "{}").block;
+      return json({ ok: true, block_suggestions: u.block_suggestions });
     }
 
     // Per-user usage limit — stateful, and validated exactly like the backend:
