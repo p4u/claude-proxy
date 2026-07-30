@@ -103,6 +103,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// served by a GLM key, and vice versa.
 	prov := providerFor(r, body)
 
+	// Undo the advertising alias before anything else reads the body, so the
+	// prompt/conversation capture records the real model rather than the
+	// claude-prefixed name this proxy invented for the picker.
+	if rewritten, wire, ok := rewriteModel(body); ok {
+		body = rewritten
+		h.log.Debug("model alias resolved", "wire_model", wire, "provider", string(prov))
+	}
+
 	var (
 		cred    *creds.Credential
 		convID  string

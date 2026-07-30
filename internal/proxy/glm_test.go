@@ -182,10 +182,15 @@ func TestModelsMergesOnlyUsableProviders(t *testing.T) {
 	t.Run("both providers", func(t *testing.T) {
 		h, _, _ := glmSetup(t, anthropic, glm)
 		got := strings.Join(ids(t, h), ",")
-		for _, want := range []string{"claude-sonnet-5", "glm-4.7"} {
+		// GLM is advertised under a claude- alias, because Claude Code drops
+		// any gateway model whose ID fails /^(claude|anthropic)/i.
+		for _, want := range []string{"claude-sonnet-5", "claude-glm-4.7"} {
 			if !strings.Contains(got, want) {
 				t.Errorf("merged list missing %q: %s", want, got)
 			}
+		}
+		if strings.Contains(got, ",glm-4.7") || strings.HasPrefix(got, "glm-4.7") {
+			t.Errorf("bare GLM id would be filtered out client-side: %s", got)
 		}
 		// [1m] is an Anthropic-only alias — Z.AI 400s on the suffixed form.
 		if !strings.Contains(got, "claude-sonnet-5[1m]") {
@@ -206,10 +211,12 @@ func TestModelsMergesOnlyUsableProviders(t *testing.T) {
 	t.Run("anthropic absent", func(t *testing.T) {
 		h, _, _ := glmSetup(t, nil, glm)
 		got := strings.Join(ids(t, h), ",")
-		if !strings.Contains(got, "glm-4.7") {
+		if !strings.Contains(got, "claude-glm-4.7") {
 			t.Errorf("GLM-only deployment should still offer GLM models: %s", got)
 		}
-		if strings.Contains(got, "claude") {
+		// "no Claude models" means none of Anthropic's own — the GLM alias
+		// legitimately carries a claude- prefix, so assert on a real one.
+		if strings.Contains(got, "claude-sonnet") || strings.Contains(got, "claude-opus") {
 			t.Errorf("no Anthropic credential, so no Claude models should be offered: %s", got)
 		}
 	})
@@ -317,5 +324,66 @@ func TestRequestModelAndProviderFor(t *testing.T) {
 				t.Errorf("providerFor = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// Claude Code drops gateway models failing /^(claude|anthropic)/i, so GLM is
+// advertised under a claude- alias. That alias must never reach Z.AI, which
+// rejects the prefixed name — the round trip is the whole feature.
+func TestAliasedModelRoundTrip(t *testing.T) {
+	var sawBody []byte
+	glm := func(w http.ResponseWriter, r *http.Request) {
+		sawBody, _ = io.ReadAll(r.Body)
+		okJSON(w, r)
+	}
+	h, db, seen := glmSetup(t, nil, glm)
+
+	if code := postMessages(t, h, "claude-glm-4.7").Code; code != 200 {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if len(*seen) != 1 || !strings.HasPrefix((*seen)[0], "api.z.ai/") {
+		t.Fatalf("aliased model did not route to Z.AI: %v", *seen)
+	}
+
+	var up map[string]any
+	if err := json.Unmarshal(sawBody, &up); err != nil {
+		t.Fatalf("upstream body not JSON: %v", err)
+	}
+	if up["model"] != "glm-4.7" {
+		t.Errorf("upstream saw model %q, want the un-aliased %q", up["model"], "glm-4.7")
+	}
+	// Rewriting the model must not disturb the rest of the request.
+	if up["max_tokens"] != float64(8) {
+		t.Errorf("max_tokens corrupted by the rewrite: %v", up["max_tokens"])
+	}
+	msgs, ok := up["messages"].([]any)
+	if !ok || len(msgs) != 1 {
+		t.Errorf("messages corrupted by the rewrite: %v", up["messages"])
+	}
+
+	// The binding is the GLM key, and it is recorded under the GLM provider.
+	list, err := creds.List(context.Background(), db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if list[0].Provider != provider.GLM {
+		t.Errorf("served by %q, want the GLM credential", list[0].Provider)
+	}
+}
+
+// An Anthropic request must pass through byte-for-byte: no alias applies, so
+// the rewrite has to be a genuine no-op rather than a re-encode.
+func TestAnthropicBodyNotRewritten(t *testing.T) {
+	var sawBody []byte
+	anthropic := func(w http.ResponseWriter, r *http.Request) {
+		sawBody, _ = io.ReadAll(r.Body)
+		okJSON(w, r)
+	}
+	h, _, _ := glmSetup(t, anthropic, nil)
+
+	postMessages(t, h, "claude-sonnet-5")
+	want := `{"model":"claude-sonnet-5","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`
+	if string(sawBody) != want {
+		t.Errorf("body was modified:\n got %s\nwant %s", sawBody, want)
 	}
 }

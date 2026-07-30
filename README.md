@@ -364,22 +364,38 @@ button on the Credentials page.
 
 ### Using it
 
-Nothing to configure on the client. Once a GLM key is in the pool, GLM models
-appear in Claude Code's `/model` picker next to the Claude ones:
+Nothing to configure on the client beyond
+`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`. Once a GLM key is in the pool,
+GLM models appear in Claude Code's `/model` picker next to the Claude ones:
 
 ```
 $ curl -s $PROXY/v1/models -H "Authorization: Bearer $TOKEN" | jq -r '.data[].id'
 claude-opus-4-8[1m]
 claude-opus-4-8
 ...
-glm-4.7
-glm-5.2
+claude-glm-4.7
+claude-glm-5.2
 ```
 
 Pick one and it just works. The proxy routes each request by the model it names:
-`glm-*` goes to Z.AI, everything else to Anthropic. Claude Code's background
+GLM models go to Z.AI, everything else to Anthropic. Claude Code's background
 haiku calls keep going to Anthropic even while your main model is GLM, each with
 its own sticky credential binding.
+
+**Why the `claude-` prefix?** Claude Code filters the gateway model list
+client-side and drops any entry whose ID doesn't match `/^(claude|anthropic)/i`,
+so a bare `glm-4.7` is discarded by the CLI before it ever reaches the picker.
+The proxy therefore advertises GLM models under a `claude-glm-*` alias — shown
+as *"GLM-4.7 (Z.AI GLM)"* so it's clear which upstream serves it — and strips
+the prefix again before forwarding, since Z.AI rejects the prefixed name. The
+alias never leaves the proxy, and `glm-4.7` still works for anything addressing
+it directly:
+
+```bash
+# Both of these reach Z.AI and are billed to your GLM key:
+curl $PROXY/v1/messages -d '{"model":"claude-glm-4.7", ...}'   # via the picker
+curl $PROXY/v1/messages -d '{"model":"glm-4.7", ...}'          # direct
+```
 
 **Models you cannot use are never offered.** A provider contributes entries to
 `/v1/models` only when it has a usable credential, so with no GLM key configured

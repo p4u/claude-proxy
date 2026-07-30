@@ -90,3 +90,55 @@ func TestAllReturnsACopy(t *testing.T) {
 		t.Error("All() leaked the registry: mutating the result changed the source of truth")
 	}
 }
+
+// The alias deliberately borrows Anthropic's prefix, so ordering inside
+// ForModel is load-bearing: a naive prefix scan hands every GLM model to
+// Anthropic and the feature silently routes to the wrong upstream.
+func TestAliasedModelRouting(t *testing.T) {
+	tests := []struct {
+		model string
+		want  ID
+	}{
+		{"claude-glm-4.7", GLM},
+		{"claude-glm-5.2", GLM},
+		{"CLAUDE-GLM-4.7", GLM},
+		{"claude-glm-4.7[1m]", GLM},
+		{"glm-4.7", GLM}, // native form still routes
+		{"claude-sonnet-5", Anthropic},
+		{"claude-opus-4-8", Anthropic},
+		// Not an alias — "glmx" is not a GLM model prefix.
+		{"claude-glmx", Anthropic},
+	}
+	for _, tc := range tests {
+		if got := ForModel(tc.model); got != tc.want {
+			t.Errorf("ForModel(%q) = %q, want %q", tc.model, got, tc.want)
+		}
+	}
+}
+
+func TestWireModelAndAdvertisedID(t *testing.T) {
+	// Z.AI rejects the prefixed name, so the alias must be stripped on the wire.
+	if got := WireModel("claude-glm-4.7"); got != "glm-4.7" {
+		t.Errorf("WireModel(claude-glm-4.7) = %q, want glm-4.7", got)
+	}
+	// Everything else passes through untouched — this must never mangle a name
+	// the upstream would have accepted.
+	for _, m := range []string{"glm-4.7", "claude-sonnet-5", "claude-opus-4-8", "", "gpt-5"} {
+		if got := WireModel(m); got != m {
+			t.Errorf("WireModel(%q) = %q, want it unchanged", m, got)
+		}
+	}
+
+	if got := AdvertisedID("glm-4.7", GLM); got != "claude-glm-4.7" {
+		t.Errorf("AdvertisedID(glm-4.7) = %q, want claude-glm-4.7", got)
+	}
+	if got := AdvertisedID("claude-sonnet-5", Anthropic); got != "claude-sonnet-5" {
+		t.Errorf("AdvertisedID must not touch Anthropic ids, got %q", got)
+	}
+	// Round trip is the invariant that matters.
+	for _, m := range []string{"glm-4.7", "glm-5.2", "glm-4.5-air"} {
+		if got := WireModel(AdvertisedID(m, GLM)); got != m {
+			t.Errorf("round trip broke for %q: got %q", m, got)
+		}
+	}
+}

@@ -94,6 +94,30 @@ nothing else tests for a provider by name.
 | Refreshable | yes | no — a 401 means a bad key |
 | Usage API | `/api/oauth/usage` | none |
 | `[1m]` variants | yes | no — Z.AI 400s on the suffixed form |
+| Advertised as | native ID | `claude-`-prefixed alias (see below) |
+
+**GLM models are advertised under a `claude-` alias, and must be.** Claude Code
+filters the gateway model list client-side; its `/v1/models` bootstrap runs
+
+```js
+.filter(o => /^(claude|anthropic)/i.test(o.id))
+.filter(o => { let i = QQ(o.id); return i === null || i === kot })
+```
+
+so a bare `glm-4.7` is discarded in the CLI and never reaches the `/model`
+picker, no matter what this proxy returns. The second filter admits IDs the CLI
+does not recognise (`QQ` returns `null` outside its built-in table), so
+`claude-glm-4.7` passes both. `provider.AdvertisePrefix` drives this:
+`AdvertisedID` applies it in the merged model list (with the display name tagged
+`(Z.AI GLM)` so the picker stays honest about the upstream), and `WireModel`
+strips it again in `rewriteModel` before forwarding — Z.AI rejects the prefixed
+name, so the alias must never escape the proxy. The native `glm-4.7` keeps
+routing normally for clients that address it directly (raw API calls, or
+`ANTHROPIC_DEFAULT_SONNET_MODEL=glm-4.7`).
+
+Ordering in `ForModel` is load-bearing: aliases are matched **before** native
+prefixes, because `claude-glm-4.7` also starts with Anthropic's `claude-`, so a
+naive single pass would hand every GLM model to the wrong upstream.
 
 **GLM needs no translation layer.** Its Anthropic-compatible surface was verified
 live against `/v1/models`, `/v1/messages`, `/v1/messages/count_tokens`, SSE

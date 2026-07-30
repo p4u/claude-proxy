@@ -96,6 +96,35 @@ func augment1M(entries []map[string]any) []map[string]any {
 	return out
 }
 
+// advertise rewrites entry IDs into the form clients are offered.
+//
+// For providers with no AdvertisePrefix this is a no-op. For GLM it prefixes
+// each ID so Claude Code's client-side filter (which drops any gateway model
+// not matching /^(claude|anthropic)/i) lets it through, and tags the display
+// name so the picker still shows plainly which upstream serves it — the
+// prefix is a transport detail, not a claim that this is a Claude model.
+func advertise(entries []map[string]any, p provider.Provider) []map[string]any {
+	if p.AdvertisePrefix == "" {
+		return entries
+	}
+	out := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		id, ok := e["id"].(string)
+		if !ok {
+			continue
+		}
+		clone := maps.Clone(e)
+		clone["id"] = provider.AdvertisedID(id, p.ID)
+		name, _ := e["display_name"].(string)
+		if name == "" {
+			name = id
+		}
+		clone["display_name"] = name + " (" + p.Name + ")"
+		out = append(out, clone)
+	}
+	return out
+}
+
 // modelsEnvelope renders merged entries as an Anthropic /v1/models response.
 //
 // The envelope is rebuilt rather than carried over from any one upstream: the
@@ -263,6 +292,7 @@ func (h *Handler) serveModels(w http.ResponseWriter, r *http.Request, start time
 		if p.Augment1M {
 			entries = augment1M(entries)
 		}
+		entries = advertise(entries, p)
 		merged = append(merged, entries...)
 		answered++
 		lastErr = nil

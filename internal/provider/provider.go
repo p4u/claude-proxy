@@ -61,6 +61,26 @@ type Provider struct {
 	// sending, so the wire model name is always bare. Z.AI rejects the suffixed
 	// form with HTTP 400 ("Unknown Model"), so GLM entries are left alone.
 	Augment1M bool
+
+	// AdvertisePrefix is prepended to this provider's model IDs in
+	// GET /v1/models, and stripped again before the request goes upstream.
+	//
+	// This exists for exactly one reason: Claude Code discards gateway models
+	// whose ID does not look like Anthropic's. Its /v1/models bootstrap runs
+	//
+	//	.filter(o => /^(claude|anthropic)/i.test(o.id))
+	//	.filter(o => { let i = QQ(o.id); return i === null || i === kot })
+	//
+	// so a bare "glm-4.7" is dropped client-side and never reaches the /model
+	// picker, no matter what this proxy returns. The second filter keeps IDs
+	// the CLI does not recognise (QQ returns null for anything outside its
+	// built-in table), so "claude-glm-4.7" passes both and shows up.
+	//
+	// The prefix is presentation only. It is stripped in WireModel before the
+	// request is forwarded, because Z.AI would reject the prefixed name — so
+	// the alias never escapes this proxy, and the native "glm-4.7" keeps
+	// working for clients that address it directly.
+	AdvertisePrefix string
 }
 
 var registry = []Provider{
@@ -74,13 +94,14 @@ var registry = []Provider{
 		Augment1M:     true,
 	},
 	{
-		ID:            GLM,
-		Name:          "Z.AI GLM",
-		BaseURL:       "https://api.z.ai/api/anthropic",
-		ModelPrefixes: []string{"glm-"},
-		Refreshable:   false,
-		PollsUsage:    false,
-		Augment1M:     false,
+		ID:              GLM,
+		Name:            "Z.AI GLM",
+		BaseURL:         "https://api.z.ai/api/anthropic",
+		ModelPrefixes:   []string{"glm-"},
+		Refreshable:     false,
+		PollsUsage:      false,
+		Augment1M:       false,
+		AdvertisePrefix: "claude-",
 	},
 }
 
@@ -133,8 +154,24 @@ func Valid(id ID) bool {
 // table having to know about them; only a provider that claims a prefix
 // diverts traffic away from it.
 func ForModel(model string) ID {
-	m := strings.ToLower(strings.TrimSpace(model))
-	m = strings.TrimSuffix(m, "[1m]")
+	m := normalizeModel(model)
+
+	// Aliased IDs are matched FIRST and must be, because an alias deliberately
+	// borrows another provider's prefix: "claude-glm-4.7" starts with
+	// "claude-", so a naive pass would hand every GLM model to Anthropic.
+	for _, p := range registry {
+		if p.AdvertisePrefix == "" {
+			continue
+		}
+		for _, prefix := range p.ModelPrefixes {
+			if strings.HasPrefix(m, p.AdvertisePrefix+prefix) {
+				return p.ID
+			}
+		}
+	}
+	// Native IDs. A client addressing "glm-4.7" directly — via
+	// ANTHROPIC_DEFAULT_SONNET_MODEL, a raw API call, or a non-Claude-Code
+	// client — keeps working unchanged.
 	for _, p := range registry {
 		for _, prefix := range p.ModelPrefixes {
 			if strings.HasPrefix(m, prefix) {
@@ -143,4 +180,40 @@ func ForModel(model string) ID {
 		}
 	}
 	return Default
+}
+
+func normalizeModel(model string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(model)), "[1m]")
+}
+
+// AdvertisedID is how a model is presented in GET /v1/models. It is the
+// identity function for providers that need no alias.
+func AdvertisedID(id string, p ID) string {
+	pr := Get(p)
+	if pr.AdvertisePrefix == "" || strings.HasPrefix(strings.ToLower(id), pr.AdvertisePrefix) {
+		return id
+	}
+	return pr.AdvertisePrefix + id
+}
+
+// WireModel converts a model ID as the client sent it into the name the
+// upstream actually accepts, undoing AdvertisedID.
+//
+// Anything unrecognised is returned untouched: this must never mangle a model
+// name the upstream would have accepted, so it only strips a prefix it can
+// prove it added itself (the remainder still matches that provider's own
+// prefixes).
+func WireModel(model string) string {
+	m := normalizeModel(model)
+	for _, p := range registry {
+		if p.AdvertisePrefix == "" {
+			continue
+		}
+		for _, prefix := range p.ModelPrefixes {
+			if strings.HasPrefix(m, p.AdvertisePrefix+prefix) {
+				return model[len(p.AdvertisePrefix):]
+			}
+		}
+	}
+	return model
 }

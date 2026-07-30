@@ -45,6 +45,39 @@ func providerFor(r *http.Request, body []byte) provider.ID {
 	return provider.Default
 }
 
+// rewriteModel replaces the body's "model" with the name the upstream accepts,
+// undoing the advertising alias (see provider.AdvertisePrefix). Returns the
+// body unchanged — the same slice — when no rewrite is needed, which is every
+// Anthropic request and every request that already names a native model.
+//
+// The envelope is decoded into json.RawMessage values so every other field is
+// re-encoded byte-for-byte: this must not normalise, reorder or lose anything
+// in a request body it does not own. Only the model string is touched.
+func rewriteModel(body []byte) ([]byte, string, bool) {
+	model := requestModel(body)
+	if model == "" {
+		return body, "", false
+	}
+	wire := provider.WireModel(model)
+	if wire == model {
+		return body, model, false
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body, model, false
+	}
+	encoded, err := json.Marshal(wire)
+	if err != nil {
+		return body, model, false
+	}
+	obj["model"] = encoded
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body, model, false
+	}
+	return out, wire, true
+}
+
 // pickForProvider returns a credential belonging to prov for non-sticky paths.
 // Prefers active; falls back to limited so the request still reaches the
 // upstream and earns a real 429 (with Retry-After) instead of a proxy-invented
