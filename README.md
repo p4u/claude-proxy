@@ -364,9 +364,10 @@ button on the Credentials page.
 
 ### Using it
 
-Nothing to configure on the client beyond
-`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`. Once a GLM key is in the pool,
-GLM models appear in Claude Code's `/model` picker next to the Claude ones:
+The client must be in **gateway mode** for the `/model` picker to be populated
+by the proxy (see [Client setup](#client-setup-for-the-model-picker) — this is
+also what the `[1m]` variants need). With that set, GLM models appear in the
+picker next to the Claude ones:
 
 ```
 $ curl -s $PROXY/v1/models -H "Authorization: Bearer $TOKEN" | jq -r '.data[].id'
@@ -402,6 +403,38 @@ curl $PROXY/v1/messages -d '{"model":"glm-4.7", ...}'          # direct
 no `glm-*` model appears at all. If a client asks for one anyway, the proxy
 answers `503` with `X-Router-Reason: provider-unavailable` and a message naming
 the provider — it never silently substitutes a different model.
+
+### Client setup for the `/model` picker
+
+For the proxy's model list to reach Claude Code's picker at all, the client must
+run in **gateway mode**:
+
+```bash
+export ANTHROPIC_BASE_URL=https://your-proxy
+export ANTHROPIC_AUTH_TOKEN=<your token>
+export CLAUDE_CODE_USE_GATEWAY=1                    # ← required
+export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 # ← required
+```
+
+**Both** are needed, and neither is sufficient alone. Claude Code only fetches
+`GET /v1/models` from the configured base URL when its provider mode is
+`gateway`, and it enters that mode only when `CLAUDE_CODE_USE_GATEWAY=1`
+promotes `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` into a gateway
+credential. With only `ANTHROPIC_BASE_URL` set, the client is in `firstParty`
+mode and never requests the model list — so nothing the proxy returns can
+influence the picker. `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` is a
+second gate *inside* the gateway branch, which is why setting it by itself
+appears to do nothing.
+
+This applies equally to the `[1m]` variants from `MODELS_1M` — they reach the
+picker through the same mechanism.
+
+The discovered options are cached client-side in `~/.claude.json`
+(`additionalModelOptionsCache`), so restart the CLI after adding a credential.
+
+None of this affects **routing**: `--model glm-4.7`, `/model glm-4.7`, or
+`ANTHROPIC_DEFAULT_SONNET_MODEL=glm-4.7` work in any mode, because the proxy
+routes on whatever model name the request carries.
 
 ### What differs from an Anthropic credential
 

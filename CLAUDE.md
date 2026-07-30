@@ -119,6 +119,24 @@ Ordering in `ForModel` is load-bearing: aliases are matched **before** native
 prefixes, because `claude-glm-4.7` also starts with Anthropic's `claude-`, so a
 naive single pass would hand every GLM model to the wrong upstream.
 
+**The client must be in gateway mode or none of this is reachable.** Claude Code
+fetches `GET /v1/models` from the configured base URL only when its provider
+mode is `gateway`:
+
+```js
+function Hn(){ if(Cy()) return "gateway"; ... return "firstParty" }   // Cy() = gatewayAuth
+async function AXi(){ if (Z.CLAUDE_CODE_USE_GATEWAY) { ... U5e({url, jwt, ...}) } }
+```
+
+so **both** `CLAUDE_CODE_USE_GATEWAY=1` (which promotes `ANTHROPIC_BASE_URL` +
+`ANTHROPIC_AUTH_TOKEN` into a gateway credential) and
+`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` (a second gate *inside* the
+gateway branch) are required. With only `ANTHROPIC_BASE_URL` set the client is
+`firstParty`, never requests the list, and nothing this proxy serves can affect
+the picker — which is equally true of the pre-existing `MODELS_1M` feature.
+Verified end-to-end: the discovered entries land in `~/.claude.json` under
+`additionalModelOptionsCache`, which is what the picker renders.
+
 **GLM needs no translation layer.** Its Anthropic-compatible surface was verified
 live against `/v1/models`, `/v1/messages`, `/v1/messages/count_tokens`, SSE
 streaming, tool use, `cache_control`, and Claude Code's `anthropic-beta` headers.
