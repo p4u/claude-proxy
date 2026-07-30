@@ -62,17 +62,32 @@ the selected window into equal intervals.
 
 ### Subscription usage (remote limits)
 - `GET /api/usage/current` → per credential, latest snapshot + live counters:
-  `[{credential_id,label,subscription_type,status,weight,five_hour:{pct,resets_at},
-     seven_day:{pct,resets_at},seven_day_sonnet:{pct,resets_at},captured_at}]`
+  `[{credential_id,label,subscription_type,provider,has_usage_api,status,weight,
+     five_hour:{pct,resets_at},seven_day:{pct,resets_at},
+     seven_day_sonnet:{pct,resets_at},captured_at,selection:{...}}]`
   (from `usage_history` latest row per cred; include resets_at).
+  Credentials with `has_usage_api: false` never have a snapshot, so their
+  percentages are 0 and `captured_at` is null — the UI must render the
+  "no usage API" note instead of meters. `selection.share_pct` is totalled
+  **per provider**, matching the pool's provider-scoped candidate set: a lone
+  GLM key takes 100% of GLM traffic, not a few percent of the global total.
 - `GET /api/usage/history?period&credential_id?` → time series of pct values per
   credential for charts: `{series:[{credential_id,label,points:[{ts,five_hour_pct,
   seven_day_pct,seven_day_sonnet_pct}]}]}`.
 
 ### Credential management (wraps `internal/creds`, `internal/ingest`)
-- `GET /api/credentials` → extended `credView` (reuse fields from `internal/admin`).
+- `GET /api/credentials` → extended `credView` (reuse fields from `internal/admin`),
+  including `provider` (`anthropic` | `glm`) and `has_usage_api`. The latter is
+  false for providers publishing no utilization endpoint; the UI uses it to hide
+  the usage meters, the expiry date and the OAuth-only row actions (Refresh,
+  Update tokens) rather than showing 0% and a synthetic far-future date.
 - `POST /api/credentials` `{credentials_json, label, weight?}` → import pasted
   `.credentials.json` (use `ingest.ImportFromJSON`; verifies liveness, rejects dupes).
+- `POST /api/credentials/keys` `{provider, api_key, label?, plan?, weight?}` → add a
+  static API key (`ingest.ImportKey`). Verified with a live `GET /v1/models` against
+  the provider before storing; duplicates rejected by access token. `400` on a
+  rejected key, an unknown provider, or an OAuth provider (which needs `POST
+  /api/credentials` instead).
 - `POST /api/credentials/{id}/disable` | `/enable` (SetStatus disabled/active)
 - `POST /api/credentials/{id}/refresh` → force OAuth token refresh (`Refresher.RefreshNow`)
 - `POST /api/credentials/{id}/weight` `{weight}` (creds.SetWeight)

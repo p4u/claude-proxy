@@ -9,6 +9,7 @@ import (
 
 	"github.com/p4u/claude-proxy/internal/creds"
 	"github.com/p4u/claude-proxy/internal/pool"
+	"github.com/p4u/claude-proxy/internal/provider"
 )
 
 type usageWindow struct {
@@ -31,6 +32,8 @@ type usageCurrent struct {
 	CredentialID     string        `json:"credential_id"`
 	Label            string        `json:"label"`
 	SubscriptionType string        `json:"subscription_type"`
+	Provider         string        `json:"provider"`
+	HasUsageAPI      bool          `json:"has_usage_api"`
 	Status           string        `json:"status"`
 	Weight           int           `json:"weight"`
 	FiveHour         usageWindow   `json:"five_hour"`
@@ -61,6 +64,8 @@ func (s *Server) handleUsageCurrent(w http.ResponseWriter, r *http.Request) {
 			CredentialID:     c.ID,
 			Label:            c.Label,
 			SubscriptionType: c.SubscriptionType,
+			Provider:         string(provider.Get(c.Provider).ID),
+			HasUsageAPI:      provider.Get(c.Provider).PollsUsage,
 			Status:           string(c.Status),
 			Weight:           c.Weight,
 		}
@@ -100,13 +105,20 @@ func (s *Server) handleUsageCurrent(w http.ResponseWriter, r *http.Request) {
 
 	// share_pct = score / Σscore × 100 across ACTIVE credentials (the pool's
 	// candidate set); non-active credentials are never selected → share 0.
-	var total float64
+	//
+	// Totalled PER PROVIDER, because the pool filters by provider before it
+	// scores: a GLM key only ever competes with other GLM keys. Summing across
+	// providers would understate every credential of the smaller pool — a lone
+	// GLM key that takes 100% of GLM traffic would read as a few percent, or as
+	// 0% whenever the Anthropic scores dominate.
+	totals := map[string]float64{}
 	for i := range out {
 		if out[i].Status == string(creds.StatusActive) {
-			total += out[i].Selection.Score
+			totals[out[i].Provider] += out[i].Selection.Score
 		}
 	}
 	for i := range out {
+		total := totals[out[i].Provider]
 		if total > 0 && out[i].Status == string(creds.StatusActive) {
 			out[i].Selection.SharePct = out[i].Selection.Score / total * 100
 		}

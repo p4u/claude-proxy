@@ -9,6 +9,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/p4u/claude-proxy/internal/creds"
+	"github.com/p4u/claude-proxy/internal/pool"
+	"github.com/p4u/claude-proxy/internal/provider"
 )
 
 // Claude Code's gateway model discovery (CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1)
@@ -43,18 +47,32 @@ func has1MVariant(id string) bool {
 	return false
 }
 
-// augmentModels appends "[1m]" picker entries to a /v1/models response body.
-// Returns nil when the body can't be parsed (caller passes the original through).
-func augmentModels(raw []byte) []byte {
+// parseModelEntries extracts the "data" array from a /v1/models response.
+// Returns ok=false when the body is not a models envelope.
+func parseModelEntries(raw []byte) ([]map[string]any, bool) {
 	var envelope map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return nil
+		return nil, false
+	}
+	data, present := envelope["data"]
+	if !present {
+		return nil, false
 	}
 	var entries []map[string]any
-	if err := json.Unmarshal(envelope["data"], &entries); err != nil {
-		return nil
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, false
 	}
+	return entries, true
+}
 
+// augment1M returns entries with "[1m]" picker rows inserted.
+//
+// The variant goes BEFORE its base model: Claude Code's /model picker collapses
+// long gateway lists behind a "+N models" tail, and models without a built-in
+// picker row (e.g. Fable) are only reachable through these gateway rows — so
+// putting the 1M variant first makes it the visible, default pick instead of
+// the 200K bare entry.
+func augment1M(entries []map[string]any) []map[string]any {
 	existing := make(map[string]bool, len(entries))
 	for _, e := range entries {
 		if id, ok := e["id"].(string); ok {
@@ -62,11 +80,6 @@ func augmentModels(raw []byte) []byte {
 		}
 	}
 
-	// The [1m] variant is inserted BEFORE its base model: Claude Code's /model
-	// picker collapses long gateway lists behind a "+N models" tail, and models
-	// without a built-in picker row (e.g. Fable) are only reachable through
-	// these gateway rows — putting the 1M variant first makes it the visible,
-	// default pick instead of the 200K bare entry.
 	out := make([]map[string]any, 0, len(entries)*2)
 	for _, e := range entries {
 		id, ok := e["id"].(string)
@@ -80,8 +93,49 @@ func augmentModels(raw []byte) []byte {
 		}
 		out = append(out, e)
 	}
+	return out
+}
 
-	data, err := json.Marshal(out)
+// modelsEnvelope renders merged entries as an Anthropic /v1/models response.
+//
+// The envelope is rebuilt rather than carried over from any one upstream: the
+// pagination fields describe the merged list, not whichever provider happened
+// to answer first, and Z.AI spells them camelCase (firstId/lastId) while
+// Anthropic uses first_id/last_id. Claude Code reads only id and display_name
+// per entry, but emitting a coherent envelope keeps the response honest for
+// anything else that consumes it.
+func modelsEnvelope(entries []map[string]any) ([]byte, error) {
+	if entries == nil {
+		entries = []map[string]any{}
+	}
+	env := map[string]any{
+		"data":     entries,
+		"has_more": false,
+	}
+	if len(entries) > 0 {
+		if id, ok := entries[0]["id"].(string); ok {
+			env["first_id"] = id
+		}
+		if id, ok := entries[len(entries)-1]["id"].(string); ok {
+			env["last_id"] = id
+		}
+	}
+	return json.Marshal(env)
+}
+
+// augmentModels appends "[1m]" picker entries to a single /v1/models response
+// body. Returns nil when the body can't be parsed (caller passes the original
+// through). Retained for its tests; the merge path composes the helpers above.
+func augmentModels(raw []byte) []byte {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil
+	}
+	entries, ok := parseModelEntries(raw)
+	if !ok {
+		return nil
+	}
+	data, err := json.Marshal(augment1M(entries))
 	if err != nil {
 		return nil
 	}
@@ -143,6 +197,15 @@ func (b *bufferedRW) Flush()                      {}
 // serveModels handles GET /v1/models: forward upstream via the regular path
 // (401 refresh, credential accounting), augment the JSON with [1m] variants,
 // and cache the result.
+// serveModels answers GET /v1/models with the union of every provider that can
+// currently serve traffic.
+//
+// A provider contributes rows only if it has a usable credential and answers
+// successfully. That is the whole mechanism behind "unusable models are not
+// offered": with no GLM key configured (or every GLM key revoked), no glm-*
+// entry is advertised, so Claude Code never shows a model the proxy would have
+// to reject. One provider being down degrades the list rather than failing
+// discovery, since a partial picker beats no picker at all.
 func (h *Handler) serveModels(w http.ResponseWriter, r *http.Request, start time.Time) {
 	now := time.Now()
 	if body, ct, ok := h.modelsCache.get(now); ok {
@@ -151,16 +214,14 @@ func (h *Handler) serveModels(w http.ResponseWriter, r *http.Request, start time
 		return
 	}
 
-	cred, err := h.pickAny(r.Context())
+	list, err := creds.List(r.Context(), h.db)
 	if err != nil {
-		// No usable credential: serve a stale copy if we have one so client
-		// discovery still succeeds.
+		h.log.Error("models: list credentials", "err", err)
 		if body, ct, ok := h.modelsCache.getStale(); ok {
-			h.log.Warn("models: no credential, serving stale cache", "err", err)
 			writeModels(w, body, ct)
 			return
 		}
-		h.failBind(w, err)
+		h.failBind(w, err, provider.Default)
 		return
 	}
 
@@ -168,39 +229,76 @@ func (h *Handler) serveModels(w http.ResponseWriter, r *http.Request, start time
 	// transparently decompresses, so the buffered body is plain JSON.
 	r.Header.Del("Accept-Encoding")
 
-	rec := newBufferedRW()
-	status, rxBytes, _, _ := h.forward(rec, r, nil, cred, true, false)
-	latency := time.Since(start)
-	h.log.Info("models discovery",
-		"cred", cred.ID, "label", cred.Label, "status", status,
-		"latency_ms", latency.Milliseconds(), "bytes_received", rxBytes)
-	h.logRequest(r.Context(), r.URL.Path, "", cred.ID, status, 0, rxBytes, latency, tokenUsage{})
-
-	if status != http.StatusOK {
-		// Serve stale cache on upstream/transport failures; pass 4xx through.
-		if status < 0 || status >= 500 {
-			if body, ct, ok := h.modelsCache.getStale(); ok {
-				h.log.Warn("models: upstream failure, serving stale cache", "status", status)
-				writeModels(w, body, ct)
-				return
-			}
+	var (
+		merged    []map[string]any
+		answered  int
+		lastErr   = pool.ErrNoCredentials
+		lastRec   *bufferedRW
+		lastState int
+	)
+	for _, p := range provider.All() {
+		cred, perr := pickFrom(list, p.ID)
+		if perr != nil {
+			h.log.Debug("models: provider has no usable credential, omitting its models",
+				"provider", string(p.ID))
+			continue
 		}
-		replayBuffered(w, rec)
+
+		rec := newBufferedRW()
+		status, rxBytes, _, _ := h.forward(rec, r, nil, cred, true, false)
+		h.logRequest(r.Context(), r.URL.Path, "", cred.ID, status, 0, rxBytes, time.Since(start), tokenUsage{})
+
+		if status != http.StatusOK {
+			h.log.Warn("models: provider fetch failed, omitting its models",
+				"provider", string(p.ID), "cred", cred.ID, "status", status)
+			lastRec, lastState = rec, status
+			continue
+		}
+		entries, ok := parseModelEntries(rec.body.Bytes())
+		if !ok {
+			h.log.Warn("models: provider response not parseable, omitting its models",
+				"provider", string(p.ID), "bytes", rec.body.Len())
+			continue
+		}
+		if p.Augment1M {
+			entries = augment1M(entries)
+		}
+		merged = append(merged, entries...)
+		answered++
+		lastErr = nil
+		h.log.Info("models discovery",
+			"provider", string(p.ID), "cred", cred.ID, "label", cred.Label,
+			"models", len(entries), "bytes_received", rxBytes)
+	}
+
+	if answered == 0 {
+		// Nothing usable anywhere: prefer a stale copy so client discovery
+		// still succeeds, then the upstream's own error, then a clean 503.
+		if body, ct, ok := h.modelsCache.getStale(); ok {
+			h.log.Warn("models: no provider answered, serving stale cache")
+			writeModels(w, body, ct)
+			return
+		}
+		if lastRec != nil && lastState > 0 && lastState < 500 {
+			replayBuffered(w, lastRec)
+			return
+		}
+		h.failBind(w, lastErr, provider.Default)
 		return
 	}
 
-	body := rec.body.Bytes()
-	if augmented := augmentModels(body); augmented != nil {
-		body = augmented
-	} else {
-		h.log.Warn("models: response not augmentable, passing through", "bytes", len(body))
+	body, merr := modelsEnvelope(merged)
+	if merr != nil {
+		h.log.Error("models: encode merged envelope", "err", merr)
+		h.failBind(w, merr, provider.Default)
+		return
 	}
-	ct := rec.header.Get("Content-Type")
-	if ct == "" {
-		ct = "application/json"
-	}
-	h.modelsCache.set(body, ct, now)
-	writeModels(w, body, ct)
+	h.log.Info("models merged",
+		"providers", answered, "models", len(merged),
+		"latency_ms", time.Since(start).Milliseconds())
+
+	h.modelsCache.set(body, "application/json", now)
+	writeModels(w, body, "application/json")
 }
 
 func writeModels(w http.ResponseWriter, body []byte, ct string) {

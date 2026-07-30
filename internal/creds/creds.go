@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/p4u/claude-proxy/internal/provider"
 	"github.com/p4u/claude-proxy/internal/store"
 )
 
@@ -26,25 +27,38 @@ type Credential struct {
 	ID               string
 	Label            string
 	SubscriptionType string
-	AccessToken      string
-	RefreshToken     string
-	ExpiresAt        time.Time
-	Status           Status
-	RetryAfter       *time.Time
-	LastSuccessAt    *time.Time
-	Last429At        *time.Time
-	LastRequestAt    *time.Time
-	RequestCount     int64
-	SuccessCount     int64
-	ErrorCount       int64
-	Weight           int
-	CreatedAt        time.Time
+	// Provider names the upstream this credential authenticates against.
+	// Never empty for rows read back from the database (the column defaults to
+	// "anthropic"), and provider.Get tolerates an empty value regardless.
+	Provider      provider.ID
+	AccessToken   string
+	RefreshToken  string
+	ExpiresAt     time.Time
+	Status        Status
+	RetryAfter    *time.Time
+	LastSuccessAt *time.Time
+	Last429At     *time.Time
+	LastRequestAt *time.Time
+	RequestCount  int64
+	SuccessCount  int64
+	ErrorCount    int64
+	Weight        int
+	CreatedAt     time.Time
 }
 
-// DefaultWeight returns the round-robin weight implied by a Claude
-// subscription tier. Higher = more new conversations routed here.
-// Tweak freely — these are heuristics, not Anthropic-published numbers.
-func DefaultWeight(subscriptionType string) int {
+// DefaultWeight returns the selection weight implied by a subscription tier.
+// Higher = more new conversations routed here. Tweak freely — these are
+// heuristics, not published numbers.
+//
+// Weights only ever compete within a single provider, because the provider is a
+// hard filter applied before scoring: a GLM key is never weighed against an
+// Anthropic subscription, only against other GLM keys. Providers whose plan
+// tiers we cannot infer therefore start uniform at 1 and are differentiated by
+// the operator with `creds set-weight`.
+func DefaultWeight(p provider.ID, subscriptionType string) int {
+	if p != "" && p != provider.Anthropic {
+		return 1
+	}
 	switch subscriptionType {
 	case "max":
 		return 5
@@ -65,14 +79,38 @@ func newID() string {
 	return "cred_" + hex.EncodeToString(b[:])
 }
 
+// Insert stores an Anthropic OAuth credential (access + refresh token pair).
+// For static API keys from other providers, use InsertKey.
 func Insert(ctx context.Context, db *store.DB, label, subType, access, refresh string, expiresAt time.Time, weight int) (*Credential, error) {
+	return insert(ctx, db, provider.Anthropic, label, subType, access, refresh, expiresAt, weight)
+}
+
+// keyExpiry is the stored expires_at for API-key credentials. They never
+// expire, but the column is NOT NULL and the refresher compares against it, so
+// a date far enough out that the proactive refresh window can never open is
+// simpler — and less fragile — than threading a nullable expiry through every
+// caller. The refresher also skips non-refreshable providers outright, so this
+// is belt-and-braces.
+func keyExpiry() time.Time { return time.Now().AddDate(100, 0, 0) }
+
+// InsertKey stores a static API-key credential (GLM and any future key-based
+// provider). There is no refresh token and no meaningful expiry.
+func InsertKey(ctx context.Context, db *store.DB, p provider.ID, label, plan, apiKey string, weight int) (*Credential, error) {
+	return insert(ctx, db, p, label, plan, apiKey, "", keyExpiry(), weight)
+}
+
+func insert(ctx context.Context, db *store.DB, p provider.ID, label, subType, access, refresh string, expiresAt time.Time, weight int) (*Credential, error) {
+	if p == "" {
+		p = provider.Default
+	}
 	if weight < 1 {
-		weight = DefaultWeight(subType)
+		weight = DefaultWeight(p, subType)
 	}
 	c := &Credential{
 		ID:               newID(),
 		Label:            label,
 		SubscriptionType: subType,
+		Provider:         p,
 		AccessToken:      access,
 		RefreshToken:     refresh,
 		ExpiresAt:        expiresAt,
@@ -82,9 +120,9 @@ func Insert(ctx context.Context, db *store.DB, label, subType, access, refresh s
 	}
 	_, err := db.ExecContext(
 		ctx, `
-		INSERT INTO credentials (id, label, subscription_type, access_token, refresh_token, expires_at, status, weight, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		c.ID, c.Label, c.SubscriptionType, c.AccessToken, c.RefreshToken, c.ExpiresAt.Unix(), string(c.Status), c.Weight, c.CreatedAt.Unix(),
+		INSERT INTO credentials (id, label, subscription_type, provider, access_token, refresh_token, expires_at, status, weight, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.ID, c.Label, c.SubscriptionType, string(c.Provider), c.AccessToken, c.RefreshToken, c.ExpiresAt.Unix(), string(c.Status), c.Weight, c.CreatedAt.Unix(),
 	)
 	if err != nil {
 		return nil, err
@@ -108,10 +146,26 @@ func SetWeight(ctx context.Context, db *store.DB, id string, weight int) error {
 	return nil
 }
 
-const credSelectCols = `id, COALESCE(label,''), COALESCE(subscription_type,''),
+// SelectCols is the credential column list, exported because internal/pool
+// reads credentials inside its own transaction and must stay column-for-column
+// identical to ScanCred below.
+const SelectCols = `id, COALESCE(label,''), COALESCE(subscription_type,''),
+       COALESCE(provider,'anthropic'),
        access_token, refresh_token, expires_at, status,
        retry_after, last_success_at, last_429_at, last_request_at,
        request_count, success_count, error_count, weight, created_at`
+
+const credSelectCols = SelectCols
+
+// ScanCred materialises one row selected with SelectCols. Exported for the same
+// reason: it keeps the pool's in-transaction read from drifting out of sync
+// with this one, which is how a column addition silently breaks selection.
+func ScanCred(rs interface {
+	Scan(...any) error
+},
+) (*Credential, error) {
+	return scanCred(rs)
+}
 
 func scanCred(rs interface {
 	Scan(...any) error
@@ -120,15 +174,16 @@ func scanCred(rs interface {
 	c := &Credential{}
 	var exp, created int64
 	var ra, ls, l429, lreq sql.NullInt64
-	var status string
+	var status, prov string
 	if err := rs.Scan(
-		&c.ID, &c.Label, &c.SubscriptionType,
+		&c.ID, &c.Label, &c.SubscriptionType, &prov,
 		&c.AccessToken, &c.RefreshToken, &exp, &status,
 		&ra, &ls, &l429, &lreq,
 		&c.RequestCount, &c.SuccessCount, &c.ErrorCount, &c.Weight, &created,
 	); err != nil {
 		return nil, err
 	}
+	c.Provider = provider.ID(prov)
 	c.ExpiresAt = time.Unix(exp, 0)
 	c.Status = Status(status)
 	c.CreatedAt = time.Unix(created, 0)
@@ -175,6 +230,19 @@ func HasRefreshToken(ctx context.Context, db *store.DB, refreshToken string) (bo
 	err := db.QueryRowContext(
 		ctx,
 		`SELECT COUNT(*) FROM credentials WHERE refresh_token=?`, refreshToken,
+	).Scan(&n)
+	return n > 0, err
+}
+
+// HasAccessToken reports whether any credential already stores the given
+// access token. This is the duplicate check for API-key providers, where
+// HasRefreshToken cannot work: key credentials store an empty refresh token,
+// so every one of them would collide with every other.
+func HasAccessToken(ctx context.Context, db *store.DB, accessToken string) (bool, error) {
+	var n int
+	err := db.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*) FROM credentials WHERE access_token=?`, accessToken,
 	).Scan(&n)
 	return n > 0, err
 }

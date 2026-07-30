@@ -11,6 +11,7 @@ import (
 
 	"github.com/p4u/claude-proxy/internal/creds"
 	"github.com/p4u/claude-proxy/internal/ingest"
+	"github.com/p4u/claude-proxy/internal/provider"
 	"github.com/p4u/claude-proxy/internal/usage"
 	"github.com/p4u/claude-proxy/internal/usertoken"
 )
@@ -26,11 +27,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		rows := make([]table.Row, 0, len(msg.creds))
 		for _, c := range msg.creds {
 			s := msg.snaps[c.ID]
+			p := provider.Get(c.Provider)
+			// API keys have no real expiry and no usage snapshots; showing a
+			// synthetic date and 0.0% would both be misinformation.
+			expires := c.ExpiresAt.Local().Format("2006-01-02 15:04")
+			if !p.Refreshable {
+				expires = "never"
+			}
 			rows = append(rows, table.Row{
-				c.ID, c.Label, c.SubscriptionType, strconv.Itoa(c.Weight), string(c.Status),
+				c.ID, string(p.ID), c.Label, c.SubscriptionType, strconv.Itoa(c.Weight), string(c.Status),
 				pct(s, func(s *usage.Snapshot) float64 { return s.FiveHourPct }),
 				pct(s, func(s *usage.Snapshot) float64 { return s.SevenDayPct }),
-				c.ExpiresAt.Local().Format("2006-01-02 15:04"),
+				expires,
 			})
 		}
 		m.credTable.SetRows(rows)
@@ -164,6 +172,9 @@ func (m *model) handleCredKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "p": // import a new credential by pasting JSON
 		m.startPaste()
+		return m, nil
+	case "k": // add a static API-key credential (GLM)
+		m.startInput(inputAPIKey, "GLM API key: ", "")
 		return m, nil
 	}
 
@@ -307,6 +318,20 @@ func (m *model) submitInput() (tea.Model, tea.Cmd) {
 		m.busy = true
 		m.status = "importing " + file + "…"
 		return m, m.importCred(file, label)
+	case inputAPIKey:
+		if val == "" {
+			m.status, m.isErr = "API key is required", true
+			return m, nil
+		}
+		m.pendingJSON = val // reused as the pending secret between the two steps
+		m.startInput(inputAPIKeyLabel, "Label (blank = provider name): ", "")
+		return m, nil
+	case inputAPIKeyLabel:
+		key, label := m.pendingJSON, val
+		m.resetInput()
+		m.busy = true
+		m.status = "verifying API key…"
+		return m, m.addKeyCred(provider.GLM, key, label)
 	case inputUpdateFile:
 		id, file := m.pendingID, val
 		m.resetInput()
@@ -373,6 +398,19 @@ func (m *model) importCredJSON(js, label string) tea.Cmd {
 			return actionDoneMsg{err: fmt.Errorf("import (paste): %w", err)}
 		}
 		return actionDoneMsg{msg: fmt.Sprintf("imported %s (%s)", c.ID, c.Label)}
+	}
+}
+
+// addKeyCred verifies and stores a static API-key credential. Verification hits
+// the provider's /v1/models, so this blocks briefly — the caller sets busy.
+func (m *model) addKeyCred(p provider.ID, apiKey, label string) tea.Cmd {
+	db := m.db
+	return func() tea.Msg {
+		c, err := ingest.ImportKey(context.Background(), db, p, label, "", apiKey, 0)
+		if err != nil {
+			return actionDoneMsg{err: fmt.Errorf("add key: %w", err)}
+		}
+		return actionDoneMsg{msg: fmt.Sprintf("added %s (%s, %s)", c.ID, c.Label, c.Provider)}
 	}
 }
 

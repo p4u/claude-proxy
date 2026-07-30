@@ -156,6 +156,14 @@ tui: env ## Launch the interactive management TUI (credentials + users). Attache
 
 # usage: make import FROM=acct-A.json LABEL=acct-A [WEIGHT=5]
 # FROM is a path RELATIVE to ./creds (which is bind-mounted as /creds:ro).
+add-key: env ## Add a provider API key, e.g. GLM (PROVIDER=glm LABEL=zai [PLAN=pro] [WEIGHT=N]). Prompts for the key.
+	@if [ -z "$(LABEL)" ]; then \
+		echo "usage: make add-key PROVIDER=glm LABEL=zai-main [PLAN=pro] [WEIGHT=N]"; exit 2; fi
+	@printf 'API key (input hidden): ' >&2; stty -echo 2>/dev/null; read KEY; stty echo 2>/dev/null; echo >&2; \
+	 printf '%s' "$$KEY" | $(DC) run --rm --no-deps -i $(SERVICE) creds add-key --db $(DB) \
+		--provider "$(if $(PROVIDER),$(PROVIDER),glm)" --label "$(LABEL)" \
+		$(if $(PLAN),--plan $(PLAN),) $(if $(WEIGHT),--weight $(WEIGHT),)
+
 import: env ## Import a .credentials.json (FROM=acct-A.json LABEL=acct-A [WEIGHT=N]).
 	@if [ -z "$(FROM)" ] || [ -z "$(LABEL)" ]; then \
 		echo "usage: make import FROM=acct-A.json LABEL=acct-A [WEIGHT=N]"; exit 2; fi

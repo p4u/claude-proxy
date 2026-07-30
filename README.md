@@ -41,10 +41,11 @@ that:
 
 ```
                           ┌─────────────────────────────────────┐
-  Claude Code agent A ───►│  /v1/*                              │
-  Claude Code agent B ───►│  • sticky conv → cred binding       │──► api.anthropic.com
-  Claude Code agent C ───►│  • usage-aware weighted selection   │
-                          │  • 401 → refresh + retry            │
+  Claude Code agent A ───►│  /v1/*                              │──► api.anthropic.com
+  Claude Code agent B ───►│  • model → provider routing         │      (claude-* models)
+  Claude Code agent C ───►│  • sticky conv → cred binding       │
+                          │  • usage-aware weighted selection   │──► api.z.ai/api/anthropic
+                          │  • 401 → refresh + retry            │      (glm-* models)
                           │  • 429 → mark limited + reroute     │
                           └─────────────────────────────────────┘
 ```
@@ -64,6 +65,7 @@ to keep them alive.
 
 ## Features
 
+- **Multiple providers** — Anthropic subscriptions and [Z.AI GLM](https://docs.z.ai/devpack/tool/claude) coding plans in one pool. GLM models appear in Claude Code's `/model` picker and are selectable transparently; see [GLM support](#glm-zai-support).
 - **Sticky binding** — each Claude Code conversation pins to a single credential for its lifetime.
 - **Usage-aware weighted selection** for new conversations: each credential's score combines its configured weight with live 5h/7d usage headroom, and a credential that has hit either limit is excluded entirely. Default weights: `max`/`team`/`enterprise` = 5, `pro` = 1.
 - **Automatic refresh** — proactive (every 60 s if `expires_at < now+5min`) and reactive (on `401` retry once with a fresh token).
@@ -336,6 +338,71 @@ the loopback HTTP listener. You almost certainly want to keep
 > Always combine TLS with `PROXY_AUTH_TOKEN`. HTTPS protects the *transport*
 > but anyone who learns your domain name can still reach the listener — the
 > bearer token is what stops them from spending your subscription quota.
+
+## GLM (Z.AI) support
+
+The proxy can serve [Z.AI GLM coding plans](https://docs.z.ai/devpack/tool/claude)
+alongside Anthropic subscriptions. Z.AI exposes an Anthropic-compatible API, so
+no translation layer is involved — only the base URL and the credential differ.
+
+### Adding a key
+
+```bash
+make add-key PROVIDER=glm LABEL=zai-main PLAN=pro   # prompts for the key
+# or, without docker:
+echo "$ZAI_KEY" | claude-proxy creds add-key --provider glm --label zai-main --plan pro
+```
+
+The key is read from stdin so it stays out of your shell history and out of
+`ps` output. It is verified with a live `GET /v1/models` before being stored —
+a key that cannot authenticate never enters the pool. Add as many as you like;
+they are balanced against each other exactly like Anthropic credentials, and
+`creds set-weight` differentiates plan tiers.
+
+The TUI (`make tui`) adds keys with `k`, and the web UI has an **Add API key**
+button on the Credentials page.
+
+### Using it
+
+Nothing to configure on the client. Once a GLM key is in the pool, GLM models
+appear in Claude Code's `/model` picker next to the Claude ones:
+
+```
+$ curl -s $PROXY/v1/models -H "Authorization: Bearer $TOKEN" | jq -r '.data[].id'
+claude-opus-4-8[1m]
+claude-opus-4-8
+...
+glm-4.7
+glm-5.2
+```
+
+Pick one and it just works. The proxy routes each request by the model it names:
+`glm-*` goes to Z.AI, everything else to Anthropic. Claude Code's background
+haiku calls keep going to Anthropic even while your main model is GLM, each with
+its own sticky credential binding.
+
+**Models you cannot use are never offered.** A provider contributes entries to
+`/v1/models` only when it has a usable credential, so with no GLM key configured
+no `glm-*` model appears at all. If a client asks for one anyway, the proxy
+answers `503` with `X-Router-Reason: provider-unavailable` and a message naming
+the provider — it never silently substitutes a different model.
+
+### What differs from an Anthropic credential
+
+| | Anthropic | GLM |
+|---|---|---|
+| Credential | OAuth, auto-refreshed | static API key, never expires |
+| `401` handling | refresh token, retry once | key marked revoked — replace it |
+| Usage meters | live 5h/7d from Anthropic's usage API | none (see below) |
+| Selection | weight × usage headroom | weight only |
+
+Z.AI publishes no usage/quota API and no rate-limit response headers, so there
+is nothing to poll. Rather than record 0% snapshots — which the selector could
+not distinguish from a genuinely idle key, making an exhausted one look like the
+most attractive in the pool — GLM keys carry no usage data at all. They are
+picked by weight, and a `429` marks the key limited until `Retry-After` elapses,
+exactly like a rate-limited Anthropic credential. The web UI shows this
+explicitly instead of empty meters.
 
 ## Sticky binding & conversation detection
 

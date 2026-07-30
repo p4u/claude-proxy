@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/p4u/claude-proxy/internal/creds"
+	"github.com/p4u/claude-proxy/internal/provider"
 	"github.com/p4u/claude-proxy/internal/store"
 )
 
@@ -45,6 +46,7 @@ type credView struct {
 	ID                  string `json:"id"`
 	Label               string `json:"label,omitempty"`
 	SubscriptionType    string `json:"subscription_type,omitempty"`
+	Provider            string `json:"provider"`
 	Status              string `json:"status"`
 	ExpiresAt           string `json:"expires_at"`
 	RetryAfter          string `json:"retry_after,omitempty"`
@@ -69,6 +71,7 @@ func (h *Handler) listCreds(w http.ResponseWriter, r *http.Request) {
 		v := credView{
 			ID: c.ID, Label: c.Label,
 			SubscriptionType: c.SubscriptionType,
+			Provider:         string(provider.Get(c.Provider).ID),
 			Status:           string(c.Status),
 			ExpiresAt:        c.ExpiresAt.Format(time.RFC3339),
 			RequestCount:     c.RequestCount,

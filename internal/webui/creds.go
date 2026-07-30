@@ -10,12 +10,18 @@ import (
 
 	"github.com/p4u/claude-proxy/internal/creds"
 	"github.com/p4u/claude-proxy/internal/ingest"
+	"github.com/p4u/claude-proxy/internal/provider"
 )
 
 type credView struct {
-	ID                  string `json:"id"`
-	Label               string `json:"label,omitempty"`
-	SubscriptionType    string `json:"subscription_type,omitempty"`
+	ID               string `json:"id"`
+	Label            string `json:"label,omitempty"`
+	SubscriptionType string `json:"subscription_type,omitempty"`
+	Provider         string `json:"provider"`
+	// HasUsageAPI is false for providers that publish no utilization endpoint.
+	// The dashboard uses it to render "—" rather than 0%, which would otherwise
+	// read as "completely idle" for a credential we simply cannot measure.
+	HasUsageAPI         bool   `json:"has_usage_api"`
 	Status              string `json:"status"`
 	ExpiresAt           string `json:"expires_at"`
 	RetryAfter          string `json:"retry_after,omitempty"`
@@ -37,6 +43,8 @@ func (s *Server) handleCredentials(w http.ResponseWriter, r *http.Request, rest 
 		s.listCreds(w, r)
 	case rest == "" && r.Method == http.MethodPost:
 		s.importCred(w, r)
+	case rest == "/keys" && r.Method == http.MethodPost:
+		s.addKeyCred(w, r)
 	default:
 		// /{id} or /{id}/{action}
 		trimmed := strings.TrimPrefix(rest, "/")
@@ -125,6 +133,8 @@ func (s *Server) listCreds(w http.ResponseWriter, r *http.Request) {
 		v := credView{
 			ID: c.ID, Label: c.Label,
 			SubscriptionType: c.SubscriptionType,
+			Provider:         string(provider.Get(c.Provider).ID),
+			HasUsageAPI:      provider.Get(c.Provider).PollsUsage,
 			Status:           string(c.Status),
 			ExpiresAt:        c.ExpiresAt.Format(time.RFC3339),
 			RequestCount:     c.RequestCount,
@@ -171,6 +181,34 @@ func (s *Server) importCred(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{
 		"ok": true, "id": c.ID, "label": c.Label,
 		"subscription_type": c.SubscriptionType, "weight": c.Weight,
+	})
+}
+
+// addKeyCred adds a static API-key credential (POST /api/credentials/keys).
+// Separate from importCred because the two carry different payloads and
+// different verification: an OAuth import is proven alive by refreshing it, a
+// key by calling the provider's /v1/models.
+func (s *Server) addKeyCred(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Provider string `json:"provider"`
+		APIKey   string `json:"api_key"`
+		Label    string `json:"label"`
+		Plan     string `json:"plan"`
+		Weight   int    `json:"weight"`
+	}
+	if err := decodeJSON(w, r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	c, err := ingest.ImportKey(r.Context(), s.db,
+		provider.ID(body.Provider), body.Label, body.Plan, body.APIKey, body.Weight)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{
+		"ok": true, "id": c.ID, "label": c.Label,
+		"provider": string(c.Provider), "weight": c.Weight,
 	})
 }
 

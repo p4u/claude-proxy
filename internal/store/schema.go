@@ -5,6 +5,9 @@ CREATE TABLE IF NOT EXISTS credentials (
   id                TEXT PRIMARY KEY,
   label             TEXT,
   subscription_type TEXT,
+  -- Upstream this credential authenticates against; see internal/provider.
+  -- 'anthropic' (OAuth subscription) or 'glm' (static Z.AI API key).
+  provider          TEXT NOT NULL DEFAULT 'anthropic',
   access_token      TEXT NOT NULL,
   refresh_token     TEXT NOT NULL,
   expires_at        INTEGER NOT NULL,

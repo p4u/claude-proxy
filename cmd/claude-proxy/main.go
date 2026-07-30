@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"github.com/p4u/claude-proxy/internal/ingest"
 	"github.com/p4u/claude-proxy/internal/pool"
 	"github.com/p4u/claude-proxy/internal/prettylog"
+	"github.com/p4u/claude-proxy/internal/provider"
 	"github.com/p4u/claude-proxy/internal/proxy"
 	"github.com/p4u/claude-proxy/internal/store"
 	"github.com/p4u/claude-proxy/internal/tui"
@@ -43,6 +45,8 @@ Usage:
   claude-proxy users limit <id>       --tokens 1M --window 24h | --none [--db PATH]
   claude-proxy tui                 [--db PATH]   # interactive management UI
   claude-proxy creds import        --from FILE [--label NAME] [--weight N]
+  claude-proxy creds add-key       --provider glm [--key KEY] [--label NAME] [--plan TIER] [--weight N]
+                                                 # omit --key to read it from stdin
   claude-proxy creds update <id>   --from FILE   # replace tokens from a fresh login
   claude-proxy creds export        [--db PATH]   # JSONL to stdout
   claude-proxy creds import-bulk   [--db PATH]   # JSONL from stdin
@@ -266,13 +270,15 @@ func runTUI(args []string) {
 
 func runCreds(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "creds: missing subcommand (import|update|export|import-bulk|list|usage|usage-history|disable|rm|refresh|set-weight)")
+		fmt.Fprintln(os.Stderr, "creds: missing subcommand (import|add-key|update|export|import-bulk|list|usage|usage-history|disable|rm|refresh|set-weight)")
 		os.Exit(2)
 	}
 	ctx := context.Background()
 	switch args[0] {
 	case "import":
 		credsImport(ctx, args[1:])
+	case "add-key":
+		credsAddKey(ctx, args[1:])
 	case "update":
 		credsUpdate(ctx, args[1:])
 	case "export":
@@ -346,6 +352,43 @@ func credsUpdate(ctx context.Context, args []string) {
 		c.ID, c.Label, c.SubscriptionType, string(c.Status), c.ExpiresAt.Format(time.RFC3339))
 }
 
+// credsAddKey adds a static API-key credential (currently GLM). OAuth
+// subscriptions keep using `creds import` with a .credentials.json.
+func credsAddKey(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("creds add-key", flag.ExitOnError)
+	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
+	prov := fs.String("provider", string(provider.GLM), "provider id (glm)")
+	key := fs.String("key", "", "API key (omit to read from stdin)")
+	label := fs.String("label", "", "display label (defaults to the provider id)")
+	plan := fs.String("plan", "", "plan tier label, e.g. lite|pro|max (display only)")
+	weight := fs.Int("weight", 0, "selection weight (0 = provider default)")
+	_ = fs.Parse(args)
+
+	apiKey := strings.TrimSpace(*key)
+	if apiKey == "" {
+		// Reading from stdin keeps the key out of the shell history and out of
+		// the process list, where a --key flag would be visible to any local
+		// user via `ps`.
+		raw, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "add-key: read stdin: %v\n", err)
+			os.Exit(1)
+		}
+		apiKey = strings.TrimSpace(string(raw))
+	}
+
+	db := openDB(*dbPath)
+	defer db.Close()
+
+	fmt.Fprintf(os.Stderr, "verifying key with %s...\n", provider.Get(provider.ID(*prov)).Name)
+	c, err := ingest.ImportKey(ctx, db, provider.ID(*prov), *label, *plan, apiKey, *weight)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "add-key: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("added %s  provider=%s  label=%s  weight=%d\n", c.ID, c.Provider, c.Label, c.Weight)
+}
+
 func credsList(ctx context.Context, args []string) {
 	fs := flag.NewFlagSet("creds list", flag.ExitOnError)
 	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
@@ -361,16 +404,22 @@ func credsList(ctx context.Context, args []string) {
 		fmt.Println("(no credentials)")
 		return
 	}
-	fmt.Printf("%-30s  %-10s  %-6s  %3s  %-9s  %-25s  %5s/%5s/%5s  %s\n",
-		"ID", "LABEL", "SUB", "WT", "STATUS", "EXPIRES", "REQ", "OK", "ERR", "LAST_REQ")
+	fmt.Printf("%-30s  %-9s  %-10s  %-6s  %3s  %-9s  %-25s  %5s/%5s/%5s  %s\n",
+		"ID", "PROVIDER", "LABEL", "SUB", "WT", "STATUS", "EXPIRES", "REQ", "OK", "ERR", "LAST_REQ")
 	for _, c := range list {
 		lastReq := "-"
 		if c.LastRequestAt != nil {
 			lastReq = c.LastRequestAt.Format(time.RFC3339)
 		}
-		fmt.Printf("%-30s  %-10s  %-6s  %3d  %-9s  %-25s  %5d/%5d/%5d  %s\n",
-			c.ID, c.Label, c.SubscriptionType, c.Weight, string(c.Status),
-			c.ExpiresAt.Format(time.RFC3339),
+		// API keys carry a synthetic far-future expiry that would only be
+		// noise in a listing; show it as "never" instead of a date in 2126.
+		expires := c.ExpiresAt.Format(time.RFC3339)
+		if !provider.Get(c.Provider).Refreshable {
+			expires = "never (api key)"
+		}
+		fmt.Printf("%-30s  %-9s  %-10s  %-6s  %3d  %-9s  %-25s  %5d/%5d/%5d  %s\n",
+			c.ID, provider.Get(c.Provider).ID, c.Label, c.SubscriptionType, c.Weight, string(c.Status),
+			expires,
 			c.RequestCount, c.SuccessCount, c.ErrorCount, lastReq)
 	}
 }

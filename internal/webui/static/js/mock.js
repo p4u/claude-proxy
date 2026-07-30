@@ -3,13 +3,21 @@
 
 import { API_BASE } from "./api.js";
 
+// `provider` is omitted for Anthropic rows (the API always sends it, but
+// defaulting here keeps the fixtures readable). The GLM entry exercises the
+// API-key rendering path: no usage meters, no expiry, no refresh action.
 const CREDS = [
   { id: "cred_ax91", label: "max-personal", type: "max", weight: 5, status: "active" },
   { id: "cred_bt42", label: "team-eu", type: "team", weight: 5, status: "active" },
   { id: "cred_ck88", label: "pro-backup", type: "pro", weight: 1, status: "limited" },
   { id: "cred_dz17", label: "enterprise-01", type: "enterprise", weight: 5, status: "active" },
   { id: "cred_er05", label: "pro-old", type: "pro", weight: 1, status: "disabled" },
+  { id: "cred_gl01", label: "zai-main", type: "pro", weight: 1, status: "active", provider: "glm" },
 ];
+
+// Mirrors internal/provider: only Anthropic publishes a utilization API.
+const providerOf = (c) => c.provider || "anthropic";
+const hasUsageAPI = (c) => providerOf(c) === "anthropic";
 // full_capture and the usage limit are mutated in place by
 // POST /users/{id}/capture and POST /users/{id}/limit, so both toggles stay
 // stateful for the whole mock session.
@@ -167,9 +175,11 @@ const DB = {
     }));
   },
   "/usage/current": () => {
-    const fives = [72, 41, 100, 18, 0];
-    const sevens = [58, 63, 92, 22, 0];
-    const sonnets = [44, 51, 78, 15, 0];
+    // Trailing 0s are the GLM key: providers with no usage API report no
+    // percentages at all, and the frontend hides the meters for them.
+    const fives = [72, 41, 100, 18, 0, 0];
+    const sevens = [58, 63, 92, 22, 0, 0];
+    const sonnets = [44, 51, 78, 15, 0, 0];
     // Score mirrors the pool: weight × room_5h × room_7d^1.5. Disabled creds and
     // saturated snapshots (≥100% on either window) are excluded from the share.
     const rows = CREDS.map((c, i) => {
@@ -181,16 +191,21 @@ const DB = {
       const score = active ? c.weight * room5 * Math.pow(room7, 1.5) : 0;
       return { c, i, five, seven, sonnet: sonnets[i], room5, room7, saturated, score };
     });
-    const sum = rows.reduce((a, r) => a + r.score, 0) || 1;
+    // Share is totalled per provider, matching the backend: the pool filters by
+    // provider before scoring, so a GLM key only competes with other GLM keys.
+    const sums = {};
+    for (const r of rows) sums[providerOf(r.c)] = (sums[providerOf(r.c)] || 0) + r.score;
     return rows.map(({ c, i, five, seven, sonnet, room5, room7, saturated, score }) => ({
       credential_id: c.id, label: c.label, subscription_type: c.type, status: c.status, weight: c.weight,
+      provider: providerOf(c), has_usage_api: hasUsageAPI(c),
       five_hour: { pct: five, resets_at: now + (3600 * (1 + i)) },
       seven_day: { pct: seven, resets_at: now + (86400 * (2 + i)) },
       seven_day_sonnet: { pct: sonnet, resets_at: now + (86400 * (2 + i)) },
-      captured_at: now - 300 - i * 90,
+      // No usage API ⇒ no snapshot was ever recorded.
+      captured_at: hasUsageAPI(c) ? now - 300 - i * 90 : null,
       selection: {
         room_5h: room5, room_7d: room7, score,
-        share_pct: score > 0 ? (score / sum) * 100 : 0,
+        share_pct: score > 0 ? (score / (sums[providerOf(c)] || 1)) * 100 : 0,
         saturated,
       },
     }));
@@ -199,7 +214,9 @@ const DB = {
     // Aligned grid: shared buckets, one value per bucket per series, null gaps.
     const n = 48;
     const b = buckets(q, n);
-    const active = CREDS.filter((c) => c.status !== "disabled");
+    // Only credentials whose provider has a usage API ever produce history
+    // rows, so a GLM key has no series at all — not a flat or zeroed one.
+    const active = CREDS.filter((c) => c.status !== "disabled" && hasUsageAPI(c));
     const series = active.map((c, i) => {
       const five = wave(n, 30 + i * 12, 55, i + 2).map((v) => Math.min(100, v));
       const seven = wave(n, 25 + i * 10, 45, i + 5).map((v) => Math.min(100, v));
@@ -234,7 +251,8 @@ const DB = {
   "/credentials": () =>
     CREDS.map((c, i) => ({
       id: c.id, label: c.label, subscription_type: c.type, status: c.status, weight: c.weight,
-      request_count: [8200, 5400, 1200, 3600, 40][i], last_request_at: c.status === "disabled" ? null : now - 60 * (i + 1),
+      provider: providerOf(c), has_usage_api: hasUsageAPI(c),
+      request_count: [8200, 5400, 1200, 3600, 40, 970][i], last_request_at: c.status === "disabled" ? null : now - 60 * (i + 1),
       expires_at: now + 3600 * (5 - i), created_at: now - 86400 * (30 - i * 4),
     })),
   "/users": () =>
@@ -388,6 +406,20 @@ window.fetch = async (input, init = {}) => {
   // Mutations: acknowledge.
   if (method !== "GET") {
     if (path === "/users" && method === "POST") return json({ id: "utok_new", name: JSON.parse(init.body || "{}").name || "new", token: "cpu_" + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2) });
+    // Adding a key appends to CREDS so the credentials table reflects it for
+    // the rest of the mock session, matching how the real endpoint behaves.
+    if (path === "/credentials/keys" && method === "POST") {
+      const b = JSON.parse(init.body || "{}");
+      if (!b.api_key) return json({ error: "API key is empty" }, 400);
+      const c = {
+        id: "cred_" + Math.random().toString(36).slice(2, 6),
+        label: b.label || b.provider || "glm",
+        type: b.plan || "", weight: b.weight || 1,
+        status: "active", provider: b.provider || "glm",
+      };
+      CREDS.push(c);
+      return json({ ok: true, id: c.id, label: c.label, provider: c.provider, weight: c.weight });
+    }
     if (path.endsWith("/rotate")) return json({ token: "cpu_" + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2) });
     // Per-user capture mode — stateful for the session.
     const cm = path.match(/^\/users\/([^/]+)\/capture$/);

@@ -96,6 +96,8 @@ export const api = {
   usageHistory: (win, credId) =>
     request("GET", `/usage/history?${winParams(win)}` + (credId ? `&credential_id=${credId}` : "")),
   credentials: () => request("GET", "/credentials"),
+  // Static API keys (GLM). OAuth subscriptions use POST /credentials instead.
+  addKey: (body) => request("POST", "/credentials/keys", body),
   users: () => request("GET", "/users"),
 
   // Per-user capture mode. `full` true ⇒ store both sides of every conversation.

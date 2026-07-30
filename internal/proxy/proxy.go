@@ -14,15 +14,14 @@ import (
 
 	"github.com/p4u/claude-proxy/internal/creds"
 	"github.com/p4u/claude-proxy/internal/pool"
+	"github.com/p4u/claude-proxy/internal/provider"
 	"github.com/p4u/claude-proxy/internal/router"
 	"github.com/p4u/claude-proxy/internal/store"
 	"github.com/p4u/claude-proxy/internal/usertoken"
 )
 
-const (
-	UpstreamHost = "api.anthropic.com"
-	maxBodyBytes = 16 << 20 // 16 MiB hard ceiling on buffered request body
-)
+// maxBodyBytes is a hard ceiling on the buffered request body.
+const maxBodyBytes = 16 << 20 // 16 MiB
 
 type Handler struct {
 	db        *store.DB
@@ -99,6 +98,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Which upstream serves this request is decided by the model the client
+	// asked for, before any credential is chosen — a GLM model can only be
+	// served by a GLM key, and vice versa.
+	prov := providerFor(r, body)
+
 	var (
 		cred    *creds.Credential
 		convID  string
@@ -106,29 +110,37 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 	if needsSticky(r) {
 		dr := router.Derive(r, body)
-		convID, convSrc = dr.ConvID, dr.Source
-		c, isNew, err := h.pool.Bind(r.Context(), convID)
+		convSrc = dr.Source
+		// The stored conversation key is provider-scoped so a session that
+		// mixes providers (a GLM main model alongside Claude Code's built-in
+		// haiku background calls) keeps one stable binding per provider
+		// instead of the two fighting over a single pin. Logged and recorded
+		// in the qualified form so request_log, prompt_log and conversations
+		// all agree on one identifier.
+		convID = pool.Key(dr.ConvID, prov)
+		c, isNew, err := h.pool.Bind(r.Context(), dr.ConvID, prov)
 		if err != nil {
-			h.log.Warn("bind failed", "err", err, "conv", convID, "src", string(convSrc))
-			h.failBind(w, err)
+			h.log.Warn("bind failed", "err", err, "conv", convID, "src", string(convSrc), "provider", string(prov))
+			h.failBind(w, err, prov)
 			return
 		}
 		cred = c
 		h.log.Info("bind",
 			"conv", convID, "src", string(convSrc), "new", isNew,
+			"provider", string(prov),
 			"cred", cred.ID, "label", cred.Label,
 			"sub", cred.SubscriptionType, "weight", cred.Weight,
 			"status", string(cred.Status),
 			"req_count", cred.RequestCount, "path", r.URL.Path)
 	} else {
-		c, err := h.pickAny(r.Context())
+		c, err := h.pickForProvider(r.Context(), prov)
 		if err != nil {
-			h.failBind(w, err)
+			h.failBind(w, err, prov)
 			return
 		}
 		cred = c
 		h.log.Info("non-sticky pick",
-			"cred", cred.ID, "label", cred.Label,
+			"cred", cred.ID, "label", cred.Label, "provider", string(prov),
 			"sub", cred.SubscriptionType, "path", r.URL.Path)
 	}
 
@@ -213,10 +225,16 @@ func needsSticky(r *http.Request) bool {
 	return r.Method == "POST" && (r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/messages/count_tokens")
 }
 
-func (h *Handler) failBind(w http.ResponseWriter, err error) {
+func (h *Handler) failBind(w http.ResponseWriter, err error, prov provider.ID) {
 	switch {
 	case errors.Is(err, pool.ErrNoCredentials):
-		http.Error(w, `{"type":"error","error":{"type":"overloaded_error","message":"proxy: no active credentials"}}`, http.StatusServiceUnavailable)
+		// Name the provider. With more than one upstream configured, "no active
+		// credentials" is ambiguous and actively misleading: the pool may be
+		// full of healthy Anthropic subscriptions and still have nothing that
+		// can serve a GLM model. The operator needs to know which one to fix.
+		p := provider.Get(prov)
+		w.Header().Set("X-Router-Reason", "provider-unavailable")
+		http.Error(w, `{"type":"error","error":{"type":"overloaded_error","message":"proxy: no active `+p.Name+` credentials"}}`, http.StatusServiceUnavailable)
 	case errors.Is(err, pool.ErrCredentialOrphaned):
 		w.Header().Set("X-Router-Reason", "credential-orphaned")
 		http.Error(w, `{"type":"error","error":{"type":"authentication_error","message":"proxy: pinned credential revoked; re-import"}}`, http.StatusServiceUnavailable)
@@ -225,36 +243,17 @@ func (h *Handler) failBind(w http.ResponseWriter, err error) {
 	}
 }
 
-// pickAny returns any credential for non-sticky paths. Prefers active; falls
-// back to limited so the request reaches Anthropic and gets a real 429 rather
-// than a proxy-generated 503.
-func (h *Handler) pickAny(ctx context.Context) (*creds.Credential, error) {
-	list, err := creds.List(ctx, h.db)
-	if err != nil {
-		return nil, err
-	}
-	var fallback *creds.Credential
-	for _, c := range list {
-		if c.Status == creds.StatusActive {
-			return c, nil
-		}
-		if c.Status == creds.StatusLimited && fallback == nil {
-			fallback = c
-		}
-	}
-	if fallback != nil {
-		return fallback, nil
-	}
-	return nil, pool.ErrNoCredentials
-}
-
 // forward sends the request upstream and streams the response back. Returns the
 // upstream HTTP status (or -1 on local failure), bytes received from upstream,
 // the parsed token usage, and — when captureText is set — the assistant's
 // visible output text (for full conversation capture). If allowRetry is true
 // and upstream returns 401, the proxy refreshes the credential and retries once.
 func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, cred *creds.Credential, allowRetry, captureText bool) (int, int64, tokenUsage, string) {
-	upstreamURL := "https://" + UpstreamHost + r.URL.RequestURI()
+	// The upstream is a property of the credential, not of the proxy. GLM's
+	// base URL carries a path prefix (/api/anthropic), so this concatenates
+	// onto the base rather than swapping a host.
+	up := provider.Get(credProvider(cred))
+	upstreamURL := up.BaseURL + r.URL.RequestURI()
 
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, bytes.NewReader(body))
 	if err != nil {
@@ -264,7 +263,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 	}
 
 	copyHeaders(upstreamReq.Header, r.Header)
-	upstreamReq.Host = UpstreamHost
+	upstreamReq.Host = upstreamReq.URL.Host
 	upstreamReq.Header.Set("Authorization", "Bearer "+cred.AccessToken)
 	upstreamReq.Header.Del("X-Api-Key")
 	for k := range upstreamReq.Header {
@@ -292,6 +291,22 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 		"rl_tokens_remaining", resp.Header.Get("Anthropic-Ratelimit-Tokens-Remaining"),
 		"rl_requests_remaining", resp.Header.Get("Anthropic-Ratelimit-Requests-Remaining"),
 	)
+
+	if resp.StatusCode == http.StatusUnauthorized && allowRetry && !up.Refreshable {
+		// Static API key: a 401 means the key is wrong or revoked, not stale.
+		// Retrying after a "refresh" would be a no-op that burns a second
+		// request and reports a misleading OAuth failure, so fail immediately
+		// and say what actually needs fixing.
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
+		_ = creds.SetStatus(r.Context(), h.db, cred.ID, creds.StatusRevoked)
+		_ = creds.MarkError(r.Context(), h.db, cred.ID)
+		h.log.Error("upstream 401 on API key; marked revoked",
+			"cred", cred.ID, "label", cred.Label, "provider", string(up.ID),
+			"snippet", decodeBodySnippet(raw, resp.Header.Get("Content-Encoding")))
+		http.Error(w, `{"type":"error","error":{"type":"authentication_error","message":"proxy: `+up.Name+` API key rejected; replace it"}}`, http.StatusBadGateway)
+		return 401, 0, tokenUsage{}, ""
+	}
 
 	if resp.StatusCode == http.StatusUnauthorized && allowRetry {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))

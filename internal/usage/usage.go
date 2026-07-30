@@ -14,6 +14,7 @@ import (
 
 	"github.com/guptarohit/asciigraph"
 	"github.com/p4u/claude-proxy/internal/creds"
+	"github.com/p4u/claude-proxy/internal/provider"
 	"github.com/p4u/claude-proxy/internal/store"
 )
 
@@ -309,6 +310,15 @@ func (p *Poller) poll(ctx context.Context) {
 		return
 	}
 	for _, c := range list {
+		// Only Anthropic publishes a utilization API. Polling a provider that
+		// has none would fail every cycle; worse, recording a zeroed snapshot
+		// instead would be read by the pool as "wide open", making an
+		// exhausted key look like the most attractive one in the pool.
+		// Providers without a usage API are left with no snapshots at all, so
+		// selection falls through to its headroom=1.0 weight-only path.
+		if !provider.Get(c.Provider).PollsUsage {
+			continue
+		}
 		if c.Status == creds.StatusDisabled || c.Status == creds.StatusRevoked {
 			continue
 		}

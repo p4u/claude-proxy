@@ -63,7 +63,7 @@ func (m *model) helpLine() string {
 	}
 	common := "↑/↓ move · tab switch · q quit"
 	if m.tab == tabCreds {
-		return "creds: r refresh · u update-token · w weight · d disable/enable · x delete · i import · p paste   " + common
+		return "creds: r refresh · u update-token · w weight · d disable/enable · x delete · i import · p paste · k api-key   " + common
 	}
 	return "users: c create · R rotate-token · d disable/enable · x delete   " + common
 }

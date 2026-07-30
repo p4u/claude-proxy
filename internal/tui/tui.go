@@ -47,6 +47,9 @@ const (
 	inputUpdateFile
 	inputUserName
 	inputPasteJSON
+	// API-key credentials are entered in two steps: the key, then a label.
+	inputAPIKey
+	inputAPIKeyLabel
 )
 
 var (
@@ -92,6 +95,7 @@ func (m *model) initTables() {
 	m.credTable = table.New(
 		table.WithColumns([]table.Column{
 			{Title: "ID", Width: 22},
+			{Title: "Provider", Width: 9},
 			{Title: "Label", Width: 14},
 			{Title: "Sub", Width: 6},
 			{Title: "Wt", Width: 3},

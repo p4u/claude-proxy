@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/p4u/claude-proxy/internal/creds"
+	"github.com/p4u/claude-proxy/internal/provider"
 	"github.com/p4u/claude-proxy/internal/store"
 )
 
@@ -43,23 +44,47 @@ func NewWithLogger(db *store.DB, log *slog.Logger) *Pool {
 // concurrently running CLI or TUI all write to the same file, so losing a race
 // is normal and transient. bindOnce is a self-contained transaction that rolls
 // back whole, which is what makes re-running it safe.
-func (p *Pool) Bind(ctx context.Context, convID string) (*creds.Credential, bool, error) {
+// The credential is chosen from prov's credentials only. Callers pass the
+// provider that serves the request's model; see Key for how the two combine.
+func (p *Pool) Bind(ctx context.Context, convID string, prov provider.ID) (*creds.Credential, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if prov == "" {
+		prov = provider.Default
+	}
 	var (
 		c     *creds.Credential
 		isNew bool
 	)
 	err := store.Retry(ctx, func() error {
 		var err error
-		c, isNew, err = p.bindOnce(ctx, convID)
+		c, isNew, err = p.bindOnce(ctx, convID, prov)
 		return err
 	})
 	return c, isNew, err
 }
 
-func (p *Pool) bindOnce(ctx context.Context, convID string) (*creds.Credential, bool, error) {
+// Key returns the storage key for a conversation's sticky binding on a given
+// provider.
+//
+// A single Claude Code session sends its main-model turns and its background
+// haiku calls under the same derived conversation ID. Once those can land on
+// different providers, one key per conversation is not enough: each request
+// would find the other provider's credential pinned and migrate the binding,
+// so the two would fight and neither would ever be sticky.
+//
+// Scoping the key by provider gives each its own stable pin. Anthropic keeps
+// the bare ID so existing rows, existing bindings and existing dashboard links
+// are untouched; other providers are prefixed.
+func Key(convID string, prov provider.ID) string {
+	if convID == "" || prov == "" || prov == provider.Default {
+		return convID
+	}
+	return string(prov) + ":" + convID
+}
+
+func (p *Pool) bindOnce(ctx context.Context, convID string, prov provider.ID) (*creds.Credential, bool, error) {
 	tx, err := p.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, false, err
@@ -69,18 +94,21 @@ func (p *Pool) bindOnce(ctx context.Context, convID string) (*creds.Credential, 
 	var credID string
 	var newConv bool
 
-	err = tx.QueryRowContext(ctx, `SELECT credential_id FROM conversations WHERE id=?`, convID).Scan(&credID)
+	// Sticky bindings are per (conversation, provider) — see Key.
+	convKey := Key(convID, prov)
+
+	err = tx.QueryRowContext(ctx, `SELECT credential_id FROM conversations WHERE id=?`, convKey).Scan(&credID)
 	switch {
 	case err == sql.ErrNoRows:
 		newConv = true
-		credID, err = p.pickActiveLocked(ctx, tx)
+		credID, err = p.pickActiveLocked(ctx, tx, prov)
 		if err != nil {
 			return nil, false, err
 		}
 		now := time.Now().Unix()
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO conversations (id, credential_id, created_at, last_seen_at, request_count, status)
-			VALUES (?, ?, ?, ?, 1, 'active')`, convID, credID, now, now); err != nil {
+			VALUES (?, ?, ?, ?, 1, 'active')`, convKey, credID, now, now); err != nil {
 			return nil, false, err
 		}
 	case err != nil:
@@ -88,7 +116,7 @@ func (p *Pool) bindOnce(ctx context.Context, convID string) (*creds.Credential, 
 	default:
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE conversations SET last_seen_at=?, request_count=request_count+1 WHERE id=?`,
-			time.Now().Unix(), convID); err != nil {
+			time.Now().Unix(), convKey); err != nil {
 			return nil, false, err
 		}
 	}
@@ -111,7 +139,7 @@ func (p *Pool) bindOnce(ctx context.Context, convID string) (*creds.Credential, 
 	if !newConv {
 		switch c.Status {
 		case creds.StatusExpired, creds.StatusRevoked, creds.StatusDisabled:
-			newCredID, perr := p.pickActiveLocked(ctx, tx)
+			newCredID, perr := p.pickActiveLocked(ctx, tx, prov)
 			if perr != nil {
 				if errors.Is(perr, ErrNoCredentials) {
 					return c, false, ErrCredentialOrphaned
@@ -120,7 +148,7 @@ func (p *Pool) bindOnce(ctx context.Context, convID string) (*creds.Credential, 
 			}
 			if _, uerr := tx.ExecContext(ctx,
 				`UPDATE conversations SET credential_id=?, last_seen_at=? WHERE id=?`,
-				newCredID, time.Now().Unix(), convID); uerr != nil {
+				newCredID, time.Now().Unix(), convKey); uerr != nil {
 				return nil, false, uerr
 			}
 			rebound, gerr := getCredTx(ctx, tx, newCredID)
@@ -138,7 +166,7 @@ func (p *Pool) bindOnce(ctx context.Context, convID string) (*creds.Credential, 
 				return nil, false, serr
 			}
 			if saturated {
-				newCredID, perr := p.pickActiveLocked(ctx, tx)
+				newCredID, perr := p.pickActiveLocked(ctx, tx, prov)
 				switch {
 				case errors.Is(perr, ErrNoCredentials):
 					// No healthy alternative — keep the sticky (saturated) pin
@@ -148,7 +176,7 @@ func (p *Pool) bindOnce(ctx context.Context, convID string) (*creds.Credential, 
 				case newCredID != credID:
 					if _, uerr := tx.ExecContext(ctx,
 						`UPDATE conversations SET credential_id=?, last_seen_at=? WHERE id=?`,
-						newCredID, time.Now().Unix(), convID); uerr != nil {
+						newCredID, time.Now().Unix(), convKey); uerr != nil {
 						return nil, false, uerr
 					}
 					rebound, gerr := getCredTx(ctx, tx, newCredID)
@@ -199,11 +227,20 @@ func (p *Pool) bindOnce(ctx context.Context, convID string) (*creds.Credential, 
 // before scoring — a maxed-out subscription is never selected for a new
 // conversation. Only the limited fallback below can still reach a saturated
 // credential, and only as the last resort to obtain a real 429 + Retry-After.
-func (p *Pool) pickActiveLocked(ctx context.Context, tx *sql.Tx) (string, error) {
+// Provider is a hard pre-filter, applied before any scoring: a request for a
+// GLM model can only ever be served by a GLM credential, so an Anthropic
+// subscription is not a fallback for it (it cannot serve that model at all) and
+// vice versa. Weights and usage scores therefore only ever compare credentials
+// within one provider.
+func (p *Pool) pickActiveLocked(ctx context.Context, tx *sql.Tx, prov provider.ID) (string, error) {
+	if prov == "" {
+		prov = provider.Default
+	}
 	now := time.Now()
 	rows, err := tx.QueryContext(ctx, `
 		SELECT c.id, c.weight FROM credentials c
 		WHERE c.status='active'
+		  AND COALESCE(c.provider,'anthropic') = ?
 		  AND (c.retry_after IS NULL OR c.retry_after < ?)
 		  AND NOT EXISTS (
 		    SELECT 1 FROM usage_history u
@@ -213,7 +250,7 @@ func (p *Pool) pickActiveLocked(ctx context.Context, tx *sql.Tx) (string, error)
 		      )
 		      AND (u.five_hour_pct >= 100 OR u.seven_day_pct >= 100)
 		  )
-		ORDER BY c.id`, now.Unix())
+		ORDER BY c.id`, string(prov), now.Unix())
 	if err != nil {
 		return "", err
 	}
@@ -241,7 +278,8 @@ func (p *Pool) pickActiveLocked(ctx context.Context, tx *sql.Tx) (string, error)
 		lrows, lerr := tx.QueryContext(ctx, `
 			SELECT id, weight FROM credentials
 			WHERE status='limited'
-			ORDER BY COALESCE(retry_after, 0) ASC, id`)
+			  AND COALESCE(provider,'anthropic') = ?
+			ORDER BY COALESCE(retry_after, 0) ASC, id`, string(prov))
 		if lerr != nil {
 			return "", lerr
 		}
@@ -422,45 +460,15 @@ func credSaturatedLocked(ctx context.Context, tx *sql.Tx, credID string) (bool, 
 	return Saturated(fhPct, sdPct), nil
 }
 
+// getCredTx reads one credential inside the caller's transaction.
+//
+// It deliberately reuses creds.SelectCols and creds.ScanCred rather than
+// re-spelling the query: this function previously carried its own copy of the
+// column list, which is exactly the kind of duplication that turns "add a
+// column" into a silent scan mismatch here while every other read path works.
 func getCredTx(ctx context.Context, tx *sql.Tx, id string) (*creds.Credential, error) {
-	row := tx.QueryRowContext(ctx, `
-		SELECT id, COALESCE(label,''), COALESCE(subscription_type,''),
-		       access_token, refresh_token, expires_at, status,
-		       retry_after, last_success_at, last_429_at, last_request_at,
-		       request_count, success_count, error_count, weight, created_at
-		FROM credentials WHERE id=?`, id)
-	c := &creds.Credential{}
-	var exp, created int64
-	var ra, ls, l429, lreq sql.NullInt64
-	var status string
-	if err := row.Scan(
-		&c.ID, &c.Label, &c.SubscriptionType,
-		&c.AccessToken, &c.RefreshToken, &exp, &status,
-		&ra, &ls, &l429, &lreq,
-		&c.RequestCount, &c.SuccessCount, &c.ErrorCount, &c.Weight, &created,
-	); err != nil {
-		return nil, err
-	}
-	c.ExpiresAt = time.Unix(exp, 0)
-	c.Status = creds.Status(status)
-	c.CreatedAt = time.Unix(created, 0)
-	if ra.Valid {
-		t := time.Unix(ra.Int64, 0)
-		c.RetryAfter = &t
-	}
-	if ls.Valid {
-		t := time.Unix(ls.Int64, 0)
-		c.LastSuccessAt = &t
-	}
-	if l429.Valid {
-		t := time.Unix(l429.Int64, 0)
-		c.Last429At = &t
-	}
-	if lreq.Valid {
-		t := time.Unix(lreq.Int64, 0)
-		c.LastRequestAt = &t
-	}
-	return c, nil
+	row := tx.QueryRowContext(ctx, `SELECT `+creds.SelectCols+` FROM credentials WHERE id=?`, id)
+	return creds.ScanCred(row)
 }
 
 // Janitor heals limited→active when retry_after passes, every 30s.

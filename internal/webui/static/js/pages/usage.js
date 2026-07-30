@@ -58,11 +58,12 @@ function subCard(r) {
   const seven = r.seven_day || {};
   const sonnet = r.seven_day_sonnet || {};
   const sel = r.selection || null;
+  const noUsageAPI = r.has_usage_api === false;
   return el("div", { class: "card sub-card" }, [
     el("div", { class: "sub-card__head" }, [
       el("div", {}, [
         el("div", { class: "sub-card__name", text: r.label || r.credential_id }),
-        el("div", { class: "sub-card__meta", text: [r.subscription_type, `weight ${r.weight}`].filter(Boolean).join(" · ") }),
+        el("div", { class: "sub-card__meta", text: [r.provider, r.subscription_type, `weight ${r.weight}`].filter(Boolean).join(" · ") }),
       ]),
       el("div", { class: "sub-card__badges" }, [
         sel && sel.saturated ? el("span", { class: "badge badge--critical", title: "Excluded from new sessions" }, [
@@ -71,13 +72,20 @@ function subCard(r) {
         statusBadge(r.status),
       ]),
     ]),
-    el("div", { class: "sub-card__meters" }, [
-      meter({ label: "5-hour window", value: five.pct, resets: countdown(five.resets_at) }),
-      meter({ label: "7-day window", value: seven.pct, resets: countdown(seven.resets_at) }),
-      meter({ label: "7-day Sonnet", value: sonnet.pct, resets: countdown(sonnet.resets_at) }),
-    ]),
+    // Providers with no utilization API get no meters at all. Rendering them
+    // at 0% would be a lie in the most dangerous direction: it reads as
+    // "completely idle", which is exactly how an exhausted key would look.
+    noUsageAPI
+      ? el("div", { class: "sub-card__empty", text: "This provider publishes no usage API — selection uses weight only, and a 429 marks the key limited until it recovers." })
+      : el("div", { class: "sub-card__meters" }, [
+        meter({ label: "5-hour window", value: five.pct, resets: countdown(five.resets_at) }),
+        meter({ label: "7-day window", value: seven.pct, resets: countdown(seven.resets_at) }),
+        meter({ label: "7-day Sonnet", value: sonnet.pct, resets: countdown(sonnet.resets_at) }),
+      ]),
     sel ? selectionRow(sel) : null,
-    el("div", { class: "sub-card__foot", text: r.captured_at ? `snapshot ${relTime(tsOf(r.captured_at))}` : "no snapshot yet" }),
+    noUsageAPI
+      ? null
+      : el("div", { class: "sub-card__foot", text: r.captured_at ? `snapshot ${relTime(tsOf(r.captured_at))}` : "no snapshot yet" }),
   ]);
 }
 

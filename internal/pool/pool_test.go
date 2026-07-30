@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/p4u/claude-proxy/internal/creds"
+	"github.com/p4u/claude-proxy/internal/provider"
 	"github.com/p4u/claude-proxy/internal/store"
 )
 
@@ -42,7 +43,7 @@ func TestRoundRobinNewConversations(t *testing.T) {
 	// one credential being skipped in 30 draws is (2/3)^30 < 0.0001.
 	got := map[string]bool{}
 	for i := 0; i < 30; i++ {
-		c, isNew, err := p.Bind(ctx, fmt.Sprintf("conv-%d", i))
+		c, isNew, err := p.Bind(ctx, fmt.Sprintf("conv-%d", i), provider.Anthropic)
 		if err != nil {
 			t.Fatalf("bind %d: %v", i, err)
 		}
@@ -63,12 +64,12 @@ func TestStickyBinding(t *testing.T) {
 	p := New(db)
 	ctx := context.Background()
 
-	c1, isNew, err := p.Bind(ctx, "convX")
+	c1, isNew, err := p.Bind(ctx, "convX", provider.Anthropic)
 	if err != nil || !isNew {
 		t.Fatalf("first bind: isNew=%v err=%v", isNew, err)
 	}
 	for i := 0; i < 5; i++ {
-		c, isNew, _ := p.Bind(ctx, "convX")
+		c, isNew, _ := p.Bind(ctx, "convX", provider.Anthropic)
 		if isNew {
 			t.Fatalf("repeat bind reported new")
 		}
@@ -89,7 +90,7 @@ func TestSkipsLimitedOnNewConversation(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, conv := range []string{"n1", "n2", "n3", "n4"} {
-		c, _, err := p.Bind(ctx, conv)
+		c, _, err := p.Bind(ctx, conv, provider.Anthropic)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -104,11 +105,11 @@ func TestExistingConvKeptOnLimited(t *testing.T) {
 	p := New(db)
 	ctx := context.Background()
 
-	c1, _, _ := p.Bind(ctx, "convY")
+	c1, _, _ := p.Bind(ctx, "convY", provider.Anthropic)
 	if err := creds.MarkLimited(ctx, db, c1.ID, time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	c2, isNew, err := p.Bind(ctx, "convY")
+	c2, isNew, err := p.Bind(ctx, "convY", provider.Anthropic)
 	if err != nil {
 		t.Fatalf("expected sticky-passthrough, got %v", err)
 	}
@@ -133,7 +134,7 @@ func TestAllLimitedFallback(t *testing.T) {
 	}
 	// A new conversation should still bind (fall back to a limited credential)
 	// rather than return ErrNoCredentials.
-	c, isNew, err := p.Bind(ctx, "new-conv-all-limited")
+	c, isNew, err := p.Bind(ctx, "new-conv-all-limited", provider.Anthropic)
 	if err != nil {
 		t.Fatalf("expected fallback to limited credential, got err: %v", err)
 	}
@@ -161,7 +162,7 @@ func TestSpreadAcrossTwoCreds(t *testing.T) {
 	// P(one cred never picked) = (1/2)^20 < 0.000001.
 	seen := map[string]bool{}
 	for i := 0; i < 20; i++ {
-		c, _, err := p.Bind(ctx, fmt.Sprintf("conv-%d", i))
+		c, _, err := p.Bind(ctx, fmt.Sprintf("conv-%d", i), provider.Anthropic)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -188,7 +189,7 @@ func TestWeightedSelection(t *testing.T) {
 	const N = 1200
 	count := map[string]int{}
 	for i := 0; i < N; i++ {
-		c, _, err := p.Bind(ctx, fmt.Sprintf("conv-%d", i))
+		c, _, err := p.Bind(ctx, fmt.Sprintf("conv-%d", i), provider.Anthropic)
 		if err != nil {
 			t.Fatalf("bind %d: %v", i, err)
 		}
@@ -237,7 +238,7 @@ func TestUsageAwareScoring(t *testing.T) {
 	const N = 200
 	count := map[string]int{}
 	for i := range N {
-		c, _, err := p.Bind(ctx, fmt.Sprintf("u-%d", i))
+		c, _, err := p.Bind(ctx, fmt.Sprintf("u-%d", i), provider.Anthropic)
 		if err != nil {
 			t.Fatalf("bind %d: %v", i, err)
 		}
@@ -287,7 +288,7 @@ func TestSevenDayExhaustedAvoided(t *testing.T) {
 	const N = 200
 	count := map[string]int{}
 	for i := range N {
-		c, _, err := p.Bind(ctx, fmt.Sprintf("e-%d", i))
+		c, _, err := p.Bind(ctx, fmt.Sprintf("e-%d", i), provider.Anthropic)
 		if err != nil {
 			t.Fatalf("bind %d: %v", i, err)
 		}
@@ -333,7 +334,7 @@ func TestSaturatedCredsHardExcluded(t *testing.T) {
 	const N = 100
 	count := map[string]int{}
 	for i := range N {
-		c, _, err := p.Bind(ctx, fmt.Sprintf("s-%d", i))
+		c, _, err := p.Bind(ctx, fmt.Sprintf("s-%d", i), provider.Anthropic)
 		if err != nil {
 			t.Fatalf("bind %d: %v", i, err)
 		}
@@ -372,7 +373,7 @@ func TestAllSaturatedNoActive(t *testing.T) {
 	}
 
 	p := New(db)
-	if _, _, err := p.Bind(ctx, "x"); err != ErrNoCredentials {
+	if _, _, err := p.Bind(ctx, "x", provider.Anthropic); err != ErrNoCredentials {
 		t.Fatalf("expected ErrNoCredentials when all active creds are saturated, got %v", err)
 	}
 }
@@ -386,7 +387,7 @@ func TestStickyRebindsOffSaturated(t *testing.T) {
 	p := New(db)
 	ctx := context.Background()
 
-	c1, isNew, err := p.Bind(ctx, "convSat")
+	c1, isNew, err := p.Bind(ctx, "convSat", provider.Anthropic)
 	if err != nil || !isNew {
 		t.Fatalf("first bind: isNew=%v err=%v", isNew, err)
 	}
@@ -401,7 +402,7 @@ func TestStickyRebindsOffSaturated(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c2, isNew, err := p.Bind(ctx, "convSat")
+	c2, isNew, err := p.Bind(ctx, "convSat", provider.Anthropic)
 	if err != nil {
 		t.Fatalf("rebind: %v", err)
 	}
@@ -434,7 +435,7 @@ func TestStickySaturatedKeptWhenNoAlternative(t *testing.T) {
 	only, _ := creds.Insert(ctx, db, "only", "pro", "sk-ant-oat-x", "rt-x", time.Now().Add(time.Hour), 1)
 	p := New(db)
 
-	if _, _, err := p.Bind(ctx, "c1"); err != nil {
+	if _, _, err := p.Bind(ctx, "c1", provider.Anthropic); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().Unix()
@@ -444,7 +445,7 @@ func TestStickySaturatedKeptWhenNoAlternative(t *testing.T) {
 		VALUES (?, ?, 100.0, NULL, 100.0, NULL, 0.0, NULL)`, only.ID, now); err != nil {
 		t.Fatal(err)
 	}
-	c, isNew, err := p.Bind(ctx, "c1")
+	c, isNew, err := p.Bind(ctx, "c1", provider.Anthropic)
 	if err != nil {
 		t.Fatalf("expected saturated sticky to be kept, got %v", err)
 	}
@@ -473,7 +474,7 @@ func TestNoCredentials(t *testing.T) {
 	db, _ := store.Open(filepath.Join(dir, "t.db"))
 	defer db.Close()
 	p := New(db)
-	_, _, err := p.Bind(context.Background(), "x")
+	_, _, err := p.Bind(context.Background(), "x", provider.Anthropic)
 	if err != ErrNoCredentials {
 		t.Fatalf("expected ErrNoCredentials, got %v", err)
 	}
@@ -484,11 +485,11 @@ func TestOrphanedConversationRebinds(t *testing.T) {
 	p := New(db)
 	ctx := context.Background()
 
-	c1, _, _ := p.Bind(ctx, "convZ")
+	c1, _, _ := p.Bind(ctx, "convZ", provider.Anthropic)
 	if err := creds.SetStatus(ctx, db, c1.ID, creds.StatusRevoked); err != nil {
 		t.Fatal(err)
 	}
-	c2, isNew, err := p.Bind(ctx, "convZ")
+	c2, isNew, err := p.Bind(ctx, "convZ", provider.Anthropic)
 	if err != nil {
 		t.Fatalf("expected auto-rebind to a healthy cred, got %v", err)
 	}
@@ -517,14 +518,100 @@ func TestOrphanedConversationFailsIfNoAlternative(t *testing.T) {
 	only, _ := creds.Insert(ctx, db, "only", "pro", "sk-ant-oat-x", "rt-x", time.Now().Add(time.Hour), 1)
 	p := New(db)
 
-	if _, _, err := p.Bind(ctx, "c1"); err != nil {
+	if _, _, err := p.Bind(ctx, "c1", provider.Anthropic); err != nil {
 		t.Fatal(err)
 	}
 	if err := creds.SetStatus(ctx, db, only.ID, creds.StatusRevoked); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err = p.Bind(ctx, "c1")
+	_, _, err = p.Bind(ctx, "c1", provider.Anthropic)
 	if err != ErrCredentialOrphaned {
 		t.Fatalf("expected ErrCredentialOrphaned when no alternative exists, got %v", err)
+	}
+}
+
+// Provider is a hard filter: a GLM model can only be served by a GLM key, so
+// selection must never cross providers even when the other side is idle and
+// heavily weighted.
+func TestProviderFilteringIsHard(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(dir + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	// Anthropic is deliberately the more attractive candidate on every axis.
+	anth, _ := creds.Insert(ctx, db, "anth", "max", "sk-ant-oat-a", "rt-a", time.Now().Add(time.Hour), 50)
+	glm, _ := creds.InsertKey(ctx, db, provider.GLM, "zai", "pro", "zai-key", 1)
+
+	p := New(db)
+	for i := range 20 {
+		c, _, err := p.Bind(ctx, fmt.Sprintf("g-%d", i), provider.GLM)
+		if err != nil {
+			t.Fatalf("bind glm %d: %v", i, err)
+		}
+		if c.ID != glm.ID {
+			t.Fatalf("GLM request bound to %s (want %s) — provider filter leaked", c.ID, glm.ID)
+		}
+	}
+	for i := range 20 {
+		c, _, err := p.Bind(ctx, fmt.Sprintf("a-%d", i), provider.Anthropic)
+		if err != nil {
+			t.Fatalf("bind anthropic %d: %v", i, err)
+		}
+		if c.ID != anth.ID {
+			t.Fatalf("Anthropic request bound to %s (want %s)", c.ID, anth.ID)
+		}
+	}
+}
+
+// With no credential for the requested provider the pool must fail rather than
+// fall back to another provider's credential, which could not serve the model.
+func TestBindFailsWhenProviderHasNoCredential(t *testing.T) {
+	db, _ := setup(t) // Anthropic credentials only
+	p := New(db)
+	if _, _, err := p.Bind(context.Background(), "x", provider.GLM); err != ErrNoCredentials {
+		t.Fatalf("err = %v, want ErrNoCredentials", err)
+	}
+}
+
+// A limited GLM key is still preferable to failing: the request reaches Z.AI
+// and earns a real 429 + Retry-After. But the fallback must stay in-provider.
+func TestLimitedFallbackStaysWithinProvider(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(dir + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	_, _ = creds.Insert(ctx, db, "anth", "max", "sk-ant-oat-a", "rt-a", time.Now().Add(time.Hour), 5)
+	glm, _ := creds.InsertKey(ctx, db, provider.GLM, "zai", "pro", "zai-key", 1)
+	if err := creds.MarkLimited(ctx, db, glm.ID, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	c, _, err := New(db).Bind(ctx, "conv", provider.GLM)
+	if err != nil {
+		t.Fatalf("expected fallback to the limited GLM key, got %v", err)
+	}
+	if c.ID != glm.ID {
+		t.Fatalf("fell back to %s, crossing providers; want the limited GLM key %s", c.ID, glm.ID)
+	}
+}
+
+func TestKeyIsProviderQualified(t *testing.T) {
+	// Anthropic keeps the bare ID so pre-existing rows and bindings still match.
+	if got := Key("abc", provider.Anthropic); got != "abc" {
+		t.Errorf("Key(anthropic) = %q, want %q", got, "abc")
+	}
+	if got := Key("abc", ""); got != "abc" {
+		t.Errorf("Key(empty) = %q, want %q", got, "abc")
+	}
+	if got := Key("abc", provider.GLM); got != "glm:abc" {
+		t.Errorf("Key(glm) = %q, want %q", got, "glm:abc")
 	}
 }

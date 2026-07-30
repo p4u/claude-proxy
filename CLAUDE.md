@@ -4,9 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Project Is
 
-`claude-proxy` is a sticky multi-subscription OAuth proxy for Claude Code. It sits between Claude Code clients and `api.anthropic.com`, managing multiple Claude OAuth credentials (subscriptions) with **usage-aware weighted-random selection** and stable per-conversation credential pinning. Built as a single static Go binary backed by SQLite.
+`claude-proxy` is a sticky multi-subscription OAuth proxy for Claude Code. It sits between Claude Code clients and its upstream providers, managing multiple credentials with **usage-aware weighted-random selection** and stable per-conversation credential pinning. Built as a single static Go binary backed by SQLite.
 
-It serves `/v1/*` as a transparent pass-through to `api.anthropic.com`, swapping in a managed credential's `Authorization` header. This is what Claude Code clients connect to.
+It serves `/v1/*` as a transparent pass-through, swapping in a managed credential's `Authorization` header. This is what Claude Code clients connect to.
+
+Two upstreams are supported (`internal/provider`): **Anthropic** OAuth subscriptions and **Z.AI GLM** coding plans, whose API is Anthropic-compatible. The provider that serves a request is decided by the model the client asked for, so a user picks a GLM model in Claude Code's `/model` picker and it just works. See [Providers](#providers-multi-upstream).
 
 ## Build & Test Commands
 
@@ -35,6 +37,20 @@ make logs           # Tail proxy logs
 make down           # Stop and remove containers
 ```
 
+### Web UI development
+
+`internal/webui/static/` is plain ES modules + CSS with **no build step** — there
+is no `package.json`, and the tree is compiled in via `go:embed`, so changing a
+`.js`/`.css` file requires only rebuilding the Go binary.
+
+Appending **`?mock=1`** to the UI URL makes `index.html` import
+`static/js/mock.js`, which intercepts `fetch` for `/api/*` and serves realistic
+sample credentials, users, and usage series. That is the fast path for frontend
+work: no proxy, no database, no real subscriptions. The mock keeps per-session
+state for the toggles it exposes (`full_capture`, `block_suggestions`, the usage
+limit) so switch behaviour can be exercised end-to-end. When adding an endpoint
+to `/api`, add it to `mock.js` too or the UI silently loses its offline mode.
+
 ## Architecture
 
 ### Request Flow (`/v1/*`)
@@ -43,6 +59,8 @@ make down           # Stop and remove containers
 Claude Code (ANTHROPIC_BASE_URL → proxy)
   → AuthMiddleware (internal/proxy/auth.go): admin token OR per-user bearer token
   → proxy handler (internal/proxy/)
+      → providerFor(): the request body's "model" selects the upstream
+        (internal/proxy/routing.go); everything below is scoped to it
       → blockSuggestion(): POST /v1/messages only — for users with
         block_suggestions set, Claude Code's prompt-suggestion requests are
         answered locally with an empty completion + X-Router-Reason:
@@ -50,16 +68,73 @@ Claude Code (ANTHROPIC_BASE_URL → proxy)
       → enforceUserLimit(): POST /v1/messages only — 429 + X-Router-Reason: user-quota
         when the user is over their rolling usage cap (internal/proxy/userlimit.go)
       → router.Derive(): compute stable conversation key (4-priority algorithm)
-      → pool.Bind(): get/create sticky credential for this conversation
-      → forward to api.anthropic.com with swapped Authorization header
-      → GET /v1/models: response augmented with "[1m]" variants + cached 5min
+      → pool.Bind(): get/create sticky credential for (conversation, provider)
+      → forward to the provider's base URL with swapped Authorization header
+      → GET /v1/models: union of every provider that has a usable credential,
+        Anthropic entries augmented with "[1m]" variants, cached 5min
         (internal/proxy/models1m.go) for Claude Code gateway model discovery
-      → on 401: creds refresher triggers token refresh → retry
+      → on 401: OAuth credential → refresher triggers token refresh → retry;
+        API key → marked revoked immediately (nothing to refresh)
       → on 429: mark credential "limited", synthesize Retry-After if missing → pass 429 to client
       → on 200: heal "limited" → "active" immediately
   → SSE response streamed back verbatim
   → request_log row written (user, cred, status, bytes, latency)
 ```
+
+### Providers (multi-upstream)
+
+`internal/provider` is the single place per-upstream behaviour is declared;
+nothing else tests for a provider by name.
+
+| | Anthropic | Z.AI GLM |
+|---|---|---|
+| Base URL | `https://api.anthropic.com` | `https://api.z.ai/api/anthropic` |
+| Model prefix | `claude-` | `glm-` |
+| Credential | OAuth (access + refresh) | static API key |
+| Refreshable | yes | no — a 401 means a bad key |
+| Usage API | `/api/oauth/usage` | none |
+| `[1m]` variants | yes | no — Z.AI 400s on the suffixed form |
+
+**GLM needs no translation layer.** Its Anthropic-compatible surface was verified
+live against `/v1/models`, `/v1/messages`, `/v1/messages/count_tokens`, SSE
+streaming, tool use, `cache_control`, and Claude Code's `anthropic-beta` headers.
+Only the base URL and the credential differ, so `usagecapture.go`,
+`promptcapture.go`, the 429 handling and the SSE relay all work unmodified.
+
+**Routing is by model, resolved before any credential is chosen.**
+`provider.ForModel` prefix-matches the request body's `model` (trimming a
+trailing `[1m]`, which Claude Code normally strips client-side). Unknown models
+fall to Anthropic, so future Claude IDs keep working without a registry edit.
+Provider is then a **hard filter** in `pool.pickActiveLocked` — a GLM model can
+only be served by a GLM key, so the two never compete on weight or usage score.
+No credential for the requested provider ⇒ 503 +
+`X-Router-Reason: provider-unavailable`, naming the provider.
+
+**Sticky keys are provider-scoped** (`pool.Key`). A Claude Code session sends its
+main-model turns and its background haiku calls under one derived conversation
+ID; once those can land on different providers, a single key is not enough —
+each request would find the other provider's credential pinned and migrate it,
+so neither would ever be sticky. Anthropic keeps the bare ID (existing rows and
+dashboard links are untouched); other providers are prefixed (`glm:<id>`). The
+qualified value is used for `conversations`, `request_log` and `prompt_log`
+alike, so a GLM and a Claude thread in one session show as two conversations —
+which is truthful, they are two independent credential bindings.
+
+**Balancing GLM keys: weight only, reactive to 429.** Z.AI publishes no usage
+endpoint and no rate-limit response headers (confirmed by probing; the DevPack
+docs describe only a web dashboard). The poller therefore **skips** providers
+without a usage API rather than writing zeroed snapshots — a 0% row is
+indistinguishable from a genuinely idle credential and would make an exhausted
+key look like the most attractive one in the pool. With no snapshot, selection
+takes the existing `headroom = 1.0` bootstrap path and picks on weight; a 429
+marks the key limited until `Retry-After`. Since provider is a hard filter,
+weights only ever compete within one provider, so GLM keys default to weight 1.
+
+> Possible future refinement, deliberately not implemented: Z.AI publishes a
+> credit formula (`(in×Min + cached×Mcached + out×Mout)/10000`), per-model
+> multipliers, and per-plan 5h/weekly caps. `request_log` already stores all
+> four token counts, so a locally metered synthetic utilization could feed the
+> existing `usage_history` + `pool.Score` machinery unchanged.
 
 ### Conversation Key Derivation (4-priority, `internal/router/`)
 
@@ -75,7 +150,8 @@ Claude Code (ANTHROPIC_BASE_URL → proxy)
 | `cmd/claude-proxy/` | CLI entry point; `serve`, `tui`, `creds`, and `users` subcommands |
 | `internal/tui/` | Interactive Bubble Tea management UI (credentials + users tabs) for `claude-proxy tui` |
 | `internal/webui/` | Embedded browser dashboard (`go:embed`), served at `/` when `CLAUDE_PROXY_UI_PASSWORD` is set (old `/ui` 308-redirects); cookie-authenticated JSON API under `/api` (contract: `docs/WEBUI.md`) |
-| `internal/proxy/` | Proxy-mode HTTP handler + `AuthMiddleware` (two-tier auth, request logging) |
+| `internal/provider/` | Per-upstream behaviour table (base URL, model prefixes, refreshability, usage API, `[1m]` support) |
+| `internal/proxy/` | Proxy-mode HTTP handler + `AuthMiddleware` (two-tier auth, request logging); `routing.go` maps model → provider |
 | `internal/pool/` | Usage-aware weighted-random selection + sticky conversation→credential binding |
 | `internal/creds/` | Credential model, status management, proactive/reactive token refresh |
 | `internal/router/` | Conversation key derivation |
@@ -104,7 +180,10 @@ Claude Code (ANTHROPIC_BASE_URL → proxy)
 
 ### Storage Schema (SQLite)
 
-Eight tables (`internal/store/schema.go`): `credentials`, `conversations`, `rr_cursor` (legacy round-robin state), `user_tokens` (named bearer tokens, plus the per-user usage cap `limit_output_tokens` / `limit_window_seconds`, `0` = unlimited, and `block_suggestions` = suppress Claude Code's prompt-suggestion requests), `request_log` (one row per forwarded request, for per-user stats), `usage_history` (utilization snapshots driving selection), `prompt_log` (last user prompt per `POST /v1/messages`, `user_token_id` FK `ON DELETE SET NULL`; never stores responses, gated + retained by `CLAUDE_PROXY_PROMPT_RETENTION_DAYS`, captured in `internal/proxy/promptcapture.go` and pruned by its hourly janitor), `conversation_message` (opt-in whole-conversation capture: `UNIQUE(conv_id, seq)` where `seq` is the message's index in the request's `messages` array, so re-sent history is idempotent; same retention window and janitor as `prompt_log`). Deleting a credential cascades to `usage_history` (`ON DELETE CASCADE`); `conversations` bindings are cleared inside `creds.Delete`'s transaction, since older DBs created that FK without a cascade clause. `request_log` additionally carries per-request token usage columns (`model`, `input_tokens`, `output_tokens`, `cache_creation_tokens`, `cache_read_tokens`), added via the existing swallow-duplicate `ALTER TABLE` migration mechanism and populated by `internal/proxy/usagecapture.go` from the tee'd response stream (SSE and non-streaming JSON) — this feeds the web UI's token stats and never affects what the client receives. Core dependency: `modernc.org/sqlite` (pure Go, no CGO required); `guptarohit/asciigraph` for usage charts and `charmbracelet/bubbletea`+`lipgloss`+`bubbles` for the management TUI.
+Eight tables (`internal/store/schema.go`): `credentials` (incl. `provider`:
+`anthropic` | `glm`, added via the swallow-duplicate `ALTER TABLE` mechanism —
+its `DEFAULT 'anthropic'` is what migrates existing rows, no backfill needed),
+`conversations` (whose `id` is the provider-qualified sticky key), `rr_cursor` (legacy round-robin state), `user_tokens` (named bearer tokens, plus the per-user usage cap `limit_output_tokens` / `limit_window_seconds`, `0` = unlimited, and `block_suggestions` = suppress Claude Code's prompt-suggestion requests), `request_log` (one row per forwarded request, for per-user stats), `usage_history` (utilization snapshots driving selection), `prompt_log` (last user prompt per `POST /v1/messages`, `user_token_id` FK `ON DELETE SET NULL`; never stores responses, gated + retained by `CLAUDE_PROXY_PROMPT_RETENTION_DAYS`, captured in `internal/proxy/promptcapture.go` and pruned by its hourly janitor), `conversation_message` (opt-in whole-conversation capture: `UNIQUE(conv_id, seq)` where `seq` is the message's index in the request's `messages` array, so re-sent history is idempotent; same retention window and janitor as `prompt_log`). Deleting a credential cascades to `usage_history` (`ON DELETE CASCADE`); `conversations` bindings are cleared inside `creds.Delete`'s transaction, since older DBs created that FK without a cascade clause. `request_log` additionally carries per-request token usage columns (`model`, `input_tokens`, `output_tokens`, `cache_creation_tokens`, `cache_read_tokens`), added via the existing swallow-duplicate `ALTER TABLE` migration mechanism and populated by `internal/proxy/usagecapture.go` from the tee'd response stream (SSE and non-streaming JSON) — this feeds the web UI's token stats and never affects what the client receives. Core dependency: `modernc.org/sqlite` (pure Go, no CGO required); `guptarohit/asciigraph` for usage charts and `charmbracelet/bubbletea`+`lipgloss`+`bubbles` for the management TUI.
 
 ### Write contention (`internal/store/store.go`, `retry.go`)
 
@@ -175,6 +254,30 @@ TUI keys — Credentials tab: `r` refresh token, `u` update token from a fresh l
 `w` set weight, `d` disable/enable, `x` delete, `i` import from file, `p` paste a
 `.credentials.json` directly (multi-line; `ctrl+s` to import). Users tab: `c` create,
 `R` rotate token, `d` disable/enable, `x` delete. `tab` switches tabs, `q` quits.
+
+TUI keys also include `k` — add a static API key (GLM).
+
+### Adding a GLM (Z.AI) API key
+
+```bash
+# Reads the key from stdin, which keeps it out of shell history and out of
+# `ps` output (where a --key flag would be visible to any local user).
+echo "$ZAI_KEY" | claude-proxy creds add-key --provider glm --label zai-main --plan pro
+make add-key PROVIDER=glm LABEL=zai-main            # prompts for the key
+```
+
+The key is verified with a live `GET /v1/models` before it is stored, mirroring
+the liveness check `ingest.insertVerified` applies to OAuth imports: a credential
+that cannot authenticate must never enter the pool, because the selector would
+then hand live conversations to it. Duplicates are rejected by access token
+(`creds.HasAccessToken`) — `HasRefreshToken` cannot work here, since every API-key
+row stores an empty refresh token and would collide with every other.
+
+Key credentials store `expires_at` ~100 years out: the column is `NOT NULL` and
+the refresher compares against it, so a date the refresh window can never reach
+is simpler than threading a nullable expiry through every caller. The refresher
+also skips non-refreshable providers outright. CLI, TUI and web UI all render it
+as "never" rather than a date in 2126.
 
 ```bash
 make import FROM=path/to/.credentials.json LABEL=myaccount [WEIGHT=5]

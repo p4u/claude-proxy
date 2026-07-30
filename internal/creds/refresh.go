@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/p4u/claude-proxy/internal/provider"
 	"github.com/p4u/claude-proxy/internal/store"
 )
 
@@ -188,6 +189,12 @@ func (r *Refresher) tick(ctx context.Context) {
 	}
 	cutoff := time.Now().Add(5 * time.Minute)
 	for _, c := range creds {
+		// Static API keys have no refresh token and no real expiry. Attempting
+		// an OAuth refresh for one would fail against a token endpoint that
+		// never issued it, and would flip a perfectly good key to "revoked".
+		if !provider.Get(c.Provider).Refreshable {
+			continue
+		}
 		if c.Status == StatusRevoked || c.Status == StatusDisabled || c.Status == StatusExpired {
 			continue
 		}
