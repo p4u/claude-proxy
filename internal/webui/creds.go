@@ -21,7 +21,13 @@ type credView struct {
 	// HasUsageAPI is false for providers that publish no utilization endpoint.
 	// The dashboard uses it to render "—" rather than 0%, which would otherwise
 	// read as "completely idle" for a credential we simply cannot measure.
-	HasUsageAPI         bool   `json:"has_usage_api"`
+	HasUsageAPI bool `json:"has_usage_api"`
+	// Endpoint is the resolved base URL this credential talks to, and
+	// EndpointName the matching preset name ("" when it is a custom URL).
+	// Editable for API-key providers; OAuth credentials have a fixed endpoint.
+	Endpoint            string `json:"endpoint,omitempty"`
+	EndpointName        string `json:"endpoint_name,omitempty"`
+	Editable            bool   `json:"endpoint_editable"`
 	Status              string `json:"status"`
 	ExpiresAt           string `json:"expires_at"`
 	RetryAfter          string `json:"retry_after,omitempty"`
@@ -45,6 +51,8 @@ func (s *Server) handleCredentials(w http.ResponseWriter, r *http.Request, rest 
 		s.importCred(w, r)
 	case rest == "/keys" && r.Method == http.MethodPost:
 		s.addKeyCred(w, r)
+	case rest == "/endpoints" && r.Method == http.MethodGet:
+		s.listEndpoints(w, r)
 	default:
 		// /{id} or /{id}/{action}
 		trimmed := strings.TrimPrefix(rest, "/")
@@ -79,6 +87,23 @@ func (s *Server) credAction(w http.ResponseWriter, r *http.Request, id, action s
 			return
 		}
 		writeJSON(w, map[string]any{"ok": true, "id": id, "expires_at": c.ExpiresAt.UTC().Format(time.RFC3339)})
+	case action == "endpoint" && r.Method == http.MethodPost:
+		var body struct {
+			Endpoint string `json:"endpoint"`
+		}
+		if err := decodeJSON(w, r, &body); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		c, err := ingest.UpdateKeyEndpoint(ctx, s.db, id, body.Endpoint)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{
+			"ok": true, "id": c.ID, "status": string(c.Status),
+			"endpoint": provider.ResolveBaseURL(c.Provider, c.BaseURL),
+		})
 	case action == "weight" && r.Method == http.MethodPost:
 		var body struct {
 			Weight int `json:"weight"`
@@ -211,6 +236,23 @@ func (s *Server) addKeyCred(w http.ResponseWriter, r *http.Request) {
 		"ok": true, "id": c.ID, "label": c.Label,
 		"provider": string(c.Provider), "weight": c.Weight,
 	})
+}
+
+// listEndpoints serves the endpoint presets per provider, so the UI does not
+// keep its own copy of the registry and drift from it.
+func (s *Server) listEndpoints(w http.ResponseWriter, _ *http.Request) {
+	out := map[string]any{}
+	for _, p := range provider.All() {
+		if p.Refreshable || len(p.Endpoints) == 0 {
+			continue
+		}
+		eps := make([]map[string]string, 0, len(p.Endpoints))
+		for _, e := range p.Endpoints {
+			eps = append(eps, map[string]string{"name": e.Name, "desc": e.Desc, "url": e.URL})
+		}
+		out[string(p.ID)] = map[string]any{"name": p.Name, "default": p.BaseURL, "endpoints": eps}
+	}
+	writeJSON(w, out)
 }
 
 // decodeJSON decodes a bounded request body into v.

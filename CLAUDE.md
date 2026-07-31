@@ -108,6 +108,22 @@ selector. `provider.ResolveEndpoint` accepts a short name or a full URL, so a
 cluster added after this build is still reachable without a registry edit.
 `ResolveBaseURL` then resolves the stored override at forward time.
 
+**Presets are a convenience, not a constraint.** Every surface accepts a custom
+`https://` URL as well as a preset name, and an existing credential can be moved
+afterwards — `creds set-endpoint <id> <name|url>`, the TUI's `e`, or the web UI's
+per-row *Endpoint* button (`POST /api/credentials/{id}/endpoint`). The UI fetches
+the preset list from `GET /api/credentials/endpoints` rather than keeping its own
+copy, so it cannot drift from the registry.
+
+`ingest.UpdateKeyEndpoint` **re-verifies the key against the new endpoint before
+committing**, and leaves the credential untouched if it fails — swapping one
+broken endpoint for another would be worse than refusing. On success it also
+heals a `revoked`/`expired`/`limited` status back to `active`, because the usual
+reason to move a credential is that it was added against the wrong cluster and
+was marked revoked by that cluster's rejections. Only the stored override is
+written, and only when it differs from the provider default, so a
+default-endpoint credential keeps following the registry.
+
 **Key verification uses `POST /v1/messages`, not `GET /v1/models`.**
 `api.z.ai/api/anthropic/v1/models` returns **200 for a garbage bearer token**,
 so verifying against it admitted any string and defeated the whole point of the

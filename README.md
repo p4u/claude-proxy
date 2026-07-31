@@ -361,8 +361,30 @@ echo "$MIMO_KEY" | claude-proxy creds add-key --provider mimo --label mimo-main 
 plus pay-as-you-go `payg`) and a Token Plan key works on exactly one of them —
 the others reply `Invalid API Key` with no hint that the region is the problem.
 Z.AI offers `global` (default) and `cn`. The endpoint is stored per credential,
-so keys from different regions can share one pool. `--endpoint` also accepts a
-full `https://` URL for a cluster this build doesn't know about.
+so keys from different regions can share one pool.
+
+Presets are a shortcut, not a limit: anywhere an endpoint is accepted you can
+pass a full `https://` URL instead, and you can move a credential later.
+
+```bash
+claude-proxy creds set-endpoint cred_abc123 ams
+claude-proxy creds set-endpoint cred_abc123 https://your-cluster.example.com/anthropic
+```
+
+The TUI does the same with `e`, and the web UI has an **Endpoint** button on
+each API-key row plus a *Custom…* option in the picker. In every case the key is
+**re-verified against the new endpoint before anything is written** — a wrong
+choice is rejected and the credential is left exactly as it was:
+
+```
+set-endpoint: key is not usable at that endpoint: Xiaomi MiMo rejected the API key at
+https://token-plan-ams.xiaomimimo.com/anthropic (HTTP 401) — check the key and that
+the endpoint matches the one it was issued for
+```
+
+If the move succeeds, a credential that was sitting `revoked` because it was
+originally added against the wrong cluster is healed back to `active` in the
+same step.
 
 The key is read from stdin so it stays out of your shell history and out of
 `ps` output. It is verified with a live `GET /v1/models` before being stored —

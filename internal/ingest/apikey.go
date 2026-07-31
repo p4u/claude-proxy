@@ -17,9 +17,8 @@ import (
 // server instead of the real upstream.
 var verifyClient = &http.Client{Timeout: 20 * time.Second}
 
-// VerifyKey checks that an API key is accepted by its provider, by issuing the
-// cheapest authenticated call the Anthropic-compatible surface offers:
-// GET /v1/models. It costs no tokens and no quota.
+// VerifyKey checks that an API key is accepted by its provider at the given
+// endpoint, by issuing the smallest request that actually authenticates.
 //
 // This mirrors the discipline Import already applies to OAuth credentials
 // (insertVerified refreshes the token before storing it): a credential that
@@ -112,4 +111,52 @@ func ImportKey(ctx context.Context, db *store.DB, p provider.ID, label, plan, ap
 		stored = ""
 	}
 	return creds.InsertKey(ctx, db, p, label, plan, apiKey, stored, weight)
+}
+
+// UpdateKeyEndpoint re-points an existing API-key credential at another
+// endpoint, verifying the key against the new one before committing.
+//
+// Verification is the point: the common reason to change an endpoint is that
+// the key was added against the wrong cluster, where it authenticated as
+// "Invalid API Key" and was marked revoked. Proving it works at the new
+// endpoint both prevents swapping one broken endpoint for another and lets the
+// credential be healed back to active in the same step.
+func UpdateKeyEndpoint(ctx context.Context, db *store.DB, id, endpoint string) (*creds.Credential, error) {
+	c, err := creds.Get(ctx, db, id)
+	if err != nil {
+		return nil, err
+	}
+	p := c.Provider
+	if p == "" {
+		p = provider.Default
+	}
+	if provider.Get(p).Refreshable {
+		return nil, fmt.Errorf("%s credentials are OAuth and have a fixed endpoint", provider.Get(p).Name)
+	}
+
+	baseURL, err := provider.ResolveEndpoint(p, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	if err := VerifyKey(ctx, p, c.AccessToken, baseURL); err != nil {
+		return nil, fmt.Errorf("key is not usable at that endpoint: %w", err)
+	}
+
+	stored := baseURL
+	if stored == provider.Get(p).BaseURL {
+		stored = ""
+	}
+	if err := creds.SetBaseURL(ctx, db, id, stored); err != nil {
+		return nil, err
+	}
+	// The key demonstrably works now, so a status set by the old endpoint's
+	// rejections is stale. Heal it rather than leaving a working credential
+	// parked outside the selection pool.
+	switch c.Status {
+	case creds.StatusRevoked, creds.StatusExpired, creds.StatusLimited:
+		if err := creds.SetStatus(ctx, db, id, creds.StatusActive); err != nil {
+			return nil, err
+		}
+	}
+	return creds.Get(ctx, db, id)
 }

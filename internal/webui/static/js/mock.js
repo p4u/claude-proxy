@@ -17,6 +17,24 @@ const CREDS = [
 
 // Mirrors internal/provider: only Anthropic publishes a utilization API.
 const providerOf = (c) => c.provider || "anthropic";
+const MOCK_ENDPOINTS = {
+  glm: { name: "Z.AI GLM", default: "https://api.z.ai/api/anthropic", endpoints: [
+    { name: "global", desc: "Global (api.z.ai)", url: "https://api.z.ai/api/anthropic" },
+    { name: "cn", desc: "China (open.bigmodel.cn)", url: "https://open.bigmodel.cn/api/anthropic" }]},
+  mimo: { name: "Xiaomi MiMo", default: "https://token-plan-sgp.xiaomimimo.com/anthropic", endpoints: [
+    { name: "sgp", desc: "Token Plan — Singapore", url: "https://token-plan-sgp.xiaomimimo.com/anthropic" },
+    { name: "ams", desc: "Token Plan — Amsterdam", url: "https://token-plan-ams.xiaomimimo.com/anthropic" },
+    { name: "cn", desc: "Token Plan — China", url: "https://token-plan-cn.xiaomimimo.com/anthropic" },
+    { name: "payg", desc: "Pay-as-you-go", url: "https://api.xiaomimimo.com/anthropic" }]},
+};
+const endpointOf = (c) => {
+  const p = MOCK_ENDPOINTS[providerOf(c)];
+  return p ? (c.endpoint || p.default) : "";
+};
+const endpointNameOf = (c) => {
+  const p = MOCK_ENDPOINTS[providerOf(c)];
+  return p ? (p.endpoints.find((e) => e.url === endpointOf(c))?.name || "") : "";
+};
 const hasUsageAPI = (c) => providerOf(c) === "anthropic";
 // full_capture and the usage limit are mutated in place by
 // POST /users/{id}/capture and POST /users/{id}/limit, so both toggles stay
@@ -252,9 +270,12 @@ const DB = {
     CREDS.map((c, i) => ({
       id: c.id, label: c.label, subscription_type: c.type, status: c.status, weight: c.weight,
       provider: providerOf(c), has_usage_api: hasUsageAPI(c),
+      endpoint: endpointOf(c), endpoint_name: endpointNameOf(c),
+      endpoint_editable: !hasUsageAPI(c),
       request_count: [8200, 5400, 1200, 3600, 40, 970][i], last_request_at: c.status === "disabled" ? null : now - 60 * (i + 1),
       expires_at: now + 3600 * (5 - i), created_at: now - 86400 * (30 - i * 4),
     })),
+  "/credentials/endpoints": () => MOCK_ENDPOINTS,
   "/users": () =>
     USERS.map((u, i) => ({
       id: u.id, name: u.name, status: u.status, full_capture: u.full_capture,
@@ -408,6 +429,21 @@ window.fetch = async (input, init = {}) => {
     if (path === "/users" && method === "POST") return json({ id: "utok_new", name: JSON.parse(init.body || "{}").name || "new", token: "cpu_" + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2) });
     // Adding a key appends to CREDS so the credentials table reflects it for
     // the rest of the mock session, matching how the real endpoint behaves.
+    // Mirrors the real endpoint: re-verification can reject the move, so the
+    // mock refuses an obviously bogus URL rather than always succeeding.
+    const epm = path.match(/^\/credentials\/([^/]+)\/endpoint$/);
+    if (epm && method === "POST") {
+      const b = JSON.parse(init.body || "{}");
+      if (!b.endpoint) return json({ error: "endpoint is required" }, 400);
+      const c = CREDS.find((x) => x.id === epm[1]);
+      if (!c) return json({ error: "not found" }, 404);
+      const preset = (MOCK_ENDPOINTS[providerOf(c)]?.endpoints || []).find((e) => e.name === b.endpoint);
+      const url = preset ? preset.url : b.endpoint;
+      if (!/^https?:\/\//.test(url)) return json({ error: `unknown endpoint "${b.endpoint}"` }, 400);
+      c.endpoint = url;
+      c.status = "active";
+      return json({ ok: true, id: c.id, status: "active", endpoint: url });
+    }
     if (path === "/credentials/keys" && method === "POST") {
       const b = JSON.parse(init.body || "{}");
       if (!b.api_key) return json({ error: "API key is empty" }, 400);

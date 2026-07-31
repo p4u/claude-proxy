@@ -149,6 +149,22 @@ func SetWeight(ctx context.Context, db *store.DB, id string, weight int) error {
 	return nil
 }
 
+// SetBaseURL overrides (or clears, when empty) a credential's endpoint.
+// Callers are expected to have verified the key against the new endpoint
+// first — see ingest.UpdateKeyEndpoint.
+func SetBaseURL(ctx context.Context, db *store.DB, id, baseURL string) error {
+	res, err := db.ExecContext(ctx,
+		`UPDATE credentials SET base_url=? WHERE id=?`, strings.TrimSuffix(baseURL, "/"), id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // SelectCols is the credential column list, exported because internal/pool
 // reads credentials inside its own transaction and must stay column-for-column
 // identical to ScanCred below.

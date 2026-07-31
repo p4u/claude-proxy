@@ -94,6 +94,16 @@ the selected window into equal intervals.
   right-key/wrong-cluster mistake otherwise looks identical to a bad key), an
   unknown provider or endpoint, or an OAuth provider (which needs `POST
   /api/credentials` instead).
+- `GET /api/credentials/endpoints` → endpoint presets per key-based provider:
+  `{glm:{name,default,endpoints:[{name,desc,url}]}, mimo:{...}}`. Served from the
+  Go registry so the UI keeps no copy of it. OAuth providers are omitted.
+- `POST /api/credentials/{id}/endpoint` `{endpoint}` → move an API-key credential
+  to another cluster (`ingest.UpdateKeyEndpoint`). Accepts a preset name or a
+  full `https://` URL. The key is **re-verified against the new endpoint before
+  anything is written**; on failure the credential is left untouched and the
+  `400` names the endpoint that rejected it. On success a `revoked`/`expired`/
+  `limited` status is healed to `active`. `400` for OAuth credentials, whose
+  endpoint is fixed.
 - `POST /api/credentials/{id}/disable` | `/enable` (SetStatus disabled/active)
 - `POST /api/credentials/{id}/refresh` → force OAuth token refresh (`Refresher.RefreshNow`)
 - `POST /api/credentials/{id}/weight` `{weight}` (creds.SetWeight)

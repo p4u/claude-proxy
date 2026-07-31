@@ -98,6 +98,9 @@ export const api = {
   credentials: () => request("GET", "/credentials"),
   // Static API keys (GLM). OAuth subscriptions use POST /credentials instead.
   addKey: (body) => request("POST", "/credentials/keys", body),
+  // Endpoint presets, served from the Go registry so the UI never keeps its
+  // own copy of it.
+  endpoints: () => request("GET", "/credentials/endpoints"),
   users: () => request("GET", "/users"),
 
   // Per-user capture mode. `full` true ⇒ store both sides of every conversation.

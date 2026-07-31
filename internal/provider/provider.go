@@ -219,6 +219,18 @@ func ResolveBaseURL(p ID, credBaseURL string) string {
 	return Get(p).BaseURL
 }
 
+// EndpointName returns the preset name matching a credential's resolved base
+// URL, or "" when it is a custom URL the registry does not know.
+func EndpointName(p ID, credBaseURL string) string {
+	url := ResolveBaseURL(p, credBaseURL)
+	for _, e := range Get(p).Endpoints {
+		if strings.EqualFold(e.URL, url) {
+			return e.Name
+		}
+	}
+	return ""
+}
+
 // ResolveEndpoint maps an operator's endpoint choice to a base URL. It accepts
 // either a short name from the provider's Endpoints ("sgp") or a full URL, so
 // a cluster this build has never heard of is still reachable. Empty selects

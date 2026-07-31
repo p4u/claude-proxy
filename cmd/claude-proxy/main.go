@@ -45,11 +45,13 @@ Usage:
   claude-proxy users limit <id>       --tokens 1M --window 24h | --none [--db PATH]
   claude-proxy tui                 [--db PATH]   # interactive management UI
   claude-proxy creds import        --from FILE [--label NAME] [--weight N]
-  claude-proxy creds add-key       --provider glm [--key KEY] [--label NAME] [--plan TIER] [--weight N]
+  claude-proxy creds add-key       --provider glm|mimo [--endpoint sgp|https://…]
+                                   [--key KEY] [--label NAME] [--plan TIER] [--weight N]
                                                  # omit --key to read it from stdin
   claude-proxy creds update <id>   --from FILE   # replace tokens from a fresh login
   claude-proxy creds export        [--db PATH]   # JSONL to stdout
   claude-proxy creds import-bulk   [--db PATH]   # JSONL from stdin
+  claude-proxy creds set-endpoint <id> <name|https://url>   # move a key to another cluster
   claude-proxy creds list
   claude-proxy creds usage [<id>]
   claude-proxy creds usage-history [--period 1h|6h|24h|7d|30d] [<id>]
@@ -270,7 +272,7 @@ func runTUI(args []string) {
 
 func runCreds(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "creds: missing subcommand (import|add-key|update|export|import-bulk|list|usage|usage-history|disable|rm|refresh|set-weight)")
+		fmt.Fprintln(os.Stderr, "creds: missing subcommand (import|add-key|set-endpoint|update|export|import-bulk|list|usage|usage-history|disable|rm|refresh|set-weight)")
 		os.Exit(2)
 	}
 	ctx := context.Background()
@@ -279,6 +281,8 @@ func runCreds(args []string) {
 		credsImport(ctx, args[1:])
 	case "add-key":
 		credsAddKey(ctx, args[1:])
+	case "set-endpoint":
+		credsSetEndpoint(ctx, args[1:])
 	case "update":
 		credsUpdate(ctx, args[1:])
 	case "export":
@@ -389,6 +393,48 @@ func credsAddKey(ctx context.Context, args []string) {
 	}
 	fmt.Printf("added %s  provider=%s  label=%s  endpoint=%s  weight=%d\n",
 		c.ID, c.Provider, c.Label, provider.ResolveBaseURL(c.Provider, c.BaseURL), c.Weight)
+}
+
+// credsSetEndpoint moves an API-key credential to another endpoint. The key is
+// re-verified against the new one before anything is written.
+func credsSetEndpoint(ctx context.Context, args []string) {
+	// Positionals first, flags after — matching the other creds subcommands.
+	// Go's flag package stops at the first non-flag argument, so parsing the
+	// whole slice would silently ignore a trailing --db and hit the default DB.
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: creds set-endpoint <id> <name|https://url> [--db PATH]")
+		listEndpoints()
+		os.Exit(2)
+	}
+	fs := flag.NewFlagSet("creds set-endpoint", flag.ExitOnError)
+	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
+	_ = fs.Parse(args[2:])
+
+	db := openDB(*dbPath)
+	defer db.Close()
+
+	c, err := ingest.UpdateKeyEndpoint(ctx, db, args[0], args[1])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "set-endpoint: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("%s now uses %s (status %s)\n",
+		c.ID, provider.ResolveBaseURL(c.Provider, c.BaseURL), c.Status)
+}
+
+// listEndpoints prints the presets, since a bare "unknown endpoint" error is
+// not much help without them.
+func listEndpoints() {
+	fmt.Fprintln(os.Stderr, "\npresets (a full https:// URL is also accepted):")
+	for _, p := range provider.All() {
+		if len(p.Endpoints) == 0 {
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "  %s:\n", p.Name)
+		for _, e := range p.Endpoints {
+			fmt.Fprintf(os.Stderr, "    %-8s %s\n", e.Name, e.URL)
+		}
+	}
 }
 
 func credsList(ctx context.Context, args []string) {

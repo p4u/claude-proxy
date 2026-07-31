@@ -15,7 +15,10 @@ export async function render(root) {
   root.append(head, body);
 
   try {
-    const rows = await api.credentials();
+    const [rows] = await Promise.all([
+      api.credentials(),
+      loadEndpoints(),
+    ]);
     clear(body);
     if (!rows || !rows.length) {
       body.append(emptyState("No credentials yet", 'Click "Add credential" and paste a .credentials.json to bring a subscription into the pool.'));
@@ -31,7 +34,7 @@ function buildTable(rows, root) {
   const table = el("table", { class: "table" });
   table.append(
     el("thead", {}, el("tr", {}, [
-      th("Label"), th("Provider"), th("Type"), th("Status"), th("Weight"), th("Requests", "num"),
+      th("Label"), th("Provider"), th("Endpoint"), th("Type"), th("Status"), th("Weight"), th("Requests", "num"),
       th("Last used"), th("Expires"), th("", "actions"),
     ]))
   );
@@ -43,6 +46,114 @@ function buildTable(rows, root) {
 
 function th(label, cls) {
   return el("th", { class: cls || null, text: label });
+}
+
+// Endpoint presets, fetched once from /credentials/endpoints. The registry in
+// Go stays the single source of truth; this is only a cache.
+let ENDPOINTS = {};
+async function loadEndpoints() {
+  try {
+    ENDPOINTS = (await api.endpoints()) || {};
+  } catch {
+    ENDPOINTS = {}; // presets unavailable → the custom URL field still works
+  }
+}
+
+// endpointPicker builds a preset <select> plus a free-text field revealed by
+// the "Custom…" option, and returns { wrap, value() }. Presets cover the common
+// case; the text field means a cluster the proxy has never heard of is still
+// reachable without a rebuild.
+const CUSTOM = "__custom";
+function endpointPicker(providerId, current) {
+  const sel = el("select", { class: "input" });
+  const custom = el("input", {
+    class: "input", type: "text", spellcheck: "false",
+    placeholder: "https://your-cluster.example.com/anthropic",
+  });
+  const customRow = el("div", { class: "form-row" }, [
+    el("label", { class: "field-label", text: "Custom URL" }), custom,
+  ]);
+
+  const fill = (pid) => {
+    clear(sel);
+    for (const e of (ENDPOINTS[pid]?.endpoints) || []) {
+      sel.append(el("option", { value: e.name, text: e.desc || e.name }));
+    }
+    sel.append(el("option", { value: CUSTOM, text: "Custom…" }));
+    // Preselect the credential's current endpoint: a known preset by name,
+    // otherwise the custom field pre-filled with its URL.
+    if (current?.name) sel.value = current.name;
+    else if (current?.url) { sel.value = CUSTOM; custom.value = current.url; }
+    sync();
+  };
+  const sync = () => { customRow.hidden = sel.value !== CUSTOM; };
+  sel.addEventListener("change", sync);
+  fill(providerId);
+
+  return {
+    select: sel,
+    customRow,
+    setProvider: fill,
+    value: () => (sel.value === CUSTOM ? custom.value.trim() : sel.value),
+  };
+}
+
+// endpointLabel keeps the column narrow: a preset name when the URL matches
+// one, otherwise the custom URL's host.
+function endpointLabel(c) {
+  if (!c.endpoint) return "—";
+  if (c.endpoint_name) return c.endpoint_name;
+  try {
+    return new URL(c.endpoint).host;
+  } catch {
+    return c.endpoint;
+  }
+}
+
+// endpointModal moves an existing key to another cluster. The backend
+// re-verifies the key there before committing, so a wrong pick is rejected
+// rather than silently breaking a working credential.
+function endpointModal(c, root) {
+  const id = c.id || c.credential_id;
+  const ep = endpointPicker(c.provider, { name: c.endpoint_name, url: c.endpoint });
+  const err = el("p", { class: "form-err", role: "alert" });
+  const body = el("div", { class: "form" }, [
+    el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Endpoint" }), ep.select]),
+    ep.customRow,
+    err,
+  ]);
+  const m = modal({
+    title: "Change endpoint",
+    subtitle: `The key is re-verified against the new endpoint before ${c.label || id} is moved.`,
+    body,
+    actions: [
+      button("Cancel", { onClick: () => m.close() }),
+      button("Verify & move", {
+        kind: "primary",
+        onClick: async (ev) => {
+          const btn = ev.currentTarget;
+          err.textContent = "";
+          const value = ep.value();
+          if (!value) { err.textContent = "Pick a preset or enter a URL."; return; }
+          btn.disabled = true;
+          const orig = btn.textContent;
+          btn.textContent = "Verifying…";
+          try {
+            await api.post(`/credentials/${id}/endpoint`, { endpoint: value });
+            m.close();
+            toast("Endpoint updated");
+            render(root);
+          } catch (e) {
+            err.textContent = e.message || "Could not change the endpoint.";
+          } finally {
+            btn.disabled = false;
+            btn.textContent = orig;
+          }
+        },
+      }),
+    ],
+  });
+  return m;
 }
 
 // The badge style capitalizes its text, which turns "glm" into "Glm". Spell
@@ -62,6 +173,9 @@ function credRow(c, root) {
   const isKey = c.has_usage_api === false;
   const actions = el("div", { class: "row-actions" }, [
     button("Weight", { onClick: () => weightModal(id, c.weight, root) }),
+    ...(c.endpoint_editable ? [
+      button("Endpoint", { onClick: () => endpointModal(c, root) }),
+    ] : []),
     ...(isKey ? [] : [
       button("Refresh", { onClick: () => act(() => api.post(`/credentials/${id}/refresh`), "Token refreshed", root) }),
       button("Update tokens", { onClick: () => updateModal(id, root) }),
@@ -84,6 +198,9 @@ function credRow(c, root) {
   return el("tr", {}, [
     el("td", {}, [el("span", { class: "cell-strong", text: c.label || "—" }), el("span", { class: "cell-id", text: id })]),
     el("td", {}, el("span", { class: "badge", text: providerLabel(c.provider) })),
+    // Preset name when it matches one, else the bare host of a custom URL —
+    // the full URL is long enough to wreck the table layout.
+    el("td", { text: endpointLabel(c), title: c.endpoint || "" }),
     el("td", { text: c.subscription_type || "—" }),
     el("td", {}, statusBadge(c.status)),
     el("td", { class: "num", text: String(c.weight ?? "—") }),
@@ -97,27 +214,12 @@ function credRow(c, root) {
 // addKeyModal collects a static API key. Kept separate from addModal, which
 // takes a pasted .credentials.json — an API-key provider has no analogue of it.
 function addKeyModal(root) {
-  // Endpoint options mirror internal/provider's registry. A key is bound to one
-  // cluster and a wrong pick fails with a bare "Invalid API Key", so the choice
-  // is explicit rather than guessed.
-  const ENDPOINTS = {
-    glm: [["global", "Global (api.z.ai)"], ["cn", "China (open.bigmodel.cn)"]],
-    mimo: [["sgp", "Token Plan — Singapore"], ["ams", "Token Plan — Amsterdam"],
-           ["cn", "Token Plan — China"], ["payg", "Pay-as-you-go"]],
-  };
   const provider = el("select", { class: "input" }, [
     el("option", { value: "glm", text: "Z.AI GLM" }),
     el("option", { value: "mimo", text: "Xiaomi MiMo" }),
   ]);
-  const endpoint = el("select", { class: "input" });
-  const fillEndpoints = () => {
-    clear(endpoint);
-    for (const [v, label] of ENDPOINTS[provider.value] || []) {
-      endpoint.append(el("option", { value: v, text: label }));
-    }
-  };
-  fillEndpoints();
-  provider.addEventListener("change", fillEndpoints);
+  const ep = endpointPicker(provider.value, null);
+  provider.addEventListener("change", () => ep.setProvider(provider.value));
   const key = el("input", { class: "input", type: "password", placeholder: "API key", spellcheck: "false" });
   const label = el("input", { class: "input", type: "text", placeholder: "e.g. zai-main" });
   const plan = el("input", { class: "input", type: "text", placeholder: "lite | pro | max" });
@@ -127,7 +229,8 @@ function addKeyModal(root) {
   const body = el("div", { class: "form" }, [
     el("div", { class: "form-grid" }, [
       el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Provider" }), provider]),
-      el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Endpoint" }), endpoint]),
+      el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Endpoint" }), ep.select]),
+      ep.customRow,
       el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Label (optional)" }), label]),
       el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Plan (optional)" }), plan]),
       el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Weight (optional)" }), weight]),
@@ -154,7 +257,7 @@ function addKeyModal(root) {
           try {
             await api.addKey({
               provider: provider.value,
-              endpoint: endpoint.value,
+              endpoint: ep.value(),
               api_key: key.value.trim(),
               label: label.value.trim(),
               plan: plan.value.trim(),

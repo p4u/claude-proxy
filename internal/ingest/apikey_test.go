@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/p4u/claude-proxy/internal/creds"
 	"github.com/p4u/claude-proxy/internal/provider"
@@ -122,5 +123,92 @@ func TestImportKeyRejectsDuplicateAndEmpty(t *testing.T) {
 	}
 	if _, err := ImportKey(ctx, db, "nonesuch", "e", "", "k", "", 0); err == nil {
 		t.Error("expected rejection for an unknown provider")
+	}
+}
+
+// Moving a credential to another endpoint must re-verify the key there. The
+// usual reason to move one is that it was added against the wrong cluster and
+// got marked revoked, so a successful move also has to heal that status.
+func TestUpdateKeyEndpoint(t *testing.T) {
+	db := keyTestDB(t)
+	ctx := context.Background()
+	stubVerify(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"type":"message","content":[]}`))
+	})
+
+	c, err := ImportKey(ctx, db, provider.MiMo, "m", "", "key", "sgp", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// sgp is MiMo's default, so nothing is stored — the credential follows the
+	// registry rather than pinning a URL that may later move.
+	if c.BaseURL != "" {
+		t.Errorf("default endpoint should not be stored, got %q", c.BaseURL)
+	}
+	if err := creds.SetStatus(ctx, db, c.ID, creds.StatusRevoked); err != nil {
+		t.Fatal(err)
+	}
+
+	moved, err := UpdateKeyEndpoint(ctx, db, c.ID, "ams")
+	if err != nil {
+		t.Fatalf("UpdateKeyEndpoint: %v", err)
+	}
+	if moved.BaseURL != "https://token-plan-ams.xiaomimimo.com/anthropic" {
+		t.Errorf("endpoint not stored, got %q", moved.BaseURL)
+	}
+	if moved.Status != creds.StatusActive {
+		t.Errorf("status = %q, want active — a key proven to work must not stay revoked", moved.Status)
+	}
+
+	// A custom URL the registry has never heard of must be accepted.
+	custom := "https://token-plan-xyz.example.com/anthropic"
+	if got, err := UpdateKeyEndpoint(ctx, db, c.ID, custom); err != nil || got.BaseURL != custom {
+		t.Errorf("custom URL: got %q err %v", got.BaseURL, err)
+	}
+}
+
+// A rejected key must leave the stored endpoint untouched: swapping one broken
+// endpoint for another would be worse than refusing the change.
+func TestUpdateKeyEndpointRejectedLeavesCredentialAlone(t *testing.T) {
+	db := keyTestDB(t)
+	ctx := context.Background()
+	ok := true
+	stubVerify(t, func(w http.ResponseWriter, _ *http.Request) {
+		if !ok {
+			w.WriteHeader(401)
+			return
+		}
+		_, _ = w.Write([]byte(`{"type":"message","content":[]}`))
+	})
+
+	c, err := ImportKey(ctx, db, provider.MiMo, "m", "", "key", "ams", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := c.BaseURL
+
+	ok = false
+	if _, err := UpdateKeyEndpoint(ctx, db, c.ID, "cn"); err == nil {
+		t.Fatal("expected the move to be rejected")
+	}
+	after, err := creds.Get(ctx, db, c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.BaseURL != before {
+		t.Errorf("endpoint changed despite verification failing: %q → %q", before, after.BaseURL)
+	}
+}
+
+// OAuth credentials have a fixed endpoint; offering to move one would be a lie.
+func TestUpdateKeyEndpointRejectsOAuth(t *testing.T) {
+	db := keyTestDB(t)
+	ctx := context.Background()
+	c, err := creds.Insert(ctx, db, "a", "max", "sk-ant-oat-x", "rt", time.Now().Add(time.Hour), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UpdateKeyEndpoint(ctx, db, c.ID, "cn"); err == nil {
+		t.Error("expected OAuth credentials to be rejected")
 	}
 }

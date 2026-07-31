@@ -193,6 +193,16 @@ func (m *model) handleCredKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.pendingID = c.ID
 		m.startInput(inputUpdateFile, "Update "+c.ID+" — path to fresh .credentials.json: ", "")
 		return m, nil
+	case "e": // change the endpoint of an API-key credential
+		if provider.Get(c.Provider).Refreshable {
+			m.status, m.isErr = "OAuth credentials have a fixed endpoint", true
+			return m, nil
+		}
+		m.pendingID = c.ID
+		m.pendingProvider = c.Provider
+		m.startInput(inputEditEndpoint, endpointPrompt(c.Provider),
+			provider.EndpointName(c.Provider, c.BaseURL))
+		return m, nil
 	case "w": // set weight
 		m.pendingID = c.ID
 		m.startInput(inputWeight, "New weight for "+c.ID+": ", strconv.Itoa(c.Weight))
@@ -346,6 +356,16 @@ func (m *model) submitInput() (tea.Model, tea.Cmd) {
 		m.busy = true
 		m.status = "verifying API key…"
 		return m, m.addKeyCred(p, key, label, endpoint)
+	case inputEditEndpoint:
+		id := m.pendingID
+		m.resetInput()
+		if val == "" {
+			m.status, m.isErr = "endpoint is required", true
+			return m, nil
+		}
+		m.busy = true
+		m.status = "verifying key at the new endpoint…"
+		return m, m.setEndpoint(id, val)
 	case inputUpdateFile:
 		id, file := m.pendingID, val
 		m.resetInput()
@@ -429,7 +449,7 @@ func endpointPrompt(p provider.ID) string {
 	for _, e := range eps {
 		names = append(names, e.Name)
 	}
-	return "Endpoint [" + strings.Join(names, "|") + "] (blank = " + eps[0].Name + "): "
+	return "Endpoint [" + strings.Join(names, "|") + "] or https://… (blank = " + eps[0].Name + "): "
 }
 
 func (m *model) addKeyCred(p provider.ID, apiKey, label, endpoint string) tea.Cmd {
@@ -440,6 +460,21 @@ func (m *model) addKeyCred(p provider.ID, apiKey, label, endpoint string) tea.Cm
 			return actionDoneMsg{err: fmt.Errorf("add key: %w", err)}
 		}
 		return actionDoneMsg{msg: fmt.Sprintf("added %s (%s, %s)", c.ID, c.Label, c.Provider)}
+	}
+}
+
+// setEndpoint re-points a key credential; the key is re-verified against the
+// new endpoint before anything is written, so a wrong pick cannot break a
+// working credential.
+func (m *model) setEndpoint(id, endpoint string) tea.Cmd {
+	db := m.db
+	return func() tea.Msg {
+		c, err := ingest.UpdateKeyEndpoint(context.Background(), db, id, endpoint)
+		if err != nil {
+			return actionDoneMsg{err: fmt.Errorf("set endpoint: %w", err)}
+		}
+		return actionDoneMsg{msg: fmt.Sprintf("%s → %s (%s)",
+			c.ID, provider.ResolveBaseURL(c.Provider, c.BaseURL), c.Status)}
 	}
 }
 

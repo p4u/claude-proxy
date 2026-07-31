@@ -52,6 +52,7 @@ const (
 	inputAPIKey
 	inputAPIKeyEndpoint
 	inputAPIKeyLabel
+	inputEditEndpoint
 )
 
 var (
