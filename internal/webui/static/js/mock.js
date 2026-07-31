@@ -219,8 +219,15 @@ const DB = {
       five_hour: { pct: five, resets_at: now + (3600 * (1 + i)) },
       seven_day: { pct: seven, resets_at: now + (86400 * (2 + i)) },
       seven_day_sonnet: { pct: sonnet, resets_at: now + (86400 * (2 + i)) },
-      // No usage API ⇒ no snapshot was ever recorded.
+      // No usage API ⇒ no snapshot was ever recorded, but the proxy still
+      // meters what it forwarded.
       captured_at: hasUsageAPI(c) ? now - 300 - i * 90 : null,
+      metered: hasUsageAPI(c) ? undefined : {
+        five_hour: { requests: 412, input_tokens: 380_000, output_tokens: 96_000,
+                     cache_read_tokens: 2_400_000, cache_creation_tokens: 41_000 },
+        seven_day: { requests: 8_930, input_tokens: 7_900_000, output_tokens: 2_050_000,
+                     cache_read_tokens: 52_000_000, cache_creation_tokens: 880_000 },
+      },
       selection: {
         room_5h: room5, room_7d: room7, score,
         share_pct: score > 0 ? (score / (sums[providerOf(c)] || 1)) * 100 : 0,

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/p4u/claude-proxy/internal/creds"
+	"github.com/p4u/claude-proxy/internal/provider"
 	"github.com/p4u/claude-proxy/internal/store"
 	"github.com/p4u/claude-proxy/internal/usertoken"
 )
@@ -976,5 +977,88 @@ func TestStatsWindowValidation(t *testing.T) {
 		if !strings.Contains(w.Body.String(), `"error"`) {
 			t.Fatalf("%s: body missing error field: %s", url, w.Body.String())
 		}
+	}
+}
+
+// Providers with no quota API still have their tokens counted: usagecapture
+// records them for every provider, so the Subscriptions view reports what this
+// proxy actually forwarded instead of nothing at all.
+func TestUsageCurrentMeteredTokens(t *testing.T) {
+	db, h := newTestServer(t)
+	ctx := context.Background()
+
+	anth, _ := creds.Insert(ctx, db, "A", "max", "sk-ant-oat-a", "rt-a", time.Now().Add(time.Hour), 5)
+	glm, _ := creds.InsertKey(ctx, db, provider.GLM, "zai", "pro", "zai-key", "", 1)
+
+	now := time.Now().Unix()
+	ins := func(credID string, ts int64, in, out, cread, ccreate int64) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, `INSERT INTO request_log
+			(user_token_id, credential_id, conv_id, ts, path, status_code,
+			 bytes_sent, bytes_received, latency_ms,
+			 model, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens)
+			VALUES (NULL, ?, '', ?, '/v1/messages', 200, 0, 0, 0, 'glm-4.7', ?, ?, ?, ?)`,
+			credID, ts, in, out, ccreate, cread); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Two inside the 5h window, one only inside the 7d window.
+	ins(glm.ID, now-60, 100, 20, 500, 5)
+	ins(glm.ID, now-3600, 200, 30, 700, 10)
+	ins(glm.ID, now-(3*24*3600), 1000, 400, 9000, 100)
+	// Another credential's traffic must not leak into the GLM totals.
+	ins(anth.ID, now-60, 9999, 9999, 9999, 9999)
+
+	cookie := loginCookie(t, h)
+	w := do(t, h, http.MethodGet, "/api/usage/current", "", cookie)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	var rows []struct {
+		CredentialID string `json:"credential_id"`
+		HasUsageAPI  bool   `json:"has_usage_api"`
+		Metered      *struct {
+			FiveHour struct {
+				Requests                                                  int64 `json:"requests"`
+				InputTokens, OutputTokens, CacheReadTokens, CacheCreation int64
+			} `json:"five_hour"`
+			SevenDay struct {
+				Requests     int64 `json:"requests"`
+				InputTokens  int64 `json:"input_tokens"`
+				OutputTokens int64 `json:"output_tokens"`
+			} `json:"seven_day"`
+		} `json:"metered"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &rows); err != nil {
+		t.Fatal(err)
+	}
+	var seenGLM, seenAnth bool
+	for _, r := range rows {
+		switch r.CredentialID {
+		case glm.ID:
+			seenGLM = true
+			if r.Metered == nil {
+				t.Fatal("a provider with no usage API must still report metered tokens")
+			}
+			if got := r.Metered.FiveHour.Requests; got != 2 {
+				t.Errorf("5h requests = %d, want 2 (the third row is older than 5h)", got)
+			}
+			if got := r.Metered.SevenDay.Requests; got != 3 {
+				t.Errorf("7d requests = %d, want 3", got)
+			}
+			if got := r.Metered.SevenDay.OutputTokens; got != 450 {
+				t.Errorf("7d output tokens = %d, want 450 — other credentials must not leak in", got)
+			}
+		case anth.ID:
+			seenAnth = true
+			// Anthropic reports authoritative percentages; a locally metered
+			// figure alongside them would just be a worse second number.
+			if r.Metered != nil {
+				t.Error("credentials with a real usage API must not carry metered totals")
+			}
+		}
+	}
+	if !seenGLM || !seenAnth {
+		t.Fatalf("expected both credentials in the response, got %d rows", len(rows))
 	}
 }

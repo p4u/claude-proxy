@@ -485,8 +485,14 @@ is nothing to poll. Rather than record 0% snapshots — which the selector could
 not distinguish from a genuinely idle key, making an exhausted one look like the
 most attractive in the pool — GLM keys carry no usage data at all. They are
 picked by weight, and a `429` marks the key limited until `Retry-After` elapses,
-exactly like a rate-limited Anthropic credential. The web UI shows this
-explicitly instead of empty meters.
+exactly like a rate-limited Anthropic credential.
+
+**Tokens are still counted.** Every response is parsed for input/output/cache
+tokens regardless of provider, so the dashboard charts GLM and MiMo traffic like
+any other, and the Subscriptions card shows rolling 5-hour and 7-day token
+totals where the utilization meters would be. There is no percentage — neither
+provider publishes an allowance to measure against — and the figure only counts
+traffic through this proxy, so a key used elsewhere has spent more than shown.
 
 ## Sticky binding & conversation detection
 

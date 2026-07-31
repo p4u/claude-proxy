@@ -3,7 +3,7 @@ import { el, clear, spinner, errorState, emptyState, statusBadge } from "../ui.j
 import { meter, chartFrame, periodControl, segmented, sectionHead } from "../components.js";
 import { getWindow, setWindowPeriod, setWindowCustom } from "../store.js";
 import { timeChart } from "../charts.js";
-import { pct, relTime, countdown } from "../format.js";
+import { pct, relTime, countdown, compactNum } from "../format.js";
 
 export async function render(root) {
   clear(root);
@@ -53,6 +53,29 @@ function renderCharts(wrap) {
   selectionChart(grid, win);
 }
 
+// meteredRows renders observed token usage in the same slot the utilization
+// meters occupy, so the card reads consistently across providers.
+function meteredRows(m) {
+  const w = (label, d) => {
+    d = d || {};
+    const total = (d.input_tokens || 0) + (d.output_tokens || 0) +
+      (d.cache_read_tokens || 0) + (d.cache_creation_tokens || 0);
+    return el("div", { class: "metered" }, [
+      el("div", { class: "meter__top" }, [
+        el("span", { class: "meter__label", text: label }),
+        el("span", { class: "meter__pct", text: compactNum(total) + " tok" }),
+      ]),
+      el("div", { class: "metered__break", text:
+        `${compactNum(d.input_tokens || 0)} in · ${compactNum(d.output_tokens || 0)} out · ` +
+        `${compactNum(d.cache_read_tokens || 0)} cache · ${compactNum(d.requests || 0)} req` }),
+    ]);
+  };
+  return el("div", { class: "sub-card__meters" }, [
+    w("5-hour window", m?.five_hour),
+    w("7-day window", m?.seven_day),
+  ]);
+}
+
 function subCard(r) {
   const five = r.five_hour || {};
   const seven = r.seven_day || {};
@@ -72,20 +95,21 @@ function subCard(r) {
         statusBadge(r.status),
       ]),
     ]),
-    // Providers with no utilization API get no meters at all. Rendering them
-    // at 0% would be a lie in the most dangerous direction: it reads as
-    // "completely idle", which is exactly how an exhausted key would look.
+    // Providers with no utilization API get metered rows instead of meters:
+    // same layout and position, but the value is what this proxy actually
+    // observed, and there is no bar — there is no published allowance to fill
+    // against, and inventing one would read as authoritative when it is not.
     noUsageAPI
-      ? el("div", { class: "sub-card__empty", text: "This provider publishes no usage API — selection uses weight only, and a 429 marks the key limited until it recovers." })
+      ? meteredRows(r.metered)
       : el("div", { class: "sub-card__meters" }, [
         meter({ label: "5-hour window", value: five.pct, resets: countdown(five.resets_at) }),
         meter({ label: "7-day window", value: seven.pct, resets: countdown(seven.resets_at) }),
         meter({ label: "7-day Sonnet", value: sonnet.pct, resets: countdown(sonnet.resets_at) }),
       ]),
     sel ? selectionRow(sel) : null,
-    noUsageAPI
-      ? null
-      : el("div", { class: "sub-card__foot", text: r.captured_at ? `snapshot ${relTime(tsOf(r.captured_at))}` : "no snapshot yet" }),
+    el("div", { class: "sub-card__foot", text: noUsageAPI
+      ? "metered by this proxy — no quota API upstream"
+      : (r.captured_at ? `snapshot ${relTime(tsOf(r.captured_at))}` : "no snapshot yet") }),
   ]);
 }
 

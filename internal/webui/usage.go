@@ -28,6 +28,26 @@ type selectionView struct {
 	Saturated bool    `json:"saturated"`
 }
 
+// meteredWindow is what this proxy itself observed for a credential over a
+// rolling window, summed from request_log.
+//
+// It is not a quota reading. Providers without a usage API publish no
+// allowance, so there is no denominator and deliberately no percentage here —
+// and it counts only traffic that went through this proxy, so a key also used
+// elsewhere has consumed more than this shows.
+type meteredWindow struct {
+	Requests            int64 `json:"requests"`
+	InputTokens         int64 `json:"input_tokens"`
+	OutputTokens        int64 `json:"output_tokens"`
+	CacheReadTokens     int64 `json:"cache_read_tokens"`
+	CacheCreationTokens int64 `json:"cache_creation_tokens"`
+}
+
+type meteredUsage struct {
+	FiveHour meteredWindow `json:"five_hour"`
+	SevenDay meteredWindow `json:"seven_day"`
+}
+
 type usageCurrent struct {
 	CredentialID     string        `json:"credential_id"`
 	Label            string        `json:"label"`
@@ -41,6 +61,37 @@ type usageCurrent struct {
 	SevenDaySonnet   usageWindow   `json:"seven_day_sonnet"`
 	CapturedAt       *string       `json:"captured_at"`
 	Selection        selectionView `json:"selection"`
+	// Metered is populated only for providers with no usage API, where it is
+	// the only usage figure available.
+	Metered *meteredUsage `json:"metered,omitempty"`
+}
+
+// meteredByCredential sums request_log over a rolling window, per credential.
+// One query for all credentials rather than one per credential; the
+// (ts) index carries it.
+func (s *Server) meteredByCredential(ctx context.Context, window time.Duration) (map[string]meteredWindow, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT COALESCE(credential_id,''), COUNT(*),
+		       COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+		       COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0)
+		FROM request_log
+		WHERE ts >= ? AND credential_id != ''
+		GROUP BY credential_id`, time.Now().Add(-window).Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]meteredWindow{}
+	for rows.Next() {
+		var id string
+		var m meteredWindow
+		if err := rows.Scan(&id, &m.Requests, &m.InputTokens, &m.OutputTokens,
+			&m.CacheReadTokens, &m.CacheCreationTokens); err != nil {
+			return nil, err
+		}
+		out[id] = m
+	}
+	return out, rows.Err()
 }
 
 func rfc3339Ptr(sec sql.NullInt64) *string {
@@ -58,6 +109,16 @@ func (s *Server) handleUsageCurrent(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Only queried when some credential actually needs it.
+	var metered5h, metered7d map[string]meteredWindow
+	for _, c := range list {
+		if !provider.Get(c.Provider).PollsUsage {
+			metered5h, _ = s.meteredByCredential(ctx, 5*time.Hour)
+			metered7d, _ = s.meteredByCredential(ctx, 7*24*time.Hour)
+			break
+		}
+	}
+
 	out := make([]usageCurrent, 0, len(list))
 	for _, c := range list {
 		uc := usageCurrent{
@@ -91,6 +152,12 @@ func (s *Server) handleUsageCurrent(w http.ResponseWriter, r *http.Request) {
 			uc.SevenDaySonnet.ResetsAt = rfc3339Ptr(sdsReset)
 			ca := time.Unix(capturedAt, 0).UTC().Format(time.RFC3339)
 			uc.CapturedAt = &ca
+		}
+		if !provider.Get(c.Provider).PollsUsage {
+			uc.Metered = &meteredUsage{
+				FiveHour: metered5h[c.ID],
+				SevenDay: metered7d[c.ID],
+			}
 		}
 		// Selection scoring mirrors the pool exactly. With no snapshot the pcts
 		// are 0 → rooms 1 → score = weight (the pool's bootstrap headroom).

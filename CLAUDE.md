@@ -212,11 +212,26 @@ takes the existing `headroom = 1.0` bootstrap path and picks on weight; a 429
 marks the key limited until `Retry-After`. Since provider is a hard filter,
 weights only ever compete within one provider, so GLM keys default to weight 1.
 
+**Their tokens are still counted.** `usagecapture.go` has no provider gating, so
+every GLM and MiMo response is parsed for the four token counts and written to
+`request_log` exactly like Anthropic traffic — the dashboard's per-credential
+token stats already include them. What is missing is only a *percentage*, since
+neither upstream publishes an allowance. `/api/usage/current` therefore carries a
+`metered` block for these providers (rolling 5h/7d sums straight from
+`request_log`, one grouped query per window), and the Subscriptions card renders
+it in the same slot the utilization meters occupy — same label, same value
+position, **no bar**, because there is no published cap to fill against and a
+fabricated denominator would read as authoritative. Credentials that do have a
+real usage API omit `metered` entirely rather than carry a worse second number.
+
+> Note the metered figure only counts traffic through this proxy; a key also
+> used elsewhere has consumed more than it shows.
+
 > Possible future refinement, deliberately not implemented: Z.AI publishes a
 > credit formula (`(in×Min + cached×Mcached + out×Mout)/10000`), per-model
-> multipliers, and per-plan 5h/weekly caps. `request_log` already stores all
-> four token counts, so a locally metered synthetic utilization could feed the
-> existing `usage_history` + `pool.Score` machinery unchanged.
+> multipliers, and per-plan 5h/weekly caps, which would turn the metered totals
+> into a genuine utilization % feeding `pool.Score`. MiMo publishes per-MTok
+> prices but no quota formula, so it could only ever show estimated spend.
 
 ### Conversation Key Derivation (4-priority, `internal/router/`)
 

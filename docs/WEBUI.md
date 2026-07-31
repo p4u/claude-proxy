@@ -67,8 +67,13 @@ the selected window into equal intervals.
      seven_day_sonnet:{pct,resets_at},captured_at,selection:{...}}]`
   (from `usage_history` latest row per cred; include resets_at).
   Credentials with `has_usage_api: false` never have a snapshot, so their
-  percentages are 0 and `captured_at` is null — the UI must render the
-  "no usage API" note instead of meters. `selection.share_pct` is totalled
+  percentages are 0 and `captured_at` is null. They instead carry
+  `metered:{five_hour,seven_day}` — each `{requests,input_tokens,output_tokens,
+  cache_read_tokens,cache_creation_tokens}` summed from `request_log` over that
+  rolling window. The UI renders these where the meters would go, with no bar:
+  there is no published allowance, so there is deliberately no percentage, and
+  the figure counts only traffic through this proxy. Credentials with a real
+  usage API omit `metered`. `selection.share_pct` is totalled
   **per provider**, matching the pool's provider-scoped candidate set: a lone
   GLM key takes 100% of GLM traffic, not a few percent of the global total.
 - `GET /api/usage/history?period&credential_id?` → time series of pct values per
