@@ -261,7 +261,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 	// base URL carries a path prefix (/api/anthropic), so this concatenates
 	// onto the base rather than swapping a host.
 	up := provider.Get(credProvider(cred))
-	upstreamURL := up.BaseURL + r.URL.RequestURI()
+	upstreamURL := provider.ResolveBaseURL(up.ID, cred.BaseURL) + r.URL.RequestURI()
 
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, bytes.NewReader(body))
 	if err != nil {

@@ -25,30 +25,46 @@ var verifyClient = &http.Client{Timeout: 20 * time.Second}
 // (insertVerified refreshes the token before storing it): a credential that
 // cannot authenticate must never enter the pool, because once it is in, the
 // selector will hand live conversations to it and every one of them fails.
-func VerifyKey(ctx context.Context, p provider.ID, apiKey string) error {
+func VerifyKey(ctx context.Context, p provider.ID, apiKey, baseURL string) error {
 	pr := provider.Get(p)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pr.BaseURL+"/v1/models", nil)
+	// A one-token /v1/messages call, NOT GET /v1/models.
+	//
+	// /v1/models looks cheaper but does not authenticate: api.z.ai returns 200
+	// for a garbage bearer token, so verifying against it would wave through
+	// any string and let a dead credential into the pool — precisely the
+	// failure this check exists to prevent. MiMo has no /v1/models at all.
+	// A max_tokens:1 completion is the smallest request both providers accept
+	// and both reject with 401 when the key is wrong.
+	body := fmt.Sprintf(
+		`{"model":%q,"max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`,
+		pr.VerifyModel)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		provider.ResolveBaseURL(p, baseURL)+"/v1/messages", strings.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := verifyClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("contacting %s: %w", pr.Name, err)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 
 	switch resp.StatusCode {
 	case http.StatusOK:
 		return nil
 	case http.StatusUnauthorized, http.StatusForbidden:
-		return fmt.Errorf("%s rejected the API key (HTTP %d)", pr.Name, resp.StatusCode)
+		// Regional providers answer a wrong-cluster key with a bare "Invalid
+		// API Key", so name the endpoint that actually rejected it.
+		return fmt.Errorf("%s rejected the API key at %s (HTTP %d) — check the key and that the endpoint matches the one it was issued for",
+			pr.Name, provider.ResolveBaseURL(p, baseURL), resp.StatusCode)
 	default:
 		return fmt.Errorf("%s returned HTTP %d: %s", pr.Name, resp.StatusCode,
-			strings.TrimSpace(string(body)))
+			strings.TrimSpace(string(respBody)))
 	}
 }
 
@@ -57,7 +73,7 @@ func VerifyKey(ctx context.Context, p provider.ID, apiKey string) error {
 // plan is a free-form tier label (e.g. "pro", "max") shown in listings; it does
 // not affect routing. Unlike OAuth subscription types it cannot be derived from
 // the credential itself, since an API key carries no metadata.
-func ImportKey(ctx context.Context, db *store.DB, p provider.ID, label, plan, apiKey string, weight int) (*creds.Credential, error) {
+func ImportKey(ctx context.Context, db *store.DB, p provider.ID, label, plan, apiKey, endpoint string, weight int) (*creds.Credential, error) {
 	apiKey = strings.TrimSpace(apiKey)
 	if apiKey == "" {
 		return nil, fmt.Errorf("API key is empty")
@@ -78,12 +94,22 @@ func ImportKey(ctx context.Context, db *store.DB, p provider.ID, label, plan, ap
 		return nil, fmt.Errorf("that API key is already in the pool")
 	}
 
-	if err := VerifyKey(ctx, p, apiKey); err != nil {
+	baseURL, err := provider.ResolveEndpoint(p, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	if err := VerifyKey(ctx, p, apiKey, baseURL); err != nil {
 		return nil, fmt.Errorf("key is not usable: %w", err)
 	}
 
 	if label == "" {
 		label = string(p)
 	}
-	return creds.InsertKey(ctx, db, p, label, plan, apiKey, weight)
+	// Store the resolved URL only when it differs from the provider default, so
+	// a default-endpoint credential keeps following the registry if it moves.
+	stored := baseURL
+	if stored == provider.Get(p).BaseURL {
+		stored = ""
+	}
+	return creds.InsertKey(ctx, db, p, label, plan, apiKey, stored, weight)
 }

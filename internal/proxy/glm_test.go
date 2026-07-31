@@ -55,7 +55,7 @@ func glmSetup(t *testing.T, anthropicH, glmH http.HandlerFunc) (*Handler, *store
 		}
 	}
 	if glmH != nil {
-		if _, err := creds.InsertKey(ctx, db, provider.GLM, "zai", "pro", "zai-key", 1); err != nil {
+		if _, err := creds.InsertKey(ctx, db, provider.GLM, "zai", "pro", "zai-key", "", 1); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -385,5 +385,90 @@ func TestAnthropicBodyNotRewritten(t *testing.T) {
 	want := `{"model":"claude-sonnet-5","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`
 	if string(sawBody) != want {
 		t.Errorf("body was modified:\n got %s\nwant %s", sawBody, want)
+	}
+}
+
+// MiMo publishes no /v1/models, so its catalogue is static — but it must still
+// be gated on having a usable credential, exactly like a discovered one.
+func TestStaticCatalogueProvider(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	ctx := context.Background()
+
+	h := New(db, pool.New(db), creds.NewRefresher(db), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h.client = &http.Client{Transport: &hostRewriter{byHost: map[string]*url.URL{}}}
+
+	ids := func() string {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("GET", "/v1/models", nil))
+		var env struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		_ = json.Unmarshal(w.Body.Bytes(), &env)
+		out := []string{}
+		for _, e := range env.Data {
+			out = append(out, e.ID)
+		}
+		return strings.Join(out, ",")
+	}
+
+	// No MiMo credential yet: nothing may be advertised.
+	if got := ids(); strings.Contains(got, "mimo") {
+		t.Errorf("static models must not be offered without a credential: %s", got)
+	}
+
+	if _, err := creds.InsertKey(ctx, db, provider.MiMo, "m", "", "mimo-key", "", 1); err != nil {
+		t.Fatal(err)
+	}
+	h.modelsCache = modelsCache{} // discovery is cached for 5 minutes
+	got := ids()
+	// Advertised under the claude- alias, since MiMo is subject to the same
+	// client-side filter as GLM.
+	if !strings.Contains(got, "claude-mimo-v2.5-pro") {
+		t.Errorf("static catalogue not advertised: %s", got)
+	}
+	if strings.Contains(got, ",mimo-v2.5") || strings.HasPrefix(got, "mimo-") {
+		t.Errorf("bare MiMo id would be filtered out client-side: %s", got)
+	}
+}
+
+// A credential's endpoint override must decide the upstream, not the
+// provider default — that is the whole point of storing one.
+func TestCredentialEndpointOverrideIsUsed(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	var sawHost string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawHost = r.Host
+		okJSON(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	override := "https://token-plan-ams.xiaomimimo.com/anthropic"
+	if _, err := creds.InsertKey(context.Background(), db,
+		provider.MiMo, "m", "", "k", override, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	u, _ := url.Parse(ts.URL)
+	seen := []string{}
+	h := New(db, pool.New(db), creds.NewRefresher(db), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h.client = &http.Client{Transport: &hostRewriter{
+		byHost: map[string]*url.URL{"token-plan-ams.xiaomimimo.com": u}, seen: &seen,
+	}}
+
+	if code := postMessages(t, h, "mimo-v2.5-pro").Code; code != 200 {
+		t.Fatalf("status %d — the override endpoint was not used", code)
+	}
+	if len(seen) != 1 || !strings.HasPrefix(seen[0], "token-plan-ams.xiaomimimo.com/anthropic/") {
+		t.Fatalf("request did not go to the credential's endpoint: %v (host %q)", seen, sawHost)
 	}
 }

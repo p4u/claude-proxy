@@ -81,6 +81,9 @@ func Open(path string) (*DB, error) {
 		// every credential that predates this column is an Anthropic OAuth
 		// subscription, so no backfill is needed.
 		`ALTER TABLE credentials ADD COLUMN provider TEXT NOT NULL DEFAULT 'anthropic'`,
+		// Per-credential endpoint override. Empty = the provider default; set
+		// when a provider runs regional clusters and a key is bound to one.
+		`ALTER TABLE credentials ADD COLUMN base_url TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := sdb.Exec(alter); err != nil && !isDuplicateColumn(err) {
 			_ = sdb.Close()

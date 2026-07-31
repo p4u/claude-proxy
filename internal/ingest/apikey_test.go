@@ -55,10 +55,10 @@ func TestImportKeySuccess(t *testing.T) {
 	stubVerify(t, func(w http.ResponseWriter, r *http.Request) {
 		sawAuth, sawPath = r.Header.Get("Authorization"), r.URL.Path
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"data":[{"id":"glm-4.7"}]}`))
+		_, _ = w.Write([]byte(`{"type":"message","content":[]}`))
 	})
 
-	c, err := ImportKey(context.Background(), db, provider.GLM, "zai", "pro", "  secret-key  ", 0)
+	c, err := ImportKey(context.Background(), db, provider.GLM, "zai", "pro", "  secret-key  ", "", 0)
 	if err != nil {
 		t.Fatalf("ImportKey: %v", err)
 	}
@@ -75,8 +75,10 @@ func TestImportKeySuccess(t *testing.T) {
 	if sawAuth != "Bearer secret-key" {
 		t.Errorf("verification Authorization = %q", sawAuth)
 	}
-	if !strings.HasSuffix(sawPath, "/v1/models") {
-		t.Errorf("verification hit %q, want /v1/models (the cheapest authenticated call)", sawPath)
+	// Deliberately /v1/messages, not /v1/models: api.z.ai returns 200 on
+	// /v1/models for a garbage token, so verifying there would admit any key.
+	if !strings.HasSuffix(sawPath, "/v1/messages") {
+		t.Errorf("verification hit %q, want /v1/messages (the only probe that actually authenticates)", sawPath)
 	}
 }
 
@@ -86,7 +88,7 @@ func TestImportKeyRejectsBadKey(t *testing.T) {
 	db := keyTestDB(t)
 	stubVerify(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(401) })
 
-	if _, err := ImportKey(context.Background(), db, provider.GLM, "zai", "", "bad", 0); err == nil {
+	if _, err := ImportKey(context.Background(), db, provider.GLM, "zai", "", "bad", "", 0); err == nil {
 		t.Fatal("expected an error for a rejected key")
 	}
 	list, err := creds.List(context.Background(), db)
@@ -101,24 +103,24 @@ func TestImportKeyRejectsBadKey(t *testing.T) {
 func TestImportKeyRejectsDuplicateAndEmpty(t *testing.T) {
 	db := keyTestDB(t)
 	stubVerify(t, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"data":[]}`))
+		_, _ = w.Write([]byte(`{"type":"message","content":[]}`))
 	})
 	ctx := context.Background()
 
-	if _, err := ImportKey(ctx, db, provider.GLM, "a", "", "dup", 0); err != nil {
+	if _, err := ImportKey(ctx, db, provider.GLM, "a", "", "dup", "", 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ImportKey(ctx, db, provider.GLM, "b", "", "dup", 0); err == nil {
+	if _, err := ImportKey(ctx, db, provider.GLM, "b", "", "dup", "", 0); err == nil {
 		t.Error("expected duplicate rejection")
 	}
-	if _, err := ImportKey(ctx, db, provider.GLM, "c", "", "   ", 0); err == nil {
+	if _, err := ImportKey(ctx, db, provider.GLM, "c", "", "   ", "", 0); err == nil {
 		t.Error("expected empty-key rejection")
 	}
 	// Anthropic is OAuth-based; an API key is the wrong credential shape for it.
-	if _, err := ImportKey(ctx, db, provider.Anthropic, "d", "", "k", 0); err == nil {
+	if _, err := ImportKey(ctx, db, provider.Anthropic, "d", "", "k", "", 0); err == nil {
 		t.Error("expected rejection for an OAuth provider")
 	}
-	if _, err := ImportKey(ctx, db, "nonesuch", "e", "", "k", 0); err == nil {
+	if _, err := ImportKey(ctx, db, "nonesuch", "e", "", "k", "", 0); err == nil {
 		t.Error("expected rejection for an unknown provider")
 	}
 }

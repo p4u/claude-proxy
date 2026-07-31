@@ -83,10 +83,16 @@ the selected window into equal intervals.
   Update tokens) rather than showing 0% and a synthetic far-future date.
 - `POST /api/credentials` `{credentials_json, label, weight?}` → import pasted
   `.credentials.json` (use `ingest.ImportFromJSON`; verifies liveness, rejects dupes).
-- `POST /api/credentials/keys` `{provider, api_key, label?, plan?, weight?}` → add a
-  static API key (`ingest.ImportKey`). Verified with a live `GET /v1/models` against
-  the provider before storing; duplicates rejected by access token. `400` on a
-  rejected key, an unknown provider, or an OAuth provider (which needs `POST
+- `POST /api/credentials/keys` `{provider, api_key, endpoint?, label?, plan?, weight?}`
+  → add a static API key (`ingest.ImportKey`). `provider` is `glm` or `mimo`.
+  `endpoint` is a short name from the provider's endpoint list (`sgp`, `ams`,
+  `cn`, `payg`, `global`) or a full `https://` URL; empty selects the provider
+  default. Verified before storing with a live `max_tokens:1 POST /v1/messages`
+  — **not** `GET /v1/models`, which `api.z.ai` answers 200 for any bearer token
+  and MiMo does not serve at all. Duplicates rejected by access token. `400` on
+  a rejected key (the message names the endpoint that rejected it, since a
+  right-key/wrong-cluster mistake otherwise looks identical to a bad key), an
+  unknown provider or endpoint, or an OAuth provider (which needs `POST
   /api/credentials` instead).
 - `POST /api/credentials/{id}/disable` | `/enable` (SetStatus disabled/active)
 - `POST /api/credentials/{id}/refresh` → force OAuth token refresh (`Refresher.RefreshNow`)

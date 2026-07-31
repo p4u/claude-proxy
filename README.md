@@ -43,10 +43,10 @@ that:
                           ┌─────────────────────────────────────┐
   Claude Code agent A ───►│  /v1/*                              │──► api.anthropic.com
   Claude Code agent B ───►│  • model → provider routing         │      (claude-* models)
-  Claude Code agent C ───►│  • sticky conv → cred binding       │
-                          │  • usage-aware weighted selection   │──► api.z.ai/api/anthropic
-                          │  • 401 → refresh + retry            │      (glm-* models)
-                          │  • 429 → mark limited + reroute     │
+  Claude Code agent C ───►│  • sticky conv → cred binding       │──► api.z.ai/api/anthropic
+                          │  • usage-aware weighted selection   │      (glm-* models)
+                          │  • 401 → refresh + retry            │──► *.xiaomimimo.com/anthropic
+                          │  • 429 → mark limited + reroute     │      (mimo-* models)
                           └─────────────────────────────────────┘
 ```
 
@@ -65,7 +65,7 @@ to keep them alive.
 
 ## Features
 
-- **Multiple providers** — Anthropic subscriptions and [Z.AI GLM](https://docs.z.ai/devpack/tool/claude) coding plans in one pool. GLM models appear in Claude Code's `/model` picker and are selectable transparently; see [GLM support](#glm-zai-support).
+- **Multiple providers** — Anthropic subscriptions, [Z.AI GLM](https://docs.z.ai/devpack/tool/claude) coding plans and [Xiaomi MiMo](https://mimo.mi.com/docs/en-US/tokenplan/integration/claudecode) token plans in one pool. Their models appear in Claude Code's `/model` picker and are selectable transparently; see [Third-party providers](#glm-zai-and-mimo-support).
 - **Sticky binding** — each Claude Code conversation pins to a single credential for its lifetime.
 - **Usage-aware weighted selection** for new conversations: each credential's score combines its configured weight with live 5h/7d usage headroom, and a credential that has hit either limit is excluded entirely. Default weights: `max`/`team`/`enterprise` = 5, `pro` = 1.
 - **Automatic refresh** — proactive (every 60 s if `expires_at < now+5min`) and reactive (on `401` retry once with a fresh token).
@@ -339,19 +339,30 @@ the loopback HTTP listener. You almost certainly want to keep
 > but anyone who learns your domain name can still reach the listener — the
 > bearer token is what stops them from spending your subscription quota.
 
-## GLM (Z.AI) support
+## GLM (Z.AI) and MiMo support
 
 The proxy can serve [Z.AI GLM coding plans](https://docs.z.ai/devpack/tool/claude)
-alongside Anthropic subscriptions. Z.AI exposes an Anthropic-compatible API, so
-no translation layer is involved — only the base URL and the credential differ.
+and [Xiaomi MiMo token plans](https://mimo.mi.com/docs/en-US/tokenplan/integration/claudecode)
+alongside Anthropic subscriptions. Both expose Anthropic-compatible APIs, so no
+translation layer is involved — only the base URL and the credential differ.
 
 ### Adding a key
 
 ```bash
-make add-key PROVIDER=glm LABEL=zai-main PLAN=pro   # prompts for the key
+make add-key PROVIDER=glm LABEL=zai-main PLAN=pro            # prompts for the key
+make add-key PROVIDER=mimo LABEL=mimo-main ENDPOINT=sgp
+
 # or, without docker:
-echo "$ZAI_KEY" | claude-proxy creds add-key --provider glm --label zai-main --plan pro
+echo "$ZAI_KEY"  | claude-proxy creds add-key --provider glm  --label zai-main
+echo "$MIMO_KEY" | claude-proxy creds add-key --provider mimo --label mimo-main --endpoint sgp
 ```
+
+**Pick the right endpoint.** MiMo runs regional clusters (`sgp`, `ams`, `cn`,
+plus pay-as-you-go `payg`) and a Token Plan key works on exactly one of them —
+the others reply `Invalid API Key` with no hint that the region is the problem.
+Z.AI offers `global` (default) and `cn`. The endpoint is stored per credential,
+so keys from different regions can share one pool. `--endpoint` also accepts a
+full `https://` URL for a cluster this build doesn't know about.
 
 The key is read from stdin so it stays out of your shell history and out of
 `ps` output. It is verified with a live `GET /v1/models` before being stored —
@@ -444,8 +455,10 @@ routes on whatever model name the request carries.
 | `401` handling | refresh token, retry once | key marked revoked — replace it |
 | Usage meters | live 5h/7d from Anthropic's usage API | none (see below) |
 | Selection | weight × usage headroom | weight only |
+| Model list | live `/v1/models` | live (GLM) / static catalogue (MiMo) |
+| `count_tokens` | yes | yes (GLM) / 404 (MiMo) |
 
-Z.AI publishes no usage/quota API and no rate-limit response headers, so there
+Neither publishes a usage/quota API and no rate-limit response headers, so there
 is nothing to poll. Rather than record 0% snapshots — which the selector could
 not distinguish from a genuinely idle key, making an exhausted one look like the
 most attractive in the pool — GLM keys carry no usage data at all. They are

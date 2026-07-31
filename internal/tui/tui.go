@@ -16,6 +16,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/p4u/claude-proxy/internal/creds"
+	"github.com/p4u/claude-proxy/internal/provider"
 	"github.com/p4u/claude-proxy/internal/store"
 	"github.com/p4u/claude-proxy/internal/usage"
 	"github.com/p4u/claude-proxy/internal/usertoken"
@@ -49,6 +50,7 @@ const (
 	inputPasteJSON
 	// API-key credentials are entered in two steps: the key, then a label.
 	inputAPIKey
+	inputAPIKeyEndpoint
 	inputAPIKeyLabel
 )
 
@@ -80,6 +82,8 @@ type model struct {
 	pendingFile  string
 	pendingLabel string
 	pendingJSON  string
+	// pendingProvider carries the inferred provider across the API-key steps.
+	pendingProvider provider.ID
 
 	confirm     bool
 	confirmText string

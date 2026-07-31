@@ -1,6 +1,9 @@
 package provider
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestForModel(t *testing.T) {
 	tests := []struct {
@@ -140,5 +143,77 @@ func TestWireModelAndAdvertisedID(t *testing.T) {
 		if got := WireModel(AdvertisedID(m, GLM)); got != m {
 			t.Errorf("round trip broke for %q: got %q", m, got)
 		}
+	}
+}
+
+func TestMiMoRouting(t *testing.T) {
+	for _, tc := range []struct {
+		model string
+		want  ID
+	}{
+		{"mimo-v2.5-pro", MiMo},
+		{"mimo-v2.5", MiMo},
+		{"claude-mimo-v2.5-pro", MiMo}, // advertised alias
+		{"claude-mimo-v2.5-pro[1m]", MiMo},
+		{"MIMO-V2.5-PRO", MiMo},
+		{"claude-sonnet-5", Anthropic},
+		{"glm-4.7", GLM},
+	} {
+		if got := ForModel(tc.model); got != tc.want {
+			t.Errorf("ForModel(%q) = %q, want %q", tc.model, got, tc.want)
+		}
+	}
+	if got := WireModel("claude-mimo-v2.5-pro"); got != "mimo-v2.5-pro" {
+		t.Errorf("WireModel = %q, want mimo-v2.5-pro", got)
+	}
+	// MiMo serves no /v1/models, so its catalogue must be declared statically or
+	// nothing can ever be advertised for it.
+	p := Get(MiMo)
+	if p.HasModelsAPI {
+		t.Error("MiMo has no /v1/models (nginx 404 on every cluster)")
+	}
+	if len(p.StaticModels) == 0 {
+		t.Error("MiMo needs a static catalogue since it cannot be discovered")
+	}
+}
+
+// A key is bound to one cluster and fails with a bare "Invalid API Key" on the
+// others, so endpoint resolution has to be exact and its errors actionable.
+func TestResolveEndpoint(t *testing.T) {
+	sgp := "https://token-plan-sgp.xiaomimimo.com/anthropic"
+	ams := "https://token-plan-ams.xiaomimimo.com/anthropic"
+
+	if got, err := ResolveEndpoint(MiMo, ""); err != nil || got != sgp {
+		t.Errorf("empty should select the default: got %q err %v", got, err)
+	}
+	if got, err := ResolveEndpoint(MiMo, "ams"); err != nil || got != ams {
+		t.Errorf("named endpoint: got %q err %v", got, err)
+	}
+	if got, err := ResolveEndpoint(MiMo, "AMS"); err != nil || got != ams {
+		t.Errorf("name match should be case-insensitive: got %q err %v", got, err)
+	}
+	// A cluster added after this build must remain reachable.
+	custom := "https://token-plan-xyz.example.com/anthropic"
+	if got, err := ResolveEndpoint(MiMo, custom+"/"); err != nil || got != custom {
+		t.Errorf("full URL should pass through trimmed: got %q err %v", got, err)
+	}
+	err := func() error { _, e := ResolveEndpoint(MiMo, "nope"); return e }()
+	if err == nil {
+		t.Fatal("unknown endpoint name should error")
+	}
+	for _, want := range []string{"sgp", "ams"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should list valid names, missing %q: %v", want, err)
+		}
+	}
+}
+
+func TestResolveBaseURL(t *testing.T) {
+	if got := ResolveBaseURL(MiMo, ""); got != Get(MiMo).BaseURL {
+		t.Errorf("empty override should fall back to the provider default, got %q", got)
+	}
+	override := "https://token-plan-ams.xiaomimimo.com/anthropic"
+	if got := ResolveBaseURL(MiMo, override+"/"); got != override {
+		t.Errorf("override should win (trailing slash trimmed), got %q", got)
 	}
 }

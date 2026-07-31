@@ -361,6 +361,7 @@ func credsAddKey(ctx context.Context, args []string) {
 	key := fs.String("key", "", "API key (omit to read from stdin)")
 	label := fs.String("label", "", "display label (defaults to the provider id)")
 	plan := fs.String("plan", "", "plan tier label, e.g. lite|pro|max (display only)")
+	endpoint := fs.String("endpoint", "", "endpoint name (e.g. sgp|ams|cn) or full https:// URL; empty = provider default")
 	weight := fs.Int("weight", 0, "selection weight (0 = provider default)")
 	_ = fs.Parse(args)
 
@@ -381,12 +382,13 @@ func credsAddKey(ctx context.Context, args []string) {
 	defer db.Close()
 
 	fmt.Fprintf(os.Stderr, "verifying key with %s...\n", provider.Get(provider.ID(*prov)).Name)
-	c, err := ingest.ImportKey(ctx, db, provider.ID(*prov), *label, *plan, apiKey, *weight)
+	c, err := ingest.ImportKey(ctx, db, provider.ID(*prov), *label, *plan, apiKey, *endpoint, *weight)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "add-key: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("added %s  provider=%s  label=%s  weight=%d\n", c.ID, c.Provider, c.Label, c.Weight)
+	fmt.Printf("added %s  provider=%s  label=%s  endpoint=%s  weight=%d\n",
+		c.ID, c.Provider, c.Label, provider.ResolveBaseURL(c.Provider, c.BaseURL), c.Weight)
 }
 
 func credsList(ctx context.Context, args []string) {

@@ -194,6 +194,7 @@ func (s *Server) addKeyCred(w http.ResponseWriter, r *http.Request) {
 		APIKey   string `json:"api_key"`
 		Label    string `json:"label"`
 		Plan     string `json:"plan"`
+		Endpoint string `json:"endpoint"`
 		Weight   int    `json:"weight"`
 	}
 	if err := decodeJSON(w, r, &body); err != nil {
@@ -201,7 +202,7 @@ func (s *Server) addKeyCred(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c, err := ingest.ImportKey(r.Context(), s.db,
-		provider.ID(body.Provider), body.Label, body.Plan, body.APIKey, body.Weight)
+		provider.ID(body.Provider), body.Label, body.Plan, body.APIKey, body.Endpoint, body.Weight)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return

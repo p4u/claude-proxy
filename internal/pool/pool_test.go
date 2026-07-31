@@ -544,7 +544,7 @@ func TestProviderFilteringIsHard(t *testing.T) {
 
 	// Anthropic is deliberately the more attractive candidate on every axis.
 	anth, _ := creds.Insert(ctx, db, "anth", "max", "sk-ant-oat-a", "rt-a", time.Now().Add(time.Hour), 50)
-	glm, _ := creds.InsertKey(ctx, db, provider.GLM, "zai", "pro", "zai-key", 1)
+	glm, _ := creds.InsertKey(ctx, db, provider.GLM, "zai", "pro", "zai-key", "", 1)
 
 	p := New(db)
 	for i := range 20 {
@@ -589,7 +589,7 @@ func TestLimitedFallbackStaysWithinProvider(t *testing.T) {
 	ctx := context.Background()
 
 	_, _ = creds.Insert(ctx, db, "anth", "max", "sk-ant-oat-a", "rt-a", time.Now().Add(time.Hour), 5)
-	glm, _ := creds.InsertKey(ctx, db, provider.GLM, "zai", "pro", "zai-key", 1)
+	glm, _ := creds.InsertKey(ctx, db, provider.GLM, "zai", "pro", "zai-key", "", 1)
 	if err := creds.MarkLimited(ctx, db, glm.ID, time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}

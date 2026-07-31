@@ -8,6 +8,9 @@ CREATE TABLE IF NOT EXISTS credentials (
   -- Upstream this credential authenticates against; see internal/provider.
   -- 'anthropic' (OAuth subscription) or 'glm' (static Z.AI API key).
   provider          TEXT NOT NULL DEFAULT 'anthropic',
+  -- Endpoint override for providers with regional clusters (see
+  -- internal/provider.Endpoint). Empty = the provider's default base URL.
+  base_url          TEXT NOT NULL DEFAULT '',
   access_token      TEXT NOT NULL,
   refresh_token     TEXT NOT NULL,
   expires_at        INTEGER NOT NULL,

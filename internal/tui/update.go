@@ -173,8 +173,8 @@ func (m *model) handleCredKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "p": // import a new credential by pasting JSON
 		m.startPaste()
 		return m, nil
-	case "k": // add a static API-key credential (GLM)
-		m.startInput(inputAPIKey, "GLM API key: ", "")
+	case "k": // add a static API-key credential (GLM / MiMo)
+		m.startInput(inputAPIKey, "API key (glm or mimo): ", "")
 		return m, nil
 	}
 
@@ -268,6 +268,7 @@ func (m *model) resetInput() {
 	m.paste.Blur()
 	m.paste.Reset()
 	m.pendingID, m.pendingFile, m.pendingLabel, m.pendingJSON = "", "", "", ""
+	m.pendingProvider = ""
 }
 
 func (m *model) submitInput() (tea.Model, tea.Cmd) {
@@ -323,15 +324,28 @@ func (m *model) submitInput() (tea.Model, tea.Cmd) {
 			m.status, m.isErr = "API key is required", true
 			return m, nil
 		}
-		m.pendingJSON = val // reused as the pending secret between the two steps
+		m.pendingJSON = val // reused as the pending secret between steps
+		// The provider is inferred from the key's own prefix: MiMo Token Plan
+		// keys start with "tp-", Z.AI keys do not. Asking would be one more
+		// prompt for something the key already states.
+		p := provider.GLM
+		if strings.HasPrefix(val, "tp-") || strings.HasPrefix(val, "sk-") {
+			p = provider.MiMo
+		}
+		m.pendingProvider = p
+		m.startInput(inputAPIKeyEndpoint, endpointPrompt(p), "")
+		return m, nil
+	case inputAPIKeyEndpoint:
+		m.pendingLabel = val // endpoint choice, carried to the next step
 		m.startInput(inputAPIKeyLabel, "Label (blank = provider name): ", "")
 		return m, nil
 	case inputAPIKeyLabel:
-		key, label := m.pendingJSON, val
+		key, endpoint, label := m.pendingJSON, m.pendingLabel, val
+		p := m.pendingProvider
 		m.resetInput()
 		m.busy = true
 		m.status = "verifying API key…"
-		return m, m.addKeyCred(provider.GLM, key, label)
+		return m, m.addKeyCred(p, key, label, endpoint)
 	case inputUpdateFile:
 		id, file := m.pendingID, val
 		m.resetInput()
@@ -403,10 +417,25 @@ func (m *model) importCredJSON(js, label string) tea.Cmd {
 
 // addKeyCred verifies and stores a static API-key credential. Verification hits
 // the provider's /v1/models, so this blocks briefly — the caller sets busy.
-func (m *model) addKeyCred(p provider.ID, apiKey, label string) tea.Cmd {
+// endpointPrompt lists a provider's selectable clusters inline, because a key
+// bound to the wrong one fails with a bare "Invalid API Key" that says nothing
+// about the region.
+func endpointPrompt(p provider.ID) string {
+	eps := provider.Get(p).Endpoints
+	if len(eps) == 0 {
+		return "Endpoint (blank = default): "
+	}
+	names := make([]string, 0, len(eps))
+	for _, e := range eps {
+		names = append(names, e.Name)
+	}
+	return "Endpoint [" + strings.Join(names, "|") + "] (blank = " + eps[0].Name + "): "
+}
+
+func (m *model) addKeyCred(p provider.ID, apiKey, label, endpoint string) tea.Cmd {
 	db := m.db
 	return func() tea.Msg {
-		c, err := ingest.ImportKey(context.Background(), db, p, label, "", apiKey, 0)
+		c, err := ingest.ImportKey(context.Background(), db, p, label, "", apiKey, endpoint, 0)
 		if err != nil {
 			return actionDoneMsg{err: fmt.Errorf("add key: %w", err)}
 		}

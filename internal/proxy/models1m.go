@@ -273,6 +273,25 @@ func (h *Handler) serveModels(w http.ResponseWriter, r *http.Request, start time
 			continue
 		}
 
+		// Providers with no /v1/models (MiMo answers nginx 404) contribute
+		// their static catalogue instead. Advertising it is still gated on
+		// having a usable credential, so the "unusable models are never
+		// offered" guarantee holds identically for them.
+		if !p.HasModelsAPI {
+			entries := make([]map[string]any, 0, len(p.StaticModels))
+			for _, m := range p.StaticModels {
+				entries = append(entries, map[string]any{
+					"id": m.ID, "display_name": m.DisplayName, "type": "model",
+				})
+			}
+			merged = append(merged, advertise(entries, p)...)
+			answered++
+			lastErr = nil
+			h.log.Info("models static catalogue",
+				"provider", string(p.ID), "cred", cred.ID, "models", len(entries))
+			continue
+		}
+
 		rec := newBufferedRW()
 		status, rxBytes, _, _ := h.forward(rec, r, nil, cred, true, false)
 		h.logRequest(r.Context(), r.URL.Path, "", cred.ID, status, 0, rxBytes, time.Since(start), tokenUsage{})

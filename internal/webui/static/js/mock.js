@@ -411,6 +411,7 @@ window.fetch = async (input, init = {}) => {
     if (path === "/credentials/keys" && method === "POST") {
       const b = JSON.parse(init.body || "{}");
       if (!b.api_key) return json({ error: "API key is empty" }, 400);
+      if (!b.endpoint) return json({ error: "endpoint is required" }, 400);
       const c = {
         id: "cred_" + Math.random().toString(36).slice(2, 6),
         label: b.label || b.provider || "glm",

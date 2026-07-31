@@ -13,7 +13,10 @@
 // poller) asks here rather than testing for a provider by name.
 package provider
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // ID identifies an upstream. It is stored verbatim in credentials.provider.
 type ID string
@@ -23,16 +26,55 @@ const (
 	// multi-provider support, which is why its value must never change.
 	Anthropic ID = "anthropic"
 	GLM       ID = "glm"
+	MiMo      ID = "mimo"
 )
+
+// Endpoint is one selectable base URL for a provider.
+//
+// Some providers run regional clusters and a key is bound to exactly one of
+// them: a MiMo Token Plan key issued for Singapore authenticates against
+// token-plan-sgp and returns "Invalid API Key" on token-plan-ams, with no hint
+// that the region is the problem. The endpoint is therefore chosen per
+// credential when the key is added, not fixed per provider.
+type Endpoint struct {
+	Name string // short selector, e.g. "sgp"
+	Desc string // human label for pickers
+	URL  string
+}
+
+// StaticModel is a catalogue entry for providers with no /v1/models endpoint.
+type StaticModel struct {
+	ID          string
+	DisplayName string
+}
 
 // Provider is the per-upstream behaviour table.
 type Provider struct {
 	ID   ID
 	Name string // human-readable, for CLI/TUI/web UI display
 
-	// BaseURL is prefixed to the incoming request path. GLM's includes a path
-	// segment (/api/anthropic), so callers must join rather than swap the host.
+	// BaseURL is the default endpoint, prefixed to the incoming request path.
+	// GLM's and MiMo's include a path segment (/api/anthropic, /anthropic), so
+	// callers must join rather than swap the host. A credential may override
+	// this with its own endpoint — see Endpoints and ResolveBaseURL.
 	BaseURL string
+
+	// Endpoints are the selectable base URLs offered when adding a credential.
+	// Empty means the provider has exactly one, BaseURL.
+	Endpoints []Endpoint
+
+	// HasModelsAPI is false when the upstream serves no GET /v1/models. MiMo
+	// returns nginx 404 there, so its catalogue cannot be discovered live and
+	// StaticModels is advertised instead.
+	HasModelsAPI bool
+
+	// StaticModels is the advertised catalogue for providers without a models
+	// API. Ignored when HasModelsAPI is true.
+	StaticModels []StaticModel
+
+	// VerifyModel is the model used for the authentication probe when a key is
+	// added. Only meaningful for key-based providers.
+	VerifyModel string
 
 	// ModelPrefixes routes a request to this provider by its model ID. Empty
 	// for the default provider, which catches everything unmatched.
@@ -92,6 +134,7 @@ var registry = []Provider{
 		Refreshable:   true,
 		PollsUsage:    true,
 		Augment1M:     true,
+		HasModelsAPI:  true,
 	},
 	{
 		ID:              GLM,
@@ -102,6 +145,39 @@ var registry = []Provider{
 		PollsUsage:      false,
 		Augment1M:       false,
 		AdvertisePrefix: "claude-",
+		HasModelsAPI:    true,
+		VerifyModel:     "glm-4.7",
+		Endpoints: []Endpoint{
+			{Name: "global", Desc: "Global (api.z.ai)", URL: "https://api.z.ai/api/anthropic"},
+			{Name: "cn", Desc: "China (open.bigmodel.cn)", URL: "https://open.bigmodel.cn/api/anthropic"},
+		},
+	},
+	{
+		ID:              MiMo,
+		Name:            "Xiaomi MiMo",
+		BaseURL:         "https://token-plan-sgp.xiaomimimo.com/anthropic",
+		ModelPrefixes:   []string{"mimo-"},
+		Refreshable:     false,
+		PollsUsage:      false,
+		Augment1M:       false,
+		AdvertisePrefix: "claude-",
+		// MiMo serves no /v1/models (nginx 404 on every cluster), so the
+		// catalogue is static. Both IDs verified live; every other plausible
+		// name probed returned "Unsupported model".
+		HasModelsAPI: false,
+		StaticModels: []StaticModel{
+			{ID: "mimo-v2.5-pro", DisplayName: "MiMo v2.5 Pro"},
+			{ID: "mimo-v2.5", DisplayName: "MiMo v2.5"},
+		},
+		VerifyModel: "mimo-v2.5-pro",
+		// A Token Plan key is bound to one cluster and returns a bare
+		// "Invalid API Key" on the others, so the operator must pick.
+		Endpoints: []Endpoint{
+			{Name: "sgp", Desc: "Token Plan — Singapore", URL: "https://token-plan-sgp.xiaomimimo.com/anthropic"},
+			{Name: "ams", Desc: "Token Plan — Amsterdam", URL: "https://token-plan-ams.xiaomimimo.com/anthropic"},
+			{Name: "cn", Desc: "Token Plan — China", URL: "https://token-plan-cn.xiaomimimo.com/anthropic"},
+			{Name: "payg", Desc: "Pay-as-you-go (api.xiaomimimo.com)", URL: "https://api.xiaomimimo.com/anthropic"},
+		},
 	},
 }
 
@@ -130,6 +206,45 @@ func Get(id ID) Provider {
 		}
 	}
 	return registry[0]
+}
+
+// ResolveBaseURL returns the endpoint a credential should talk to: its own
+// override when set, otherwise the provider default. Stored overrides are
+// trusted as-is so a cluster added by the vendor after this build still works
+// without a registry edit.
+func ResolveBaseURL(p ID, credBaseURL string) string {
+	if u := strings.TrimSpace(credBaseURL); u != "" {
+		return strings.TrimSuffix(u, "/")
+	}
+	return Get(p).BaseURL
+}
+
+// ResolveEndpoint maps an operator's endpoint choice to a base URL. It accepts
+// either a short name from the provider's Endpoints ("sgp") or a full URL, so
+// a cluster this build has never heard of is still reachable. Empty selects
+// the provider default.
+func ResolveEndpoint(p ID, choice string) (string, error) {
+	c := strings.TrimSpace(choice)
+	if c == "" {
+		return Get(p).BaseURL, nil
+	}
+	for _, e := range Get(p).Endpoints {
+		if strings.EqualFold(e.Name, c) {
+			return e.URL, nil
+		}
+	}
+	if strings.HasPrefix(c, "https://") || strings.HasPrefix(c, "http://") {
+		return strings.TrimSuffix(c, "/"), nil
+	}
+	names := make([]string, 0, len(Get(p).Endpoints))
+	for _, e := range Get(p).Endpoints {
+		names = append(names, e.Name)
+	}
+	if len(names) == 0 {
+		return "", fmt.Errorf("%s has no selectable endpoints; pass a full https:// URL", Get(p).Name)
+	}
+	return "", fmt.Errorf("unknown %s endpoint %q — use one of %s, or a full https:// URL",
+		Get(p).Name, c, strings.Join(names, ", "))
 }
 
 // Valid reports whether id names a known provider.

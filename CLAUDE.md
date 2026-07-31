@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 It serves `/v1/*` as a transparent pass-through, swapping in a managed credential's `Authorization` header. This is what Claude Code clients connect to.
 
-Two upstreams are supported (`internal/provider`): **Anthropic** OAuth subscriptions and **Z.AI GLM** coding plans, whose API is Anthropic-compatible. The provider that serves a request is decided by the model the client asked for, so a user picks a GLM model in Claude Code's `/model` picker and it just works. See [Providers](#providers-multi-upstream).
+Three upstreams are supported (`internal/provider`): **Anthropic** OAuth subscriptions, **Z.AI GLM** coding plans, and **Xiaomi MiMo** token plans — both of the latter expose Anthropic-compatible APIs. The provider that serves a request is decided by the model the client asked for, so a user picks a GLM model in Claude Code's `/model` picker and it just works. See [Providers](#providers-multi-upstream).
 
 ## Build & Test Commands
 
@@ -86,15 +86,34 @@ Claude Code (ANTHROPIC_BASE_URL → proxy)
 `internal/provider` is the single place per-upstream behaviour is declared;
 nothing else tests for a provider by name.
 
-| | Anthropic | Z.AI GLM |
-|---|---|---|
-| Base URL | `https://api.anthropic.com` | `https://api.z.ai/api/anthropic` |
-| Model prefix | `claude-` | `glm-` |
-| Credential | OAuth (access + refresh) | static API key |
-| Refreshable | yes | no — a 401 means a bad key |
-| Usage API | `/api/oauth/usage` | none |
-| `[1m]` variants | yes | no — Z.AI 400s on the suffixed form |
-| Advertised as | native ID | `claude-`-prefixed alias (see below) |
+| | Anthropic | Z.AI GLM | Xiaomi MiMo |
+|---|---|---|---|
+| Base URL | `api.anthropic.com` | `api.z.ai/api/anthropic` | `token-plan-<region>.xiaomimimo.com/anthropic` |
+| Model prefix | `claude-` | `glm-` | `mimo-` |
+| Credential | OAuth (access + refresh) | static API key | static API key |
+| Refreshable | yes | no — a 401 means a bad key | no |
+| Usage API | `/api/oauth/usage` | none | none |
+| `GET /v1/models` | yes | yes | **no** — nginx 404; static catalogue |
+| `count_tokens` | yes | yes | **no** — nginx 404 |
+| `[1m]` variants | yes | no — 400s on the suffixed form | no — 400s on the suffixed form |
+| Advertised as | native ID | `claude-`-prefixed alias | `claude-`-prefixed alias |
+| Endpoints | one | global / cn | sgp / ams / cn / payg |
+
+**Endpoints are per credential, not per provider** (`credentials.base_url`,
+empty = the provider default). A MiMo Token Plan key is bound to one regional
+cluster and answers every other with a bare `Invalid API Key` that says nothing
+about the region, so the operator picks the endpoint when adding the key —
+`creds add-key --endpoint sgp`, the TUI's endpoint prompt, or the web UI's
+selector. `provider.ResolveEndpoint` accepts a short name or a full URL, so a
+cluster added after this build is still reachable without a registry edit.
+`ResolveBaseURL` then resolves the stored override at forward time.
+
+**Key verification uses `POST /v1/messages`, not `GET /v1/models`.**
+`api.z.ai/api/anthropic/v1/models` returns **200 for a garbage bearer token**,
+so verifying against it admitted any string and defeated the whole point of the
+check; MiMo has no `/v1/models` at all. A `max_tokens:1` completion is the
+smallest request both providers accept and both reject with 401, and it is what
+catches a right-key/wrong-cluster mistake at add time rather than in production.
 
 **GLM models are advertised under a `claude-` alias, and must be.** Claude Code
 filters the gateway model list client-side; its `/v1/models` bootstrap runs
@@ -137,11 +156,16 @@ the picker — which is equally true of the pre-existing `MODELS_1M` feature.
 Verified end-to-end: the discovered entries land in `~/.claude.json` under
 `additionalModelOptionsCache`, which is what the picker renders.
 
-**GLM needs no translation layer.** Its Anthropic-compatible surface was verified
-live against `/v1/models`, `/v1/messages`, `/v1/messages/count_tokens`, SSE
-streaming, tool use, `cache_control`, and Claude Code's `anthropic-beta` headers.
+**Neither needs a translation layer.** Both surfaces were verified live against
+`/v1/messages`, SSE streaming, tool use, `cache_control` and Claude Code's
+`anthropic-beta` headers (GLM additionally serves `/v1/models` and
+`count_tokens`; MiMo serves neither, and returns `thinking` content blocks).
 Only the base URL and the credential differ, so `usagecapture.go`,
 `promptcapture.go`, the 429 handling and the SSE relay all work unmodified.
+
+> MiMo's missing `count_tokens` is forwarded and 404s back to the client.
+> Claude Code tolerates that (it falls back to estimating), so it is passed
+> through honestly rather than synthesized.
 
 **Routing is by model, resolved before any credential is chosen.**
 `provider.ForModel` prefix-matches the request body's `model` (trimming a

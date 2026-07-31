@@ -48,7 +48,7 @@ function th(label, cls) {
 // The badge style capitalizes its text, which turns "glm" into "Glm". Spell
 // out the display form instead of fighting the CSS; unknown providers fall
 // back to the raw id so a new one is still legible before this map is updated.
-const PROVIDER_LABELS = { anthropic: "Anthropic", glm: "GLM" };
+const PROVIDER_LABELS = { anthropic: "Anthropic", glm: "GLM", mimo: "MiMo" };
 function providerLabel(id) {
   return PROVIDER_LABELS[id] || id || "Anthropic";
 }
@@ -97,9 +97,27 @@ function credRow(c, root) {
 // addKeyModal collects a static API key. Kept separate from addModal, which
 // takes a pasted .credentials.json — an API-key provider has no analogue of it.
 function addKeyModal(root) {
+  // Endpoint options mirror internal/provider's registry. A key is bound to one
+  // cluster and a wrong pick fails with a bare "Invalid API Key", so the choice
+  // is explicit rather than guessed.
+  const ENDPOINTS = {
+    glm: [["global", "Global (api.z.ai)"], ["cn", "China (open.bigmodel.cn)"]],
+    mimo: [["sgp", "Token Plan — Singapore"], ["ams", "Token Plan — Amsterdam"],
+           ["cn", "Token Plan — China"], ["payg", "Pay-as-you-go"]],
+  };
   const provider = el("select", { class: "input" }, [
     el("option", { value: "glm", text: "Z.AI GLM" }),
+    el("option", { value: "mimo", text: "Xiaomi MiMo" }),
   ]);
+  const endpoint = el("select", { class: "input" });
+  const fillEndpoints = () => {
+    clear(endpoint);
+    for (const [v, label] of ENDPOINTS[provider.value] || []) {
+      endpoint.append(el("option", { value: v, text: label }));
+    }
+  };
+  fillEndpoints();
+  provider.addEventListener("change", fillEndpoints);
   const key = el("input", { class: "input", type: "password", placeholder: "API key", spellcheck: "false" });
   const label = el("input", { class: "input", type: "text", placeholder: "e.g. zai-main" });
   const plan = el("input", { class: "input", type: "text", placeholder: "lite | pro | max" });
@@ -109,6 +127,7 @@ function addKeyModal(root) {
   const body = el("div", { class: "form" }, [
     el("div", { class: "form-grid" }, [
       el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Provider" }), provider]),
+      el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Endpoint" }), endpoint]),
       el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Label (optional)" }), label]),
       el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Plan (optional)" }), plan]),
       el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Weight (optional)" }), weight]),
@@ -135,6 +154,7 @@ function addKeyModal(root) {
           try {
             await api.addKey({
               provider: provider.value,
+              endpoint: endpoint.value,
               api_key: key.value.trim(),
               label: label.value.trim(),
               plan: plan.value.trim(),
