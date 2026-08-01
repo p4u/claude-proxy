@@ -451,6 +451,28 @@ window.fetch = async (input, init = {}) => {
       c.status = "active";
       return json({ ok: true, id: c.id, status: "active", endpoint: url });
     }
+    // Mirrors ProbeCustomHost so the unified add-modal's "Test connection"
+    // works offline for every provider kind.
+    if (path === "/credentials/probe" && method === "POST") {
+      const b = JSON.parse(init.body || "{}");
+      if (!/^https?:\/\//.test(b.base_url || "")) {
+        return json({ ok: false, error: "base URL must start with http:// or https://", models: [] });
+      }
+      return json({
+        ok: true, auth_required: !!b.api_key, has_models_api: false,
+        has_count_tokens: true, reported_model: "demo-model-v1",
+        models: [{ id: "demo-model-v1", display_name: "demo-model-v1" }],
+      });
+    }
+    if (path === "/credentials/custom" && method === "POST") {
+      const b = JSON.parse(init.body || "{}");
+      if (!b.base_url) return json({ error: "base URL is required" }, 400);
+      const c = { id: "cred_" + Math.random().toString(36).slice(2, 6),
+        label: b.label || new URL(b.base_url).host, type: "", weight: b.weight || 1,
+        status: "active", provider: "custom", endpoint: b.base_url };
+      CREDS.push(c);
+      return json({ ok: true, id: c.id, label: c.label, base_url: b.base_url });
+    }
     if (path === "/credentials/keys" && method === "POST") {
       const b = JSON.parse(init.body || "{}");
       if (!b.api_key) return json({ error: "API key is empty" }, 400);

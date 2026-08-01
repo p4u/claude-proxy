@@ -148,6 +148,18 @@ queries must use the indexes on `request_log(ts)` / `usage_history(credential_id
   Global period selector (1h/6h/24h/7d/30d) drives every chart; per-chart group-by toggle.
 - **Subscriptions**: per-credential cards with 5h/7d/sonnet utilization meters +
   resets-at countdowns, and the utilization history multi-line chart.
+> **Add credential is one modal for every kind** (`addCredentialModal`). A type
+> selector switches between Anthropic subscription (paste `credentials.json`),
+> a provider API key (GLM/MiMo), and a custom Anthropic-compatible host; the
+> fields follow the selection. The endpoint is an `<input list>` backed by a
+> `<datalist>` of the provider's presets — one editable control that both
+> suggests and accepts anything, rather than a `<select>` plus a separate
+> "custom URL" field. Presets come from `GET /api/credentials/endpoints`, so
+> the UI keeps no copy of the registry. Every field carries help text, optional
+> settings (label/plan/weight) are folded into an `Advanced` disclosure, and
+> "Test connection" runs `POST /api/credentials/probe` for any key-based kind —
+> the only way to tell a bad key from a right key aimed at the wrong cluster.
+
 - **Credentials**: table with status badges, weight editing, enable/disable/refresh/
   delete actions, "add credential" modal (paste JSON), "update tokens" modal.
 - **Users**: table with per-period stats, create modal (token reveal + copy once),

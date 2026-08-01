@@ -8,21 +8,19 @@ import { compactNum, relTime, localTime } from "../format.js";
 export async function render(root) {
   clear(root);
   const head = sectionHead("Credentials", "Managed subscriptions and API keys in the rotation pool.", [
-    button("Add custom host", { onClick: () => addCustomModal(root) }),
-    button("Add API key", { onClick: () => addKeyModal(root) }),
-    button("Add credential", { kind: "primary", onClick: () => addModal(root) }),
+    button("Add credential", { kind: "primary", onClick: () => addCredentialModal(root) }),
   ]);
   const body = el("div", { class: "card table-card" }, spinner("Loading credentials…"));
   root.append(head, body);
 
   try {
-    const [rows] = await Promise.all([
-      api.credentials(),
-      loadEndpoints(),
-    ]);
+    const [rows] = await Promise.all([api.credentials(), loadEndpoints()]);
     clear(body);
     if (!rows || !rows.length) {
-      body.append(emptyState("No credentials yet", 'Click "Add credential" and paste a .credentials.json to bring a subscription into the pool.'));
+      body.append(emptyState(
+        "No credentials yet",
+        'Click "Add credential" to bring an Anthropic subscription, a provider API key, or any Anthropic-compatible host into the pool.',
+      ));
       return;
     }
     body.append(buildTable(rows, root));
@@ -49,55 +47,294 @@ function th(label, cls) {
   return el("th", { class: cls || null, text: label });
 }
 
-// Endpoint presets, fetched once from /credentials/endpoints. The registry in
-// Go stays the single source of truth; this is only a cache.
+// ---------------------------------------------------------------------------
+// Provider metadata
+// ---------------------------------------------------------------------------
+
+// Endpoint presets, fetched once from /credentials/endpoints. The Go registry
+// stays the single source of truth; this is only a cache.
 let ENDPOINTS = {};
 async function loadEndpoints() {
   try {
     ENDPOINTS = (await api.endpoints()) || {};
   } catch {
-    ENDPOINTS = {}; // presets unavailable → the custom URL field still works
+    ENDPOINTS = {}; // presets unavailable → the endpoint field still accepts a URL
   }
 }
 
-// endpointPicker builds a preset <select> plus a free-text field revealed by
-// the "Custom…" option, and returns { wrap, value() }. Presets cover the common
-// case; the text field means a cluster the proxy has never heard of is still
-// reachable without a rebuild.
-const CUSTOM = "__custom";
-function endpointPicker(providerId, current) {
-  const sel = el("select", { class: "input" });
-  const custom = el("input", {
-    class: "input", type: "text", spellcheck: "false",
-    placeholder: "https://your-cluster.example.com/anthropic",
-  });
-  const customRow = el("div", { class: "form-row" }, [
-    el("label", { class: "field-label", text: "Custom URL" }), custom,
+// The badge style capitalizes its text, which turns "glm" into "Glm". Spell out
+// the display form instead of fighting the CSS; unknown providers fall back to
+// the raw id so a new one stays legible before this map is updated.
+const PROVIDER_LABELS = { anthropic: "Anthropic", glm: "GLM", mimo: "MiMo", custom: "Custom" };
+function providerLabel(id) {
+  return PROVIDER_LABELS[id] || id || "Anthropic";
+}
+
+// What each credential kind needs from the operator, and what to tell them
+// about it. Keeping the copy here rather than inline keeps the form builder
+// readable and the guidance consistent between the add and edit modals.
+const KINDS = {
+  anthropic: {
+    label: "Anthropic subscription",
+    blurb: "A Pro/Max/Team/Enterprise login. The proxy keeps its token refreshed for you.",
+    needsJSON: true,
+  },
+  glm: {
+    label: "Z.AI GLM",
+    blurb: "A GLM coding-plan API key.",
+    keyHelp: "From z.ai → API Keys. Verified against the endpoint below before it is stored.",
+    endpointHelp: "Pick the cluster your key belongs to, or type any other URL.",
+    plan: true,
+  },
+  mimo: {
+    label: "Xiaomi MiMo",
+    blurb: "A MiMo token-plan API key.",
+    keyHelp: "Token Plan keys start with tp-. Verified against the endpoint below before it is stored.",
+    endpointHelp:
+      "A Token Plan key works on exactly one cluster — the others answer “Invalid API Key” without saying why. Type a URL directly for a cluster not listed.",
+    plan: true,
+  },
+  custom: {
+    label: "Custom Anthropic-compatible host",
+    blurb: "Any endpoint speaking the Anthropic Messages API — a self-hosted model, a gateway, another vendor.",
+    keyHelp: "Leave blank if the host needs no key.",
+    endpointHelp: "Base URL of the host, e.g. http://10.0.0.5:3456 or https://host/anthropic.",
+    models: true,
+    freeEndpoint: true,
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Form building blocks
+// ---------------------------------------------------------------------------
+
+let uid = 0;
+
+// field wraps a control with its label and an optional help line. The help text
+// is the point of this refactor: every input says what it is for and what goes
+// wrong if it is off, instead of assuming the operator already knows.
+function field(labelText, control, help) {
+  return el("div", { class: "form-row" }, [
+    el("label", { class: "field-label", text: labelText }),
+    control,
+    el("p", { class: "field-help", text: help || "" }),
   ]);
+}
 
-  const fill = (pid) => {
-    clear(sel);
-    for (const e of (ENDPOINTS[pid]?.endpoints) || []) {
-      sel.append(el("option", { value: e.name, text: e.desc || e.name }));
+function setHelp(row, text) {
+  const p = row.querySelector(".field-help");
+  if (p) p.textContent = text || "";
+}
+
+// endpointInput is a free-text URL box backed by native suggestions.
+//
+// Deliberately an <input list> rather than a <select> plus a separate "custom"
+// field: presets are a shortcut, not a constraint, so one control both offers
+// them and accepts anything else. No mode switch, and the effective value is
+// always visible and editable.
+function endpointInput(kind, value) {
+  const listID = `ep-${++uid}`;
+  const input = el("input", {
+    class: "input", type: "text", spellcheck: "false", list: listID,
+    placeholder: "https://host/anthropic",
+    value: value || "",
+  });
+  const datalist = el("datalist", { id: listID });
+  const fill = (k) => {
+    clear(datalist);
+    for (const e of ENDPOINTS[k]?.endpoints || []) {
+      datalist.append(el("option", { value: e.url, label: e.desc || e.name }));
     }
-    sel.append(el("option", { value: CUSTOM, text: "Custom…" }));
-    // Preselect the credential's current endpoint: a known preset by name,
-    // otherwise the custom field pre-filled with its URL.
-    if (current?.name) sel.value = current.name;
-    else if (current?.url) { sel.value = CUSTOM; custom.value = current.url; }
-    sync();
+    // Default to the provider's own default so the common case needs no typing.
+    if (!input.value) input.value = ENDPOINTS[k]?.default || "";
   };
-  const sync = () => { customRow.hidden = sel.value !== CUSTOM; };
-  sel.addEventListener("change", sync);
-  fill(providerId);
+  fill(kind);
+  return { input, datalist, setKind: fill, value: () => input.value.trim() };
+}
 
+// probePanel renders what a connection test discovered.
+function probePanel() {
+  const root = el("div", { class: "probe" });
+  const line = (k, v, tone) => el("div", { class: "probe__row" }, [
+    el("span", { class: "probe__k", text: k }),
+    el("span", { class: "probe__v" + (tone ? ` probe__v--${tone}` : ""), text: v }),
+  ]);
   return {
-    select: sel,
-    customRow,
-    setProvider: fill,
-    value: () => (sel.value === CUSTOM ? custom.value.trim() : sel.value),
+    root,
+    clear: () => clear(root),
+    render: (p) => {
+      clear(root);
+      const yn = (b) => (b ? "yes" : "no");
+      root.append(
+        line("reachable", yn(p.ok), p.ok ? "good" : "bad"),
+        line("auth enforced", yn(p.auth_required), p.auth_required ? "good" : "warn"),
+        line("/v1/models", yn(p.has_models_api)),
+        line("count_tokens", yn(p.has_count_tokens)),
+      );
+      if (p.reported_model) root.append(line("reports model", p.reported_model));
+      if (p.error) root.append(line("error", p.error, "bad"));
+      for (const m of p.models || []) {
+        // Context window is only knowable from a /v1/models the host may not
+        // serve; say so rather than leaving a silent blank.
+        root.append(line("model", m.id + (m.context_window ? ` · ${m.context_window} ctx` : " · context unknown")));
+      }
+    },
   };
 }
+
+// ---------------------------------------------------------------------------
+// Add credential — one modal for every kind
+// ---------------------------------------------------------------------------
+
+// This was three near-identical modals (OAuth paste, provider key, custom host)
+// that had drifted apart. They ask for overlapping things, so they are now one
+// form whose fields follow the selected kind.
+function addCredentialModal(root) {
+  const kindSel = el("select", { class: "input" },
+    Object.entries(KINDS).map(([k, v]) => el("option", { value: k, text: v.label })));
+
+  const ep = endpointInput("glm", "");
+  const key = el("input", { class: "input", type: "password", spellcheck: "false", placeholder: "API key" });
+  const json = el("textarea", {
+    class: "input input--code", rows: "9", spellcheck: "false",
+    placeholder: '{\n  "claudeAiOauth": {\n    "accessToken": "...",\n    "refreshToken": "...",\n    "expiresAt": ...\n  }\n}',
+  });
+  const models = el("input", {
+    class: "input", type: "text", spellcheck: "false",
+    placeholder: "discovered on test — comma-separated to override",
+  });
+  const label = el("input", { class: "input", type: "text", placeholder: "defaults to the provider or host name" });
+  const plan = el("input", { class: "input", type: "text", placeholder: "lite | pro | max" });
+  const weight = el("input", { class: "input input--sm", type: "number", min: "0", placeholder: "auto" });
+
+  const probe = probePanel();
+  const err = el("p", { class: "form-err", role: "alert" });
+
+  const kindRow = field("Type", kindSel, "");
+  const endpointRow = field("Endpoint", el("div", { class: "field-control" }, [ep.input, ep.datalist]), "");
+  const keyRow = field("API key", key, "");
+  const jsonRow = field("credentials.json", json,
+    "Run `claude /login` with a dedicated CLAUDE_CONFIG_DIR, then paste that file. Liveness is verified and duplicates are rejected.");
+  const modelsRow = field("Models", models,
+    "Left blank, the host is asked what it serves. Translation shims often answer as a different name than the one requested — that reported name is what gets stored.");
+  const planRow = field("Plan", plan, "Display only — it does not affect routing.");
+
+  const advanced = el("details", { class: "form-adv" }, [
+    el("summary", { text: "Advanced" }),
+    el("div", { class: "form-adv__body" }, [
+      field("Label", label, "Shown in listings and charts."),
+      planRow,
+      field("Weight", weight, "Higher weight takes more new conversations. Weights only compete within one provider."),
+    ]),
+  ]);
+
+  const body = el("div", { class: "form" }, [
+    kindRow, endpointRow, keyRow, jsonRow, modelsRow, advanced, probe.root, err,
+  ]);
+
+  const busy = async (btn, verb, fn) => {
+    err.textContent = "";
+    btn.disabled = true;
+    const orig = btn.textContent;
+    btn.textContent = verb;
+    try {
+      await fn();
+    } catch (e) {
+      err.textContent = e.message || "Something went wrong.";
+    } finally {
+      btn.disabled = false;
+      btn.textContent = orig;
+    }
+  };
+
+  // Testing before saving is offered for every key-based kind, not only custom
+  // hosts: it is the only way to tell a bad key from a right key pointed at the
+  // wrong cluster, which fail with the same upstream message.
+  const testBtn = button("Test connection", {
+    onClick: (ev) => busy(ev.currentTarget, "Testing…", async () => {
+      if (!ep.value()) throw new Error("Enter an endpoint first.");
+      const p = await api.probeHost({ base_url: ep.value(), api_key: key.value.trim() });
+      probe.render(p);
+      if ((p.models || []).length && !models.value.trim()) {
+        models.value = p.models.map((m) => m.id).join(", ");
+      }
+    }),
+  });
+
+  const submit = button("Add", {
+    kind: "primary",
+    onClick: (ev) => busy(ev.currentTarget, "Verifying…", async () => {
+      const k = kindSel.value;
+      if (k === "anthropic") {
+        const raw = json.value.trim();
+        if (!raw) throw new Error("Paste a credentials.json first.");
+        try { JSON.parse(raw); } catch { throw new Error("That isn't valid JSON."); }
+        const payload = { credentials_json: raw };
+        if (label.value.trim()) payload.label = label.value.trim();
+        const w = parseInt(weight.value, 10);
+        if (!isNaN(w)) payload.weight = w;
+        await api.post("/credentials", payload);
+      } else if (k === "custom") {
+        if (!ep.value()) throw new Error("Enter the host's base URL.");
+        await api.addCustom({
+          base_url: ep.value(),
+          api_key: key.value.trim(),
+          label: label.value.trim(),
+          models: models.value.split(",").map((v) => v.trim()).filter(Boolean)
+            .map((id) => ({ id, display_name: id })),
+          weight: Number(weight.value) || 0,
+        });
+      } else {
+        if (!key.value.trim()) throw new Error("Enter the API key.");
+        await api.addKey({
+          provider: k,
+          endpoint: ep.value(),
+          api_key: key.value.trim(),
+          label: label.value.trim(),
+          plan: plan.value.trim(),
+          weight: Number(weight.value) || 0,
+        });
+      }
+      m.close();
+      toast("Credential added", "good");
+      render(root);
+    }),
+  });
+
+  const sync = () => {
+    const k = kindSel.value;
+    const cfg = KINDS[k];
+    setHelp(kindRow, cfg.blurb);
+    endpointRow.hidden = !!cfg.needsJSON;
+    keyRow.hidden = !!cfg.needsJSON;
+    jsonRow.hidden = !cfg.needsJSON;
+    modelsRow.hidden = !cfg.models;
+    planRow.hidden = !cfg.plan;
+    testBtn.hidden = !!cfg.needsJSON;
+    setHelp(endpointRow, cfg.endpointHelp);
+    setHelp(keyRow, cfg.keyHelp);
+    // Presets belong to the selected provider; a custom host has none.
+    ep.input.value = "";
+    ep.setKind(k);
+    probe.clear();
+    err.textContent = "";
+  };
+  kindSel.addEventListener("change", sync);
+
+  const m = modal({
+    title: "Add credential",
+    subtitle: "Anthropic subscriptions, provider API keys, and any Anthropic-compatible host.",
+    wide: true,
+    body,
+    actions: [button("Cancel", { onClick: () => m.close() }), testBtn, submit],
+  });
+  sync();
+  return m;
+}
+
+// ---------------------------------------------------------------------------
+// Rows
+// ---------------------------------------------------------------------------
 
 // endpointLabel keeps the column narrow: a preset name when the URL matches
 // one, otherwise the custom URL's host.
@@ -111,21 +348,21 @@ function endpointLabel(c) {
   }
 }
 
-// endpointModal moves an existing key to another cluster. The backend
+// endpointModal moves an existing key to another endpoint. The backend
 // re-verifies the key there before committing, so a wrong pick is rejected
 // rather than silently breaking a working credential.
 function endpointModal(c, root) {
   const id = c.id || c.credential_id;
-  const ep = endpointPicker(c.provider, { name: c.endpoint_name, url: c.endpoint });
+  const ep = endpointInput(c.provider, c.endpoint);
   const err = el("p", { class: "form-err", role: "alert" });
   const body = el("div", { class: "form" }, [
-    el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Endpoint" }), ep.select]),
-    ep.customRow,
+    field("Endpoint", el("div", { class: "field-control" }, [ep.input, ep.datalist]),
+      "Pick a preset or type any URL. The key is re-verified there before the move — if it fails, nothing changes."),
     err,
   ]);
   const m = modal({
     title: "Change endpoint",
-    subtitle: `The key is re-verified against the new endpoint before ${c.label || id} is moved.`,
+    subtitle: `Move ${c.label || id} to another cluster.`,
     body,
     actions: [
       button("Cancel", { onClick: () => m.close() }),
@@ -134,15 +371,14 @@ function endpointModal(c, root) {
         onClick: async (ev) => {
           const btn = ev.currentTarget;
           err.textContent = "";
-          const value = ep.value();
-          if (!value) { err.textContent = "Pick a preset or enter a URL."; return; }
+          if (!ep.value()) { err.textContent = "Pick a preset or enter a URL."; return; }
           btn.disabled = true;
           const orig = btn.textContent;
           btn.textContent = "Verifying…";
           try {
-            await api.post(`/credentials/${id}/endpoint`, { endpoint: value });
+            await api.post(`/credentials/${id}/endpoint`, { endpoint: ep.value() });
             m.close();
-            toast("Endpoint updated");
+            toast("Endpoint updated", "good");
             render(root);
           } catch (e) {
             err.textContent = e.message || "Could not change the endpoint.";
@@ -157,26 +393,16 @@ function endpointModal(c, root) {
   return m;
 }
 
-// The badge style capitalizes its text, which turns "glm" into "Glm". Spell
-// out the display form instead of fighting the CSS; unknown providers fall
-// back to the raw id so a new one is still legible before this map is updated.
-const PROVIDER_LABELS = { anthropic: "Anthropic", glm: "GLM", mimo: "MiMo", custom: "Custom" };
-function providerLabel(id) {
-  return PROVIDER_LABELS[id] || id || "Anthropic";
-}
-
 function credRow(c, root) {
   const id = c.id || c.credential_id;
   const disabled = (c.status || "").toLowerCase() === "disabled";
   // A static API key has no OAuth lineage: there is nothing to refresh and no
-  // .credentials.json to re-paste, so those two actions are omitted rather
-  // than offered and then failing.
+  // .credentials.json to re-paste, so those actions are omitted rather than
+  // offered and then failing.
   const isKey = c.has_usage_api === false;
   const actions = el("div", { class: "row-actions" }, [
     button("Weight", { onClick: () => weightModal(id, c.weight, root) }),
-    ...(c.endpoint_editable ? [
-      button("Endpoint", { onClick: () => endpointModal(c, root) }),
-    ] : []),
+    ...(c.endpoint_editable ? [button("Endpoint", { onClick: () => endpointModal(c, root) })] : []),
     ...(isKey ? [] : [
       button("Refresh", { onClick: () => act(() => api.post(`/credentials/${id}/refresh`), "Token refreshed", root) }),
       button("Update tokens", { onClick: () => updateModal(id, root) }),
@@ -196,13 +422,14 @@ function credRow(c, root) {
       },
     }),
   ]);
+
+  const modelIDs = (c.models || []).map((m) => m.id).join(", ");
+  const typeCell = c.subscription_type || (modelIDs ? `${(c.models || []).length} model(s)` : "—");
   return el("tr", {}, [
     el("td", {}, [el("span", { class: "cell-strong", text: c.label || "—" }), el("span", { class: "cell-id", text: id })]),
     el("td", {}, el("span", { class: "badge", text: providerLabel(c.provider) })),
-    // Preset name when it matches one, else the bare host of a custom URL —
-    // the full URL is long enough to wreck the table layout.
     el("td", { text: endpointLabel(c), title: c.endpoint || "" }),
-    el("td", { text: c.subscription_type || "—" }),
+    el("td", { text: typeCell, title: modelIDs }),
     el("td", {}, statusBadge(c.status)),
     el("td", { class: "num", text: String(c.weight ?? "—") }),
     el("td", { class: "num", text: compactNum(c.request_count ?? c.requests ?? 0) }),
@@ -210,191 +437,6 @@ function credRow(c, root) {
     el("td", { text: isKey ? "never" : (c.expires_at ? localTime(tsOf(c.expires_at)) : "—") }),
     el("td", { class: "actions" }, actions),
   ]);
-}
-
-// addCustomModal adds any Anthropic-compatible endpoint.
-//
-// The host is probed before it can be saved, and the probe fills in everything
-// it can discover — the model list above all, since a translation shim often
-// answers as a name the operator would not have guessed. Discovered values are
-// editable: the probe is a starting point, not a verdict.
-function addCustomModal(root) {
-  const url = el("input", { class: "input", type: "text", spellcheck: "false",
-    placeholder: "http://10.0.0.5:3456 or https://host/anthropic" });
-  const key = el("input", { class: "input", type: "password", spellcheck: "false",
-    placeholder: "API key (blank if the host needs none)" });
-  const label = el("input", { class: "input", type: "text", placeholder: "defaults to the host name" });
-  const models = el("input", { class: "input", type: "text", spellcheck: "false",
-    placeholder: "discovered automatically — comma-separated to override" });
-  const weight = el("input", { class: "input input--sm", type: "number", min: "0", placeholder: "auto" });
-  const report = el("div", { class: "probe" });
-  const err = el("p", { class: "form-err", role: "alert" });
-
-  const body = el("div", { class: "form" }, [
-    el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Base URL" }), url]),
-    el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "API key" }), key]),
-    el("div", { class: "form-grid" }, [
-      el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Label" }), label]),
-      el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Weight" }), weight]),
-    ]),
-    el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Models" }), models]),
-    report,
-    err,
-  ]);
-
-  const yn = (b) => (b ? "yes" : "no");
-  const renderProbe = (p) => {
-    clear(report);
-    const line = (k, v, tone) => el("div", { class: "probe__row" }, [
-      el("span", { class: "probe__k", text: k }),
-      el("span", { class: "probe__v" + (tone ? ` probe__v--${tone}` : ""), text: v }),
-    ]);
-    report.append(
-      line("reachable", yn(p.ok), p.ok ? "good" : "bad"),
-      line("auth enforced", yn(p.auth_required), p.auth_required ? "good" : "warn"),
-      line("/v1/models", yn(p.has_models_api)),
-      line("count_tokens", yn(p.has_count_tokens)),
-    );
-    if (p.reported_model) report.append(line("reports model", p.reported_model));
-    if (p.error) report.append(line("error", p.error, "bad"));
-    // Context window is only knowable from a /v1/models the host may not
-    // serve; say so rather than leaving a silent blank.
-    for (const m of p.models || []) {
-      report.append(line("model", m.id + (m.context_window ? ` · ${m.context_window} ctx` : " · context unknown")));
-    }
-    if ((p.models || []).length && !models.value.trim()) {
-      models.value = (p.models || []).map((m) => m.id).join(", ");
-    }
-  };
-
-  const parseModels = () =>
-    models.value.split(",").map((v) => v.trim()).filter(Boolean)
-      .map((id) => ({ id, display_name: id }));
-
-  const m = modal({
-    title: "Add custom Anthropic API host",
-    subtitle: "Any endpoint speaking the Anthropic Messages API. Probe first — the model list and capabilities are discovered for you.",
-    wide: true,
-    body,
-    actions: [
-      button("Cancel", { onClick: () => m.close() }),
-      button("Probe", {
-        onClick: async (ev) => {
-          const btn = ev.currentTarget;
-          err.textContent = "";
-          if (!url.value.trim()) { err.textContent = "Enter the base URL first."; return; }
-          btn.disabled = true;
-          const orig = btn.textContent;
-          btn.textContent = "Probing…";
-          try {
-            renderProbe(await api.probeHost({ base_url: url.value.trim(), api_key: key.value.trim() }));
-          } catch (e) {
-            err.textContent = e.message || "Probe failed.";
-          } finally {
-            btn.disabled = false;
-            btn.textContent = orig;
-          }
-        },
-      }),
-      button("Add host", {
-        kind: "primary",
-        onClick: async (ev) => {
-          const btn = ev.currentTarget;
-          err.textContent = "";
-          if (!url.value.trim()) { err.textContent = "Enter the base URL first."; return; }
-          btn.disabled = true;
-          const orig = btn.textContent;
-          btn.textContent = "Verifying…";
-          try {
-            await api.addCustom({
-              base_url: url.value.trim(),
-              api_key: key.value.trim(),
-              label: label.value.trim(),
-              models: parseModels(),
-              weight: Number(weight.value) || 0,
-            });
-            m.close();
-            toast("Custom host added");
-            render(root);
-          } catch (e) {
-            err.textContent = e.message || "Could not add the host.";
-          } finally {
-            btn.disabled = false;
-            btn.textContent = orig;
-          }
-        },
-      }),
-    ],
-  });
-  return m;
-}
-
-// addKeyModal collects a static API key. Kept separate from addModal, which
-// takes a pasted .credentials.json — an API-key provider has no analogue of it.
-function addKeyModal(root) {
-  const provider = el("select", { class: "input" }, [
-    el("option", { value: "glm", text: "Z.AI GLM" }),
-    el("option", { value: "mimo", text: "Xiaomi MiMo" }),
-  ]);
-  const ep = endpointPicker(provider.value, null);
-  provider.addEventListener("change", () => ep.setProvider(provider.value));
-  const key = el("input", { class: "input", type: "password", placeholder: "API key", spellcheck: "false" });
-  const label = el("input", { class: "input", type: "text", placeholder: "e.g. zai-main" });
-  const plan = el("input", { class: "input", type: "text", placeholder: "lite | pro | max" });
-  const weight = el("input", { class: "input input--sm", type: "number", min: "0", placeholder: "auto" });
-  const err = el("p", { class: "form-err", role: "alert" });
-
-  const body = el("div", { class: "form" }, [
-    el("div", { class: "form-grid" }, [
-      el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Provider" }), provider]),
-      el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Endpoint" }), ep.select]),
-      ep.customRow,
-      el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Label (optional)" }), label]),
-      el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Plan (optional)" }), plan]),
-      el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Weight (optional)" }), weight]),
-    ]),
-    el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "API key" }), key]),
-    err,
-  ]);
-
-  const m = modal({
-    title: "Add API key",
-    subtitle: "The key is verified against the provider before it enters the pool.",
-    body,
-    actions: [
-      button("Cancel", { onClick: () => m.close() }),
-      button("Verify & add", {
-        kind: "primary",
-        onClick: async (ev) => {
-          const btn = ev.currentTarget;
-          err.textContent = "";
-          if (!key.value.trim()) { err.textContent = "Paste an API key first."; return; }
-          btn.disabled = true;
-          const orig = btn.textContent;
-          btn.textContent = "Verifying…";
-          try {
-            await api.addKey({
-              provider: provider.value,
-              endpoint: ep.value(),
-              api_key: key.value.trim(),
-              label: label.value.trim(),
-              plan: plan.value.trim(),
-              weight: Number(weight.value) || 0,
-            });
-            m.close();
-            toast("API key added");
-            render(root);
-          } catch (e) {
-            err.textContent = e.message || "Could not add the key.";
-          } finally {
-            btn.disabled = false;
-            btn.textContent = orig;
-          }
-        },
-      }),
-    ],
-  });
-  return m;
 }
 
 function tsOf(v) {
@@ -418,8 +460,11 @@ function weightModal(id, current, root) {
   const input = el("input", { class: "input", type: "number", min: "0", step: "1", value: String(current ?? 1) });
   const m = modal({
     title: "Set selection weight",
-    subtitle: "Higher weight → more traffic. Pro tiers default to 1, max/team/enterprise to 5.",
-    body: el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Weight" }), input]),
+    subtitle: "Higher weight → more new conversations.",
+    body: el("div", { class: "form" }, [
+      field("Weight", input,
+        "Weights only compete within one provider. Anthropic defaults: pro 1, max/team/enterprise 5. API keys default to 1."),
+    ]),
     actions: [
       button("Cancel", { onClick: () => m.close() }),
       button("Save", {
@@ -433,43 +478,44 @@ function weightModal(id, current, root) {
       }),
     ],
   });
+  return m;
 }
 
-function jsonModal({ title, subtitle, submitLabel, onSubmit, extraFields }) {
+function updateModal(id, root) {
   const ta = el("textarea", {
-    class: "input input--code", rows: "10", spellcheck: "false",
+    class: "input input--code", rows: "9", spellcheck: "false",
     placeholder: '{\n  "claudeAiOauth": {\n    "accessToken": "...",\n    "refreshToken": "...",\n    "expiresAt": ...\n  }\n}',
   });
   const err = el("p", { class: "form-err", role: "alert" });
-  const body = el("div", { class: "form" }, [
-    ...(extraFields || []),
-    el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "credentials.json" }), ta]),
-    err,
-  ]);
   const m = modal({
-    title, subtitle, wide: true, body,
+    title: "Update tokens",
+    subtitle: "Replace this credential's tokens from a fresh login. Identity, weight and history are kept.",
+    wide: true,
+    body: el("div", { class: "form" }, [
+      field("credentials.json", ta,
+        "Use this when the subscription was re-logged-in elsewhere and the stored refresh token no longer works."),
+      err,
+    ]),
     actions: [
       button("Cancel", { onClick: () => m.close() }),
-      button(submitLabel, {
+      button("Update", {
         kind: "primary",
         onClick: async (ev) => {
           const btn = ev.currentTarget;
           const raw = ta.value.trim();
           err.textContent = "";
           if (!raw) { err.textContent = "Paste a credentials JSON first."; return; }
-          try {
-            JSON.parse(raw);
-          } catch {
-            err.textContent = "That isn't valid JSON.";
-            return;
-          }
+          try { JSON.parse(raw); } catch { err.textContent = "That isn't valid JSON."; return; }
           btn.disabled = true;
           const orig = btn.textContent;
           btn.textContent = "Verifying…";
           try {
-            await onSubmit(raw, m);
+            await api.put(`/credentials/${id}/tokens`, { credentials_json: raw });
+            m.close();
+            toast("Tokens updated", "good");
+            render(root);
           } catch (e) {
-            err.textContent = e.message || "Import failed.";
+            err.textContent = e.message || "Update failed.";
           } finally {
             btn.disabled = false;
             btn.textContent = orig;
@@ -479,44 +525,4 @@ function jsonModal({ title, subtitle, submitLabel, onSubmit, extraFields }) {
     ],
   });
   return m;
-}
-
-function addModal(root) {
-  const label = el("input", { class: "input", type: "text", placeholder: "e.g. team-account-2" });
-  const weight = el("input", { class: "input input--sm", type: "number", min: "0", placeholder: "auto" });
-  jsonModal({
-    title: "Add credential",
-    subtitle: "Paste a fresh .credentials.json. Liveness is verified; duplicates are rejected.",
-    submitLabel: "Import",
-    extraFields: [
-      el("div", { class: "form-grid" }, [
-        el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Label (optional)" }), label]),
-        el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Weight (optional)" }), weight]),
-      ]),
-    ],
-    onSubmit: async (raw, m) => {
-      const payload = { credentials_json: raw };
-      if (label.value.trim()) payload.label = label.value.trim();
-      const w = parseInt(weight.value, 10);
-      if (!isNaN(w)) payload.weight = w;
-      await api.post("/credentials", payload);
-      m.close();
-      toast("Credential imported", "good");
-      render(root);
-    },
-  });
-}
-
-function updateModal(id, root) {
-  jsonModal({
-    title: "Update tokens",
-    subtitle: "Replace this credential's tokens from a fresh login file. Identity and weight are kept.",
-    submitLabel: "Update",
-    onSubmit: async (raw, m) => {
-      await api.put(`/credentials/${id}/tokens`, { credentials_json: raw });
-      m.close();
-      toast("Tokens updated", "good");
-      render(root);
-    },
-  });
 }

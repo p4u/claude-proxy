@@ -467,7 +467,7 @@ td.actions { text-align: right; white-space: nowrap; }
 .modal__sub { font-size: 12.5px; color: var(--ink-2); margin-top: 4px; }
 .modal__head .icon-btn { font-size: 22px; line-height: 1; }
 .modal__body { padding: 4px 20px 8px; overflow-y: auto; }
-.modal__foot { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 20px 18px; }
+.modal__foot { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 20px 18px; flex-wrap: wrap; }
 .confirm-msg { color: var(--ink-2); font-size: 13.5px; }
 
 .form { display: flex; flex-direction: column; gap: 14px; }
@@ -513,6 +513,21 @@ td.actions { text-align: right; white-space: nowrap; }
 .login__btn { margin-top: 6px; padding: 11px; font-size: 14px; }
 .login__err { color: var(--critical); font-size: 12.5px; min-height: 16px; }
 .form-err { color: var(--critical); font-size: 12.5px; min-height: 16px; margin: 0; }
+/* Per-field guidance. Empty by default and collapsed via :empty so a field
+   without help does not leave a gap. */
+.field-help { font-size: 11.5px; line-height: 1.45; color: var(--ink-muted); margin: 0; }
+.field-help:empty { display: none; }
+.field-control { display: block; }
+/* Optional settings, folded away so the common path is short. */
+.form-adv { border-top: 1px solid var(--border); padding-top: 10px; }
+.form-adv > summary { cursor: pointer; font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-muted); list-style: none; }
+.form-adv > summary::-webkit-details-marker { display: none; }
+.form-adv > summary::before { content: "▸ "; }
+.form-adv[open] > summary::before { content: "▾ "; }
+.form-adv > summary:hover { color: var(--ink-2); }
+.form-adv__body { display: flex; flex-direction: column; gap: 14px; padding-top: 12px; }
+/* A hidden form row must not still occupy its flex gap. */
+.form-row[hidden] { display: none; }
 .login__foot { font-family: var(--mono); font-size: 10.5px; color: var(--ink-muted); letter-spacing: 0.04em; }
 
 /* ---------- Responsive ---------- */
@@ -528,14 +543,6 @@ td.actions { text-align: right; white-space: nowrap; }
   .grid--charts { grid-template-columns: 1fr; }
   .outlet { padding: 20px 18px 50px; }
   .tiles { grid-template-columns: repeat(2, 1fr); }
-}
-@media (max-width: 480px) {
-  .tiles { grid-template-columns: 1fr 1fr; gap: 8px; }
-  .tile__num { font-size: 22px; }
-  .sect-actions .seg { flex-wrap: wrap; }
-  .form-grid { grid-template-columns: 1fr; }
-  .outlet { padding: 16px 12px 44px; }
-  .grid--cards { grid-template-columns: 1fr; }
 }
 @media (max-width: 560px) {
   .modal-overlay { padding: 10px; align-items: flex-start; padding-top: 24px; }
@@ -555,6 +562,14 @@ td.actions { text-align: right; white-space: nowrap; }
      targets. */
   .limit-form .seg { width: 100%; }
   .limit-form .seg__btn { flex: 1; padding: 6px 8px; }
+}
+@media (max-width: 480px) {
+  .tiles { grid-template-columns: 1fr 1fr; gap: 8px; }
+  .tile__num { font-size: 22px; }
+  .sect-actions .seg { flex-wrap: wrap; }
+  .form-grid { grid-template-columns: 1fr; }
+  .outlet { padding: 16px 12px 44px; }
+  .grid--cards { grid-template-columns: 1fr; }
 }
 @media (max-width: 380px) {
   .tiles { grid-template-columns: 1fr; }
