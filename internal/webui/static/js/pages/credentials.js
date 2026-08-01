@@ -126,30 +126,69 @@ function setHelp(row, text) {
   if (p) p.textContent = text || "";
 }
 
-// endpointInput is a free-text URL box backed by native suggestions.
+// endpointInput is a free-text URL box with an explicit preset dropdown.
 //
-// Deliberately an <input list> rather than a <select> plus a separate "custom"
-// field: presets are a shortcut, not a constraint, so one control both offers
-// them and accepts anything else. No mode switch, and the effective value is
-// always visible and editable.
+// It was a native <input list> + <datalist> first, which was wired correctly
+// but behaved as a dead text box: a datalist filters its suggestions against
+// what is already typed, and this field is prefilled with the provider's
+// default URL — so the only option that ever matched was the one already
+// shown, and the other clusters were unreachable unless the operator first
+// deleted the whole URL. A picker with nothing to pick.
+//
+// The menu is therefore explicit: one editable field that accepts any URL, plus
+// a button listing every preset regardless of the current value. Presets stay a
+// shortcut, not a constraint, and there is still no separate "custom" field.
 function endpointInput(kind, value) {
-  const listID = `ep-${++uid}`;
   const input = el("input", {
-    class: "input", type: "text", spellcheck: "false", list: listID,
-    placeholder: "https://host/anthropic",
-    value: value || "",
+    class: "input combo__input", type: "text", spellcheck: "false",
+    placeholder: "https://host/anthropic", value: value || "",
+    autocomplete: "off", role: "combobox", "aria-expanded": "false",
   });
-  const datalist = el("datalist", { id: listID });
+  const menu = el("ul", { class: "combo__menu", role: "listbox", hidden: "hidden", id: `ep-${++uid}` });
+  const toggle = el("button", {
+    class: "combo__toggle", type: "button", "aria-label": "Show endpoint presets",
+    "aria-controls": menu.id, text: "▾",
+  });
+  const root = el("div", { class: "combo" }, [input, toggle, menu]);
+
+  const open = (on) => {
+    menu.hidden = !on || !menu.childElementCount;
+    input.setAttribute("aria-expanded", String(!menu.hidden));
+  };
+  const choose = (url) => {
+    input.value = url;
+    open(false);
+    input.focus();
+  };
+
   const fill = (k) => {
-    clear(datalist);
+    clear(menu);
     for (const e of ENDPOINTS[k]?.endpoints || []) {
-      datalist.append(el("option", { value: e.url, label: e.desc || e.name }));
+      menu.append(el("li", { class: "combo__opt", role: "option", onClick: () => choose(e.url) }, [
+        el("span", { class: "combo__opt-name", text: e.desc || e.name }),
+        el("span", { class: "combo__opt-url", text: e.url }),
+      ]));
     }
+    // A provider with no presets (a custom host) gets a plain text field rather
+    // than a button that opens an empty menu.
+    toggle.hidden = !menu.childElementCount;
+    open(false);
     // Default to the provider's own default so the common case needs no typing.
     if (!input.value) input.value = ENDPOINTS[k]?.default || "";
   };
+
+  toggle.addEventListener("click", () => open(menu.hidden));
+  input.addEventListener("keydown", (e) => { if (e.key === "Escape") open(false); });
+  // Dismiss on an outside click. The listener outlives the modal, so it guards
+  // on the node still being connected rather than leaking a growing stack of
+  // handlers that act on detached DOM.
+  document.addEventListener("click", (e) => {
+    if (!root.isConnected) return;
+    if (!root.contains(e.target)) open(false);
+  });
+
   fill(kind);
-  return { input, datalist, setKind: fill, value: () => input.value.trim() };
+  return { input, root, setKind: fill, value: () => input.value.trim() };
 }
 
 // probePanel renders what a connection test discovered.
@@ -211,7 +250,7 @@ function addCredentialModal(root) {
   const err = el("p", { class: "form-err", role: "alert" });
 
   const kindRow = field("Type", kindSel, "");
-  const endpointRow = field("Endpoint", el("div", { class: "field-control" }, [ep.input, ep.datalist]), "");
+  const endpointRow = field("Endpoint", ep.root, "");
   const keyRow = field("API key", key, "");
   const jsonRow = field("credentials.json", json,
     "Run `claude /login` with a dedicated CLAUDE_CONFIG_DIR, then paste that file. Liveness is verified and duplicates are rejected.");
@@ -356,7 +395,7 @@ function endpointModal(c, root) {
   const ep = endpointInput(c.provider, c.endpoint);
   const err = el("p", { class: "form-err", role: "alert" });
   const body = el("div", { class: "form" }, [
-    field("Endpoint", el("div", { class: "field-control" }, [ep.input, ep.datalist]),
+    field("Endpoint", ep.root,
       "Pick a preset or type any URL. The key is re-verified there before the move — if it fails, nothing changes."),
     err,
   ]);
