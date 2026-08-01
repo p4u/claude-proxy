@@ -109,6 +109,18 @@ the selected window into equal intervals.
   `400` names the endpoint that rejected it. On success a `revoked`/`expired`/
   `limited` status is healed to `active`. `400` for OAuth credentials, whose
   endpoint is fixed.
+- `POST /api/credentials/probe` `{base_url, api_key?}` → interrogate a candidate
+  custom host **without storing anything**, so the modal can show what was found
+  and let the operator correct it: `{ok, error?, auth_required, has_models_api,
+  has_count_tokens, reported_model, models:[{id,display_name,context_window?,
+  max_output?}]}`. `context_window` is absent when the host publishes no
+  `/v1/models` — it is undiscoverable there and is never guessed.
+- `POST /api/credentials/custom` `{base_url, api_key?, label?, models?, weight?}`
+  → add a custom Anthropic-compatible host (`ingest.ImportCustomHost`). The host
+  is probed again here rather than trusting the modal's earlier probe, since the
+  URL or key may have changed since. `models` overrides discovery; omitted, the
+  discovered catalogue is used. `400` if the host is unusable or no model could
+  be determined.
 - `POST /api/credentials/{id}/disable` | `/enable` (SetStatus disabled/active)
 - `POST /api/credentials/{id}/refresh` → force OAuth token refresh (`Refresher.RefreshNow`)
 - `POST /api/credentials/{id}/weight` `{weight}` (creds.SetWeight)

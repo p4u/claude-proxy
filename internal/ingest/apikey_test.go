@@ -212,3 +212,97 @@ func TestUpdateKeyEndpointRejectsOAuth(t *testing.T) {
 		t.Error("expected OAuth credentials to be rejected")
 	}
 }
+
+// The probe exists so the operator does not have to know what a host supports.
+// A translation shim commonly ignores the requested model and answers as
+// whatever it fronts, so the reported name — not the requested one — is what
+// the catalogue must carry.
+func TestProbeCustomHostDiscovers(t *testing.T) {
+	var sawModels, sawCount, sawNoAuth bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			sawModels = true
+			w.WriteHeader(404) // this host publishes no catalogue
+		case "/v1/messages/count_tokens":
+			sawCount = true
+			_, _ = w.Write([]byte(`{"input_tokens":1}`))
+		case "/v1/messages":
+			if r.Header.Get("Authorization") == "" {
+				sawNoAuth = true
+				w.WriteHeader(401)
+				return
+			}
+			_, _ = w.Write([]byte(`{"type":"message","model":"Qwen3.6-fable","content":[]}`))
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	t.Cleanup(ts.Close)
+	orig := verifyClient
+	verifyClient = ts.Client()
+	t.Cleanup(func() { verifyClient = orig })
+
+	p := ProbeCustomHost(context.Background(), ts.URL, "sk-test", "")
+	if !p.OK {
+		t.Fatalf("probe failed: %s", p.Error)
+	}
+	if !sawModels || !sawCount || !sawNoAuth {
+		t.Errorf("probe did not exercise every capability check (models=%v count=%v auth=%v)",
+			sawModels, sawCount, sawNoAuth)
+	}
+	if p.HasModelsAPI {
+		t.Error("a 404 on /v1/models must not be reported as a catalogue")
+	}
+	if !p.HasCountTokens {
+		t.Error("count_tokens answered 200 and should be reported")
+	}
+	if !p.AuthRequired {
+		t.Error("the host rejected an unauthenticated call, so auth is enforced")
+	}
+	if p.ReportedModel != "Qwen3.6-fable" {
+		t.Errorf("reported model = %q, want the name the host answered with", p.ReportedModel)
+	}
+	if len(p.Models) != 1 || p.Models[0].ID != "Qwen3.6-fable" {
+		t.Errorf("catalogue should default to the reported model, got %+v", p.Models)
+	}
+	if p.Models[0].ContextWindow != 0 {
+		t.Error("context window was never published and must not be invented")
+	}
+}
+
+// When the host does publish a catalogue, take it — including the context
+// windows, which are otherwise undiscoverable.
+func TestProbeCustomHostUsesModelsAPI(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/models" {
+			_, _ = w.Write([]byte(`{"data":[
+				{"id":"m-one","display_name":"M One","max_input_tokens":200000,"max_tokens":8192},
+				{"id":"m-two","display_name":"M Two"}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"type":"message","model":"m-one","content":[]}`))
+	}))
+	t.Cleanup(ts.Close)
+	orig := verifyClient
+	verifyClient = ts.Client()
+	t.Cleanup(func() { verifyClient = orig })
+
+	p := ProbeCustomHost(context.Background(), ts.URL, "k", "")
+	if !p.HasModelsAPI || len(p.Models) != 2 {
+		t.Fatalf("catalogue not taken from /v1/models: %+v", p)
+	}
+	if p.Models[0].ContextWindow != 200000 || p.Models[0].MaxOutput != 8192 {
+		t.Errorf("published context/output must be carried through: %+v", p.Models[0])
+	}
+}
+
+func TestProbeCustomHostRejectsBadInput(t *testing.T) {
+	ctx := context.Background()
+	if p := ProbeCustomHost(ctx, "", "k", ""); p.OK || p.Error == "" {
+		t.Error("empty URL must fail with a message")
+	}
+	if p := ProbeCustomHost(ctx, "10.0.0.1:3456", "k", ""); p.OK || p.Error == "" {
+		t.Error("a URL without a scheme must fail rather than be guessed at")
+	}
+}

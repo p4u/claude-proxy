@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 It serves `/v1/*` as a transparent pass-through, swapping in a managed credential's `Authorization` header. This is what Claude Code clients connect to.
 
-Three upstreams are supported (`internal/provider`): **Anthropic** OAuth subscriptions, **Z.AI GLM** coding plans, and **Xiaomi MiMo** token plans — both of the latter expose Anthropic-compatible APIs. The provider that serves a request is decided by the model the client asked for, so a user picks a GLM model in Claude Code's `/model` picker and it just works. See [Providers](#providers-multi-upstream).
+Four upstreams are supported (`internal/provider`): **Anthropic** OAuth subscriptions, **Z.AI GLM** coding plans, **Xiaomi MiMo** token plans, and **any custom Anthropic-compatible host** (self-hosted vLLM/Ollama shims, gateways, …). The provider that serves a request is decided by the model the client asked for, so a user picks a GLM model in Claude Code's `/model` picker and it just works. See [Providers](#providers-multi-upstream).
 
 ## Build & Test Commands
 
@@ -232,6 +232,46 @@ real usage API omit `metered` entirely rather than carry a worse second number.
 > multipliers, and per-plan 5h/weekly caps, which would turn the metered totals
 > into a genuine utilization % feeding `pool.Score`. MiMo publishes per-MTok
 > prices but no quota formula, so it could only ever show estimated spend.
+
+### Custom hosts (`provider.Custom`, `internal/proxy/custom.go`)
+
+Any endpoint speaking the Anthropic Messages API can be added. Unlike the
+registry providers, a custom host has **no fixed base URL and no fixed model
+list** — both live on the credential, because each host *is* its own upstream.
+
+**Routing is dynamic, not prefix-based.** `provider.ForModel` places `glm-4.7`
+from a compile-time prefix; a custom host serves whatever its operator declared
+(`Qwen3.6-fable`, `my-llama`, …), so `matchCustomModel` asks which credential
+declares the requested name. That lookup runs against the credential list the
+request path already loaded. It resolves the advertised `claude-` alias and the
+native name to the same host, so picker selections and direct API calls agree.
+
+**The mapping is model → credential IDs, not model → provider.** Two custom
+hosts are both provider `custom` while serving disjoint models, so provider
+alone is too coarse a filter: `pool.BindScoped` therefore takes an explicit
+candidate allowlist, and additionally scopes the sticky key by model
+(`<model>:custom:<conv>`) so a conversation switching between two custom models
+does not reuse a pin to a host that cannot serve the new one.
+
+**Adding a host is a probe, not a form.** `ingest.ProbeCustomHost` interrogates
+the endpoint and fills in everything it can discover, because a translation shim
+commonly ignores the requested model and answers as whatever it fronts — a name
+the operator would have to guess otherwise. It checks, in order:
+
+| Probe | Why |
+|---|---|
+| `GET /v1/models` | The only source of **context windows**; taken wholesale when present |
+| `POST /v1/messages` (`max_tokens:1`) | Liveness, key validity, and the model name the host reports |
+| same, **without** the key | Whether auth is actually enforced — flags an accidentally open endpoint |
+| `POST /v1/messages/count_tokens` | Presence only |
+
+Context window is **omitted rather than guessed** when the host publishes no
+`/v1/models`: nothing short of binary-searching the input size could find it,
+and a wrong window misconfigures the client's context management. Discovered
+values are editable — the probe is a starting point, not a verdict.
+
+Surfaces: `creds add-custom --url … [--model ID]…`, and the web UI's *Add custom
+host* modal (`POST /api/credentials/probe` then `/custom`).
 
 ### Conversation Key Derivation (4-priority, `internal/router/`)
 

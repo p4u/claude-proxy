@@ -84,6 +84,9 @@ func Open(path string) (*DB, error) {
 		// Per-credential endpoint override. Empty = the provider default; set
 		// when a provider runs regional clusters and a key is bound to one.
 		`ALTER TABLE credentials ADD COLUMN base_url TEXT NOT NULL DEFAULT ''`,
+		// Per-credential model catalogue, JSON, for custom Anthropic-compatible
+		// hosts that publish no /v1/models. Empty for registry providers.
+		`ALTER TABLE credentials ADD COLUMN models TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := sdb.Exec(alter); err != nil && !isDuplicateColumn(err) {
 			_ = sdb.Close()

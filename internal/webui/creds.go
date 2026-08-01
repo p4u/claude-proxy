@@ -25,20 +25,23 @@ type credView struct {
 	// Endpoint is the resolved base URL this credential talks to, and
 	// EndpointName the matching preset name ("" when it is a custom URL).
 	// Editable for API-key providers; OAuth credentials have a fixed endpoint.
-	Endpoint            string `json:"endpoint,omitempty"`
-	EndpointName        string `json:"endpoint_name,omitempty"`
-	Editable            bool   `json:"endpoint_editable"`
-	Status              string `json:"status"`
-	ExpiresAt           string `json:"expires_at"`
-	RetryAfter          string `json:"retry_after,omitempty"`
-	LastSuccessAt       string `json:"last_success_at,omitempty"`
-	Last429At           string `json:"last_429_at,omitempty"`
-	LastRequestAt       string `json:"last_request_at,omitempty"`
-	RequestCount        int64  `json:"request_count"`
-	SuccessCount        int64  `json:"success_count"`
-	ErrorCount          int64  `json:"error_count"`
-	Weight              int    `json:"weight"`
-	ActiveConversations int    `json:"active_conversations"`
+	Endpoint     string `json:"endpoint,omitempty"`
+	EndpointName string `json:"endpoint_name,omitempty"`
+	Editable     bool   `json:"endpoint_editable"`
+	// Models is the credential's own catalogue, populated for custom hosts,
+	// which declare their models rather than publishing a /v1/models.
+	Models              []creds.Model `json:"models,omitempty"`
+	Status              string        `json:"status"`
+	ExpiresAt           string        `json:"expires_at"`
+	RetryAfter          string        `json:"retry_after,omitempty"`
+	LastSuccessAt       string        `json:"last_success_at,omitempty"`
+	Last429At           string        `json:"last_429_at,omitempty"`
+	LastRequestAt       string        `json:"last_request_at,omitempty"`
+	RequestCount        int64         `json:"request_count"`
+	SuccessCount        int64         `json:"success_count"`
+	ErrorCount          int64         `json:"error_count"`
+	Weight              int           `json:"weight"`
+	ActiveConversations int           `json:"active_conversations"`
 }
 
 // handleCredentials routes /credentials and /credentials/{id}/{action}. `rest`
@@ -53,6 +56,10 @@ func (s *Server) handleCredentials(w http.ResponseWriter, r *http.Request, rest 
 		s.addKeyCred(w, r)
 	case rest == "/endpoints" && r.Method == http.MethodGet:
 		s.listEndpoints(w, r)
+	case rest == "/probe" && r.Method == http.MethodPost:
+		s.probeCustom(w, r)
+	case rest == "/custom" && r.Method == http.MethodPost:
+		s.addCustomCred(w, r)
 	default:
 		// /{id} or /{id}/{action}
 		trimmed := strings.TrimPrefix(rest, "/")
@@ -160,12 +167,18 @@ func (s *Server) listCreds(w http.ResponseWriter, r *http.Request) {
 			SubscriptionType: c.SubscriptionType,
 			Provider:         string(provider.Get(c.Provider).ID),
 			HasUsageAPI:      provider.Get(c.Provider).PollsUsage,
-			Status:           string(c.Status),
-			ExpiresAt:        c.ExpiresAt.Format(time.RFC3339),
-			RequestCount:     c.RequestCount,
-			SuccessCount:     c.SuccessCount,
-			ErrorCount:       c.ErrorCount,
-			Weight:           c.Weight,
+			Endpoint:         provider.ResolveBaseURL(c.Provider, c.BaseURL),
+			EndpointName:     provider.EndpointName(c.Provider, c.BaseURL),
+			// OAuth credentials have a fixed endpoint; key-based ones can be
+			// moved between clusters.
+			Editable:     !provider.Get(c.Provider).Refreshable,
+			Models:       c.Models,
+			Status:       string(c.Status),
+			ExpiresAt:    c.ExpiresAt.Format(time.RFC3339),
+			RequestCount: c.RequestCount,
+			SuccessCount: c.SuccessCount,
+			ErrorCount:   c.ErrorCount,
+			Weight:       c.Weight,
 		}
 		if c.LastRequestAt != nil {
 			v.LastRequestAt = c.LastRequestAt.Format(time.RFC3339)
@@ -235,6 +248,48 @@ func (s *Server) addKeyCred(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{
 		"ok": true, "id": c.ID, "label": c.Label,
 		"provider": string(c.Provider), "weight": c.Weight,
+	})
+}
+
+// probeCustom interrogates a candidate host without storing anything, so the
+// modal can show what was found and let the operator correct it before saving.
+func (s *Server) probeCustom(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		BaseURL string `json:"base_url"`
+		APIKey  string `json:"api_key"`
+	}
+	if err := decodeJSON(w, r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, ingest.ProbeCustomHost(r.Context(), body.BaseURL, body.APIKey, ""))
+}
+
+// addCustomCred stores a custom Anthropic-compatible host. The host is probed
+// again here rather than trusting the modal's earlier probe: the operator may
+// have edited the URL or key since, and storing an unusable host is the failure
+// this check exists to prevent.
+func (s *Server) addCustomCred(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Label   string        `json:"label"`
+		BaseURL string        `json:"base_url"`
+		APIKey  string        `json:"api_key"`
+		Models  []creds.Model `json:"models"`
+		Weight  int           `json:"weight"`
+	}
+	if err := decodeJSON(w, r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	c, probe, err := ingest.ImportCustomHost(r.Context(), s.db,
+		body.Label, body.BaseURL, body.APIKey, body.Models, body.Weight)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{
+		"ok": true, "id": c.ID, "label": c.Label,
+		"base_url": c.BaseURL, "models": c.Models, "probe": probe,
 	})
 }
 

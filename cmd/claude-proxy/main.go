@@ -51,6 +51,8 @@ Usage:
   claude-proxy creds update <id>   --from FILE   # replace tokens from a fresh login
   claude-proxy creds export        [--db PATH]   # JSONL to stdout
   claude-proxy creds import-bulk   [--db PATH]   # JSONL from stdin
+  claude-proxy creds add-custom    --url URL [--key KEY] [--label NAME] [--model ID]...
+                                                 # any Anthropic-compatible host; probed automatically
   claude-proxy creds set-endpoint <id> <name|https://url>   # move a key to another cluster
   claude-proxy creds list
   claude-proxy creds usage [<id>]
@@ -272,7 +274,7 @@ func runTUI(args []string) {
 
 func runCreds(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "creds: missing subcommand (import|add-key|set-endpoint|update|export|import-bulk|list|usage|usage-history|disable|rm|refresh|set-weight)")
+		fmt.Fprintln(os.Stderr, "creds: missing subcommand (import|add-key|add-custom|set-endpoint|update|export|import-bulk|list|usage|usage-history|disable|rm|refresh|set-weight)")
 		os.Exit(2)
 	}
 	ctx := context.Background()
@@ -283,6 +285,8 @@ func runCreds(args []string) {
 		credsAddKey(ctx, args[1:])
 	case "set-endpoint":
 		credsSetEndpoint(ctx, args[1:])
+	case "add-custom":
+		credsAddCustom(ctx, args[1:])
 	case "update":
 		credsUpdate(ctx, args[1:])
 	case "export":
@@ -394,6 +398,83 @@ func credsAddKey(ctx context.Context, args []string) {
 	fmt.Printf("added %s  provider=%s  label=%s  endpoint=%s  weight=%d\n",
 		c.ID, c.Provider, c.Label, provider.ResolveBaseURL(c.Provider, c.BaseURL), c.Weight)
 }
+
+// credsAddCustom probes an arbitrary Anthropic-compatible host and adds it.
+// Everything the host will tell us is discovered rather than asked for; --model
+// is only needed when the discovered catalogue is wrong or incomplete.
+func credsAddCustom(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("creds add-custom", flag.ExitOnError)
+	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
+	rawURL := fs.String("url", "", "base URL of the Anthropic-compatible host")
+	key := fs.String("key", "", "API key (omit to read from stdin; empty if the host needs none)")
+	label := fs.String("label", "", "display label (defaults to the host name)")
+	weight := fs.Int("weight", 0, "selection weight (0 = default)")
+	var modelFlags multiFlag
+	fs.Var(&modelFlags, "model", "model ID to serve (repeatable; overrides discovery)")
+	_ = fs.Parse(args)
+
+	if strings.TrimSpace(*rawURL) == "" {
+		fmt.Fprintln(os.Stderr, "usage: creds add-custom --url http://host:port [--key KEY] [--model ID]...")
+		os.Exit(2)
+	}
+	apiKey := strings.TrimSpace(*key)
+	if apiKey == "" && !isTerminal(os.Stdin) {
+		raw, _ := io.ReadAll(os.Stdin)
+		apiKey = strings.TrimSpace(string(raw))
+	}
+
+	db := openDB(*dbPath)
+	defer db.Close()
+
+	var models []creds.Model
+	for _, m := range modelFlags {
+		models = append(models, creds.Model{ID: m, DisplayName: m})
+	}
+
+	fmt.Fprintf(os.Stderr, "probing %s...\n", *rawURL)
+	c, probe, err := ingest.ImportCustomHost(ctx, db, *label, *rawURL, apiKey, models, *weight)
+	printProbe(probe)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "add-custom: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("added %s  label=%s  url=%s  models=%d\n",
+		c.ID, c.Label, c.BaseURL, len(c.Models))
+}
+
+// printProbe reports what the host actually supports, so an operator can see
+// why a capability is missing rather than guessing.
+func printProbe(p ingest.Probe) {
+	yn := func(b bool) string {
+		if b {
+			return "yes"
+		}
+		return "no"
+	}
+	fmt.Fprintf(os.Stderr, "  reachable      %s\n", yn(p.OK))
+	if p.Error != "" {
+		fmt.Fprintf(os.Stderr, "  error          %s\n", p.Error)
+	}
+	fmt.Fprintf(os.Stderr, "  auth enforced  %s\n", yn(p.AuthRequired))
+	fmt.Fprintf(os.Stderr, "  /v1/models     %s\n", yn(p.HasModelsAPI))
+	fmt.Fprintf(os.Stderr, "  count_tokens   %s\n", yn(p.HasCountTokens))
+	if p.ReportedModel != "" {
+		fmt.Fprintf(os.Stderr, "  reports model  %s\n", p.ReportedModel)
+	}
+	for _, m := range p.Models {
+		ctxw := "context unknown"
+		if m.ContextWindow > 0 {
+			ctxw = fmt.Sprintf("context %d", m.ContextWindow)
+		}
+		fmt.Fprintf(os.Stderr, "  model          %s (%s)\n", m.ID, ctxw)
+	}
+}
+
+// multiFlag collects a repeatable string flag.
+type multiFlag []string
+
+func (m *multiFlag) String() string     { return strings.Join(*m, ",") }
+func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
 
 // credsSetEndpoint moves an API-key credential to another endpoint. The key is
 // re-verified against the new one before anything is written.

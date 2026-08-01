@@ -103,10 +103,29 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// served by a GLM key, and vice versa.
 	prov := providerFor(r, body)
 
+	// A custom host declares its own model names, so placing one means asking
+	// the database which credential serves it. Only /v1/messages-shaped
+	// requests carry a model, and only they can match.
+	var custom customMatch
+	if prov == provider.Default && needsSticky(r) {
+		if list, lerr := creds.List(r.Context(), h.db); lerr == nil {
+			if m, ok := matchCustomModel(list, requestModel(body)); ok {
+				custom, prov = m, provider.Custom
+			}
+		}
+	}
+
 	// Undo the advertising alias before anything else reads the body, so the
 	// prompt/conversation capture records the real model rather than the
 	// claude-prefixed name this proxy invented for the picker.
-	if rewritten, wire, ok := rewriteModel(body); ok {
+	if prov == provider.Custom {
+		// The host declared this name, so send exactly that — the alias the
+		// picker showed is ours, not something the upstream would recognise.
+		if rewritten, ok := setRequestModel(body, custom.Model); ok {
+			body = rewritten
+		}
+		h.log.Debug("custom model resolved", "wire_model", custom.Model, "creds", len(custom.CredIDs))
+	} else if rewritten, wire, ok := rewriteModel(body); ok {
 		body = rewritten
 		h.log.Debug("model alias resolved", "wire_model", wire, "provider", string(prov))
 	}
@@ -125,8 +144,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// instead of the two fighting over a single pin. Logged and recorded
 		// in the qualified form so request_log, prompt_log and conversations
 		// all agree on one identifier.
-		convID = pool.Key(dr.ConvID, prov)
-		c, isNew, err := h.pool.Bind(r.Context(), dr.ConvID, prov)
+		// Custom bindings are additionally scoped by model: two custom hosts
+		// share the provider but serve disjoint models, so one pin per
+		// (conversation, provider) could hand a request to a host that cannot
+		// serve it. See pool.BindScoped.
+		convID = pool.KeyScoped(dr.ConvID, prov, custom.Model)
+		c, isNew, err := h.pool.BindScoped(r.Context(), dr.ConvID, prov, custom.Model, custom.CredIDs)
 		if err != nil {
 			h.log.Warn("bind failed", "err", err, "conv", convID, "src", string(convSrc), "provider", string(prov))
 			h.failBind(w, err, prov)

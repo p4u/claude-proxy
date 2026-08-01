@@ -78,6 +78,28 @@ func rewriteModel(body []byte) ([]byte, string, bool) {
 	return out, wire, true
 }
 
+// setRequestModel replaces the body's model with an exact name, preserving
+// every other field byte-for-byte (see rewriteModel for why RawMessage).
+func setRequestModel(body []byte, model string) ([]byte, bool) {
+	if model == "" || len(body) == 0 {
+		return body, false
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body, false
+	}
+	encoded, err := json.Marshal(model)
+	if err != nil {
+		return body, false
+	}
+	obj["model"] = encoded
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
 // pickForProvider returns a credential belonging to prov for non-sticky paths.
 // Prefers active; falls back to limited so the request still reaches the
 // upstream and earns a real 429 (with Retry-After) instead of a proxy-invented

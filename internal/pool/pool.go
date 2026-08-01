@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
@@ -47,6 +48,22 @@ func NewWithLogger(db *store.DB, log *slog.Logger) *Pool {
 // The credential is chosen from prov's credentials only. Callers pass the
 // provider that serves the request's model; see Key for how the two combine.
 func (p *Pool) Bind(ctx context.Context, convID string, prov provider.ID) (*creds.Credential, bool, error) {
+	return p.BindScoped(ctx, convID, prov, "", nil)
+}
+
+// BindScoped is Bind with two extra constraints, both needed by custom hosts:
+//
+//   - scope further qualifies the sticky key. Custom credentials each serve
+//     their own model list, so a conversation that switches between two custom
+//     models must not reuse a binding to a credential that cannot serve the
+//     new one; scoping by model gives each its own stable pin, for the same
+//     reason Key scopes by provider.
+//   - allowed restricts the candidate set to specific credential IDs. Provider
+//     alone is not a fine enough filter for custom hosts: two of them are both
+//     provider "custom" while serving disjoint models, so selecting on
+//     provider would hand a request to a credential that does not serve it.
+//     nil means no constraint, which is every registry provider.
+func (p *Pool) BindScoped(ctx context.Context, convID string, prov provider.ID, scope string, allowed []string) (*creds.Credential, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -59,7 +76,7 @@ func (p *Pool) Bind(ctx context.Context, convID string, prov provider.ID) (*cred
 	)
 	err := store.Retry(ctx, func() error {
 		var err error
-		c, isNew, err = p.bindOnce(ctx, convID, prov)
+		c, isNew, err = p.bindOnce(ctx, convID, prov, scope, allowed)
 		return err
 	})
 	return c, isNew, err
@@ -77,14 +94,24 @@ func (p *Pool) Bind(ctx context.Context, convID string, prov provider.ID) (*cred
 // Scoping the key by provider gives each its own stable pin. Anthropic keeps
 // the bare ID so existing rows, existing bindings and existing dashboard links
 // are untouched; other providers are prefixed.
-func Key(convID string, prov provider.ID) string {
-	if convID == "" || prov == "" || prov == provider.Default {
+func Key(convID string, prov provider.ID) string { return KeyScoped(convID, prov, "") }
+
+// KeyScoped adds a further qualifier to the sticky key — see BindScoped.
+func KeyScoped(convID string, prov provider.ID, scope string) string {
+	if convID == "" {
 		return convID
 	}
-	return string(prov) + ":" + convID
+	key := convID
+	if prov != "" && prov != provider.Default {
+		key = string(prov) + ":" + key
+	}
+	if scope != "" {
+		key = scope + ":" + key
+	}
+	return key
 }
 
-func (p *Pool) bindOnce(ctx context.Context, convID string, prov provider.ID) (*creds.Credential, bool, error) {
+func (p *Pool) bindOnce(ctx context.Context, convID string, prov provider.ID, scope string, allowed []string) (*creds.Credential, bool, error) {
 	tx, err := p.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, false, err
@@ -95,13 +122,13 @@ func (p *Pool) bindOnce(ctx context.Context, convID string, prov provider.ID) (*
 	var newConv bool
 
 	// Sticky bindings are per (conversation, provider) — see Key.
-	convKey := Key(convID, prov)
+	convKey := KeyScoped(convID, prov, scope)
 
 	err = tx.QueryRowContext(ctx, `SELECT credential_id FROM conversations WHERE id=?`, convKey).Scan(&credID)
 	switch {
 	case err == sql.ErrNoRows:
 		newConv = true
-		credID, err = p.pickActiveLocked(ctx, tx, prov)
+		credID, err = p.pickActiveLocked(ctx, tx, prov, allowed)
 		if err != nil {
 			return nil, false, err
 		}
@@ -139,7 +166,7 @@ func (p *Pool) bindOnce(ctx context.Context, convID string, prov provider.ID) (*
 	if !newConv {
 		switch c.Status {
 		case creds.StatusExpired, creds.StatusRevoked, creds.StatusDisabled:
-			newCredID, perr := p.pickActiveLocked(ctx, tx, prov)
+			newCredID, perr := p.pickActiveLocked(ctx, tx, prov, allowed)
 			if perr != nil {
 				if errors.Is(perr, ErrNoCredentials) {
 					return c, false, ErrCredentialOrphaned
@@ -166,7 +193,7 @@ func (p *Pool) bindOnce(ctx context.Context, convID string, prov provider.ID) (*
 				return nil, false, serr
 			}
 			if saturated {
-				newCredID, perr := p.pickActiveLocked(ctx, tx, prov)
+				newCredID, perr := p.pickActiveLocked(ctx, tx, prov, allowed)
 				switch {
 				case errors.Is(perr, ErrNoCredentials):
 					// No healthy alternative — keep the sticky (saturated) pin
@@ -232,16 +259,17 @@ func (p *Pool) bindOnce(ctx context.Context, convID string, prov provider.ID) (*
 // subscription is not a fallback for it (it cannot serve that model at all) and
 // vice versa. Weights and usage scores therefore only ever compare credentials
 // within one provider.
-func (p *Pool) pickActiveLocked(ctx context.Context, tx *sql.Tx, prov provider.ID) (string, error) {
+func (p *Pool) pickActiveLocked(ctx context.Context, tx *sql.Tx, prov provider.ID, allowed []string) (string, error) {
 	if prov == "" {
 		prov = provider.Default
 	}
 	now := time.Now()
+	inClause, inArgs := idFilter(allowed)
 	rows, err := tx.QueryContext(ctx, `
 		SELECT c.id, c.weight FROM credentials c
 		WHERE c.status='active'
 		  AND COALESCE(c.provider,'anthropic') = ?
-		  AND (c.retry_after IS NULL OR c.retry_after < ?)
+		  AND (c.retry_after IS NULL OR c.retry_after < ?)`+inClause+`
 		  AND NOT EXISTS (
 		    SELECT 1 FROM usage_history u
 		    WHERE u.credential_id = c.id
@@ -250,7 +278,7 @@ func (p *Pool) pickActiveLocked(ctx context.Context, tx *sql.Tx, prov provider.I
 		      )
 		      AND (u.five_hour_pct >= 100 OR u.seven_day_pct >= 100)
 		  )
-		ORDER BY c.id`, string(prov), now.Unix())
+		ORDER BY c.id`, append([]any{string(prov), now.Unix()}, inArgs...)...)
 	if err != nil {
 		return "", err
 	}
@@ -275,11 +303,13 @@ func (p *Pool) pickActiveLocked(ctx context.Context, tx *sql.Tx, prov provider.I
 	// reaches Anthropic and gets a real 429 (with Retry-After) instead
 	// of a confusing 503 "no active credentials in pool".
 	if len(candidates) == 0 {
+		limitedIn, limitedArgs := idFilter(allowed)
 		lrows, lerr := tx.QueryContext(ctx, `
 			SELECT id, weight FROM credentials
 			WHERE status='limited'
-			  AND COALESCE(provider,'anthropic') = ?
-			ORDER BY COALESCE(retry_after, 0) ASC, id`, string(prov))
+			  AND COALESCE(provider,'anthropic') = ?`+limitedIn+`
+			ORDER BY COALESCE(retry_after, 0) ASC, id`,
+			append([]any{string(prov)}, limitedArgs...)...)
 		if lerr != nil {
 			return "", lerr
 		}
@@ -458,6 +488,20 @@ func credSaturatedLocked(ctx context.Context, tx *sql.Tx, credID string) (bool, 
 		return false, err
 	}
 	return Saturated(fhPct, sdPct), nil
+}
+
+// idFilter renders an optional "AND id IN (...)" restriction. Empty allowed
+// means no restriction, which is the registry-provider path.
+func idFilter(allowed []string) (string, []any) {
+	if len(allowed) == 0 {
+		return "", nil
+	}
+	ph := make([]string, len(allowed))
+	args := make([]any, len(allowed))
+	for i, id := range allowed {
+		ph[i], args[i] = "?", id
+	}
+	return " AND c.id IN (" + strings.Join(ph, ",") + ")", args
 }
 
 // getCredTx reads one credential inside the caller's transaction.

@@ -27,6 +27,10 @@ const (
 	Anthropic ID = "anthropic"
 	GLM       ID = "glm"
 	MiMo      ID = "mimo"
+	// Custom is any self-hosted or third-party Anthropic-compatible endpoint.
+	// Unlike the others it has no fixed base URL and no fixed model list: both
+	// live on the credential, because each custom host is its own upstream.
+	Custom ID = "custom"
 )
 
 // Endpoint is one selectable base URL for a provider.
@@ -151,6 +155,17 @@ var registry = []Provider{
 			{Name: "global", Desc: "Global (api.z.ai)", URL: "https://api.z.ai/api/anthropic"},
 			{Name: "cn", Desc: "China (open.bigmodel.cn)", URL: "https://open.bigmodel.cn/api/anthropic"},
 		},
+	},
+	{
+		ID:              Custom,
+		Name:            "Custom Anthropic API",
+		BaseURL:         "",  // supplied per credential; there is no default
+		ModelPrefixes:   nil, // routed by the credential's declared model list
+		Refreshable:     false,
+		PollsUsage:      false,
+		Augment1M:       false,
+		AdvertisePrefix: "claude-",
+		HasModelsAPI:    false, // probed per credential
 	},
 	{
 		ID:              MiMo,

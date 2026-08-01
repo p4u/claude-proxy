@@ -226,6 +226,16 @@ button.legend__item.is-solo .legend__lbl { color: var(--ink); font-weight: 600; 
 /* Observed-token rows, shown where the utilization meters go for providers with
    no usage API (see usage.js). Same top line as .meter; no bar, because there
    is no published allowance to fill against. */
+/* Probe report inside the custom-host modal. */
+.probe { border: 1px solid var(--border); border-radius: var(--r-sm); padding: 8px 10px; display: flex; flex-direction: column; gap: 3px; }
+.probe:empty { display: none; }
+.probe__row { display: flex; justify-content: space-between; gap: 12px; font-family: var(--mono); font-size: 11px; }
+.probe__k { color: var(--ink-muted); }
+.probe__v { color: var(--ink); }
+.probe__v--good { color: var(--good); }
+.probe__v--warn { color: var(--warning); }
+.probe__v--bad { color: var(--critical); }
+
 .metered__break { font-family: var(--mono); font-size: 10.5px; color: var(--ink-muted); margin-top: 3px; }
 
 .meter { display: flex; flex-direction: column; gap: 5px; }

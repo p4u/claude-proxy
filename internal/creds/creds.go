@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"strings"
 	"time"
@@ -32,7 +33,12 @@ type Credential struct {
 	// "anthropic"), and provider.Get tolerates an empty value regardless.
 	Provider provider.ID
 	// BaseURL overrides the provider's default endpoint. Empty = default.
-	BaseURL       string
+	// Required for provider.Custom, which has no default.
+	BaseURL string
+	// Models is this credential's own catalogue, used by custom hosts that
+	// publish no /v1/models. Empty for registry providers, which either
+	// discover their models or declare them statically.
+	Models        []Model
 	AccessToken   string
 	RefreshToken  string
 	ExpiresAt     time.Time
@@ -46,6 +52,57 @@ type Credential struct {
 	ErrorCount    int64
 	Weight        int
 	CreatedAt     time.Time
+}
+
+// Model is one entry in a credential's own catalogue.
+//
+// ContextWindow and MaxOutput are advisory and often unknown: they are only
+// discoverable from a GET /v1/models the host may not serve, so they are
+// omitted rather than guessed when absent.
+type Model struct {
+	ID            string `json:"id"`
+	DisplayName   string `json:"display_name,omitempty"`
+	ContextWindow int    `json:"context_window,omitempty"`
+	MaxOutput     int    `json:"max_output,omitempty"`
+}
+
+// encodeModels/decodeModels keep the catalogue in one TEXT column. A malformed
+// value decodes to nil rather than failing the read: a credential with an
+// unreadable catalogue should still be listable and deletable.
+func encodeModels(ms []Model) string {
+	if len(ms) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(ms)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+func decodeModels(raw string) []Model {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var ms []Model
+	if err := json.Unmarshal([]byte(raw), &ms); err != nil {
+		return nil
+	}
+	return ms
+}
+
+// SetModels replaces a credential's model catalogue.
+func SetModels(ctx context.Context, db *store.DB, id string, ms []Model) error {
+	res, err := db.ExecContext(ctx,
+		`UPDATE credentials SET models=? WHERE id=?`, encodeModels(ms), id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // DefaultWeight returns the selection weight implied by a subscription tier.
@@ -84,7 +141,7 @@ func newID() string {
 // Insert stores an Anthropic OAuth credential (access + refresh token pair).
 // For static API keys from other providers, use InsertKey.
 func Insert(ctx context.Context, db *store.DB, label, subType, access, refresh string, expiresAt time.Time, weight int) (*Credential, error) {
-	return insert(ctx, db, provider.Anthropic, "", label, subType, access, refresh, expiresAt, weight)
+	return insert(ctx, db, provider.Anthropic, "", nil, label, subType, access, refresh, expiresAt, weight)
 }
 
 // keyExpiry is the stored expires_at for API-key credentials. They never
@@ -98,10 +155,16 @@ func keyExpiry() time.Time { return time.Now().AddDate(100, 0, 0) }
 // InsertKey stores a static API-key credential (GLM and any future key-based
 // provider). There is no refresh token and no meaningful expiry.
 func InsertKey(ctx context.Context, db *store.DB, p provider.ID, label, plan, apiKey, baseURL string, weight int) (*Credential, error) {
-	return insert(ctx, db, p, baseURL, label, plan, apiKey, "", keyExpiry(), weight)
+	return insert(ctx, db, p, baseURL, nil, label, plan, apiKey, "", keyExpiry(), weight)
 }
 
-func insert(ctx context.Context, db *store.DB, p provider.ID, baseURL, label, subType, access, refresh string, expiresAt time.Time, weight int) (*Credential, error) {
+// InsertCustomKey stores a key for a custom Anthropic-compatible host, which
+// carries its own base URL and model catalogue.
+func InsertCustomKey(ctx context.Context, db *store.DB, label, apiKey, baseURL string, models []Model, weight int) (*Credential, error) {
+	return insert(ctx, db, provider.Custom, baseURL, models, label, "", apiKey, "", keyExpiry(), weight)
+}
+
+func insert(ctx context.Context, db *store.DB, p provider.ID, baseURL string, models []Model, label, subType, access, refresh string, expiresAt time.Time, weight int) (*Credential, error) {
 	if p == "" {
 		p = provider.Default
 	}
@@ -114,6 +177,7 @@ func insert(ctx context.Context, db *store.DB, p provider.ID, baseURL, label, su
 		SubscriptionType: subType,
 		Provider:         p,
 		BaseURL:          baseURL,
+		Models:           models,
 		AccessToken:      access,
 		RefreshToken:     refresh,
 		ExpiresAt:        expiresAt,
@@ -123,9 +187,9 @@ func insert(ctx context.Context, db *store.DB, p provider.ID, baseURL, label, su
 	}
 	_, err := db.ExecContext(
 		ctx, `
-		INSERT INTO credentials (id, label, subscription_type, provider, base_url, access_token, refresh_token, expires_at, status, weight, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		c.ID, c.Label, c.SubscriptionType, string(c.Provider), c.BaseURL, c.AccessToken, c.RefreshToken, c.ExpiresAt.Unix(), string(c.Status), c.Weight, c.CreatedAt.Unix(),
+		INSERT INTO credentials (id, label, subscription_type, provider, base_url, models, access_token, refresh_token, expires_at, status, weight, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.ID, c.Label, c.SubscriptionType, string(c.Provider), c.BaseURL, encodeModels(c.Models), c.AccessToken, c.RefreshToken, c.ExpiresAt.Unix(), string(c.Status), c.Weight, c.CreatedAt.Unix(),
 	)
 	if err != nil {
 		return nil, err
@@ -169,7 +233,7 @@ func SetBaseURL(ctx context.Context, db *store.DB, id, baseURL string) error {
 // reads credentials inside its own transaction and must stay column-for-column
 // identical to ScanCred below.
 const SelectCols = `id, COALESCE(label,''), COALESCE(subscription_type,''),
-       COALESCE(provider,'anthropic'), COALESCE(base_url,''),
+       COALESCE(provider,'anthropic'), COALESCE(base_url,''), COALESCE(models,''),
        access_token, refresh_token, expires_at, status,
        retry_after, last_success_at, last_429_at, last_request_at,
        request_count, success_count, error_count, weight, created_at`
@@ -193,9 +257,9 @@ func scanCred(rs interface {
 	c := &Credential{}
 	var exp, created int64
 	var ra, ls, l429, lreq sql.NullInt64
-	var status, prov string
+	var status, prov, models string
 	if err := rs.Scan(
-		&c.ID, &c.Label, &c.SubscriptionType, &prov, &c.BaseURL,
+		&c.ID, &c.Label, &c.SubscriptionType, &prov, &c.BaseURL, &models,
 		&c.AccessToken, &c.RefreshToken, &exp, &status,
 		&ra, &ls, &l429, &lreq,
 		&c.RequestCount, &c.SuccessCount, &c.ErrorCount, &c.Weight, &created,
@@ -203,6 +267,7 @@ func scanCred(rs interface {
 		return nil, err
 	}
 	c.Provider = provider.ID(prov)
+	c.Models = decodeModels(models)
 	c.ExpiresAt = time.Unix(exp, 0)
 	c.Status = Status(status)
 	c.CreatedAt = time.Unix(created, 0)

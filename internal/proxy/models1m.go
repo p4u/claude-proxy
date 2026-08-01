@@ -266,6 +266,19 @@ func (h *Handler) serveModels(w http.ResponseWriter, r *http.Request, start time
 		lastState int
 	)
 	for _, p := range provider.All() {
+		// Custom hosts have no single catalogue: each credential declares its
+		// own, so they are merged from the credential list rather than fetched.
+		if p.ID == provider.Custom {
+			entries := customModels(list)
+			if len(entries) == 0 {
+				continue
+			}
+			merged = append(merged, advertise(entries, p)...)
+			answered++
+			lastErr = nil
+			h.log.Info("models custom catalogue", "models", len(entries))
+			continue
+		}
 		cred, perr := pickFrom(list, p.ID)
 		if perr != nil {
 			h.log.Debug("models: provider has no usable credential, omitting its models",

@@ -101,6 +101,9 @@ export const api = {
   // Endpoint presets, served from the Go registry so the UI never keeps its
   // own copy of it.
   endpoints: () => request("GET", "/credentials/endpoints"),
+  // Interrogate a candidate custom host without storing anything.
+  probeHost: (body) => request("POST", "/credentials/probe", body),
+  addCustom: (body) => request("POST", "/credentials/custom", body),
   users: () => request("GET", "/users"),
 
   // Per-user capture mode. `full` true ⇒ store both sides of every conversation.

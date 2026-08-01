@@ -339,6 +339,41 @@ the loopback HTTP listener. You almost certainly want to keep
 > but anyone who learns your domain name can still reach the listener — the
 > bearer token is what stops them from spending your subscription quota.
 
+## Custom Anthropic-compatible hosts
+
+Anything speaking the Anthropic Messages API can join the pool — a self-hosted
+model behind a translation shim, an internal gateway, another vendor:
+
+```bash
+claude-proxy creds add-custom --url http://10.0.0.5:3456 --key sk-xxx
+```
+
+or the web UI's **Add custom host** button. The host is probed and everything
+discoverable is filled in for you:
+
+```
+probing http://10.0.0.5:3456...
+  reachable      yes
+  auth enforced  yes
+  /v1/models     no
+  count_tokens   yes
+  reports model  Qwen3.6-fable
+  model          Qwen3.6-fable (context unknown)
+```
+
+The **model name is discovered, not typed**: shims routinely ignore the model
+you ask for and answer as whatever they front, so the proxy asks the host and
+records the name it reports. Add `--model ID` (or edit the field in the modal)
+to override or to declare several.
+
+Where a host serves `GET /v1/models`, its catalogue and **context windows** are
+taken wholesale. Where it doesn't, the context window is left unset rather than
+guessed — a wrong window misconfigures the client's context management.
+
+The models then appear in the `/model` picker like any other, and requests route
+to the host that declared them. Two hosts declaring the same model name pool and
+load-balance.
+
 ## GLM (Z.AI) and MiMo support
 
 The proxy can serve [Z.AI GLM coding plans](https://docs.z.ai/devpack/tool/claude)

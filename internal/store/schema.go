@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS credentials (
   -- Endpoint override for providers with regional clusters (see
   -- internal/provider.Endpoint). Empty = the provider's default base URL.
   base_url          TEXT NOT NULL DEFAULT '',
+  -- JSON model catalogue for custom hosts; see creds.Model. Empty otherwise.
+  models            TEXT NOT NULL DEFAULT '',
   access_token      TEXT NOT NULL,
   refresh_token     TEXT NOT NULL,
   expires_at        INTEGER NOT NULL,

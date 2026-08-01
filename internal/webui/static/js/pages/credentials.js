@@ -8,6 +8,7 @@ import { compactNum, relTime, localTime } from "../format.js";
 export async function render(root) {
   clear(root);
   const head = sectionHead("Credentials", "Managed subscriptions and API keys in the rotation pool.", [
+    button("Add custom host", { onClick: () => addCustomModal(root) }),
     button("Add API key", { onClick: () => addKeyModal(root) }),
     button("Add credential", { kind: "primary", onClick: () => addModal(root) }),
   ]);
@@ -159,7 +160,7 @@ function endpointModal(c, root) {
 // The badge style capitalizes its text, which turns "glm" into "Glm". Spell
 // out the display form instead of fighting the CSS; unknown providers fall
 // back to the raw id so a new one is still legible before this map is updated.
-const PROVIDER_LABELS = { anthropic: "Anthropic", glm: "GLM", mimo: "MiMo" };
+const PROVIDER_LABELS = { anthropic: "Anthropic", glm: "GLM", mimo: "MiMo", custom: "Custom" };
 function providerLabel(id) {
   return PROVIDER_LABELS[id] || id || "Anthropic";
 }
@@ -209,6 +210,123 @@ function credRow(c, root) {
     el("td", { text: isKey ? "never" : (c.expires_at ? localTime(tsOf(c.expires_at)) : "—") }),
     el("td", { class: "actions" }, actions),
   ]);
+}
+
+// addCustomModal adds any Anthropic-compatible endpoint.
+//
+// The host is probed before it can be saved, and the probe fills in everything
+// it can discover — the model list above all, since a translation shim often
+// answers as a name the operator would not have guessed. Discovered values are
+// editable: the probe is a starting point, not a verdict.
+function addCustomModal(root) {
+  const url = el("input", { class: "input", type: "text", spellcheck: "false",
+    placeholder: "http://10.0.0.5:3456 or https://host/anthropic" });
+  const key = el("input", { class: "input", type: "password", spellcheck: "false",
+    placeholder: "API key (blank if the host needs none)" });
+  const label = el("input", { class: "input", type: "text", placeholder: "defaults to the host name" });
+  const models = el("input", { class: "input", type: "text", spellcheck: "false",
+    placeholder: "discovered automatically — comma-separated to override" });
+  const weight = el("input", { class: "input input--sm", type: "number", min: "0", placeholder: "auto" });
+  const report = el("div", { class: "probe" });
+  const err = el("p", { class: "form-err", role: "alert" });
+
+  const body = el("div", { class: "form" }, [
+    el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Base URL" }), url]),
+    el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "API key" }), key]),
+    el("div", { class: "form-grid" }, [
+      el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Label" }), label]),
+      el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Weight" }), weight]),
+    ]),
+    el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Models" }), models]),
+    report,
+    err,
+  ]);
+
+  const yn = (b) => (b ? "yes" : "no");
+  const renderProbe = (p) => {
+    clear(report);
+    const line = (k, v, tone) => el("div", { class: "probe__row" }, [
+      el("span", { class: "probe__k", text: k }),
+      el("span", { class: "probe__v" + (tone ? ` probe__v--${tone}` : ""), text: v }),
+    ]);
+    report.append(
+      line("reachable", yn(p.ok), p.ok ? "good" : "bad"),
+      line("auth enforced", yn(p.auth_required), p.auth_required ? "good" : "warn"),
+      line("/v1/models", yn(p.has_models_api)),
+      line("count_tokens", yn(p.has_count_tokens)),
+    );
+    if (p.reported_model) report.append(line("reports model", p.reported_model));
+    if (p.error) report.append(line("error", p.error, "bad"));
+    // Context window is only knowable from a /v1/models the host may not
+    // serve; say so rather than leaving a silent blank.
+    for (const m of p.models || []) {
+      report.append(line("model", m.id + (m.context_window ? ` · ${m.context_window} ctx` : " · context unknown")));
+    }
+    if ((p.models || []).length && !models.value.trim()) {
+      models.value = (p.models || []).map((m) => m.id).join(", ");
+    }
+  };
+
+  const parseModels = () =>
+    models.value.split(",").map((v) => v.trim()).filter(Boolean)
+      .map((id) => ({ id, display_name: id }));
+
+  const m = modal({
+    title: "Add custom Anthropic API host",
+    subtitle: "Any endpoint speaking the Anthropic Messages API. Probe first — the model list and capabilities are discovered for you.",
+    wide: true,
+    body,
+    actions: [
+      button("Cancel", { onClick: () => m.close() }),
+      button("Probe", {
+        onClick: async (ev) => {
+          const btn = ev.currentTarget;
+          err.textContent = "";
+          if (!url.value.trim()) { err.textContent = "Enter the base URL first."; return; }
+          btn.disabled = true;
+          const orig = btn.textContent;
+          btn.textContent = "Probing…";
+          try {
+            renderProbe(await api.probeHost({ base_url: url.value.trim(), api_key: key.value.trim() }));
+          } catch (e) {
+            err.textContent = e.message || "Probe failed.";
+          } finally {
+            btn.disabled = false;
+            btn.textContent = orig;
+          }
+        },
+      }),
+      button("Add host", {
+        kind: "primary",
+        onClick: async (ev) => {
+          const btn = ev.currentTarget;
+          err.textContent = "";
+          if (!url.value.trim()) { err.textContent = "Enter the base URL first."; return; }
+          btn.disabled = true;
+          const orig = btn.textContent;
+          btn.textContent = "Verifying…";
+          try {
+            await api.addCustom({
+              base_url: url.value.trim(),
+              api_key: key.value.trim(),
+              label: label.value.trim(),
+              models: parseModels(),
+              weight: Number(weight.value) || 0,
+            });
+            m.close();
+            toast("Custom host added");
+            render(root);
+          } catch (e) {
+            err.textContent = e.message || "Could not add the host.";
+          } finally {
+            btn.disabled = false;
+            btn.textContent = orig;
+          }
+        },
+      }),
+    ],
+  });
+  return m;
 }
 
 // addKeyModal collects a static API key. Kept separate from addModal, which
