@@ -376,6 +376,64 @@ func Saturated(fhPct, sdPct float64) bool {
 	return fhPct >= 100 || sdPct >= 100
 }
 
+// Window lengths for the two Anthropic quota windows the poller tracks. Used
+// by BurnBoost to translate a resets_at instant into "elapsed fraction of the
+// window", so pace can be compared to actual utilization.
+const (
+	FiveHourWindow = 5 * time.Hour
+	SevenDayWindow = 7 * 24 * time.Hour
+)
+
+// BurnCoef caps how much the burn boost can multiply a credential's score.
+// score *= 1 + BurnCoef*boost, and boost ∈ [0, 1]. Coef 2 → up to 3× score
+// for a credential fully "behind pace" (e.g. 0% used with the window nearly
+// over — leftover quota that would otherwise reset unspent).
+const BurnCoef = 2.0
+
+// BurnBoost returns the "behind pace" boost for one credential's latest
+// snapshot, in [0, 1]. Zero means "on or ahead of ideal pace" (or unknown
+// reset time); one means "the entire quota is unspent and the window is
+// about to reset".
+//
+// Ideal pace assumes linear consumption over each window: at fraction f of
+// the window elapsed, ideal utilization is f. If actual utilization is
+// below that, the difference is the per-window boost — quota we're at risk
+// of leaving on the table when the window resets. We take the max across
+// the two windows so a credential that is way behind on either one gets
+// pulled up; averaging would let a fresh 7-day window mask an about-to-
+// -reset 5-hour one.
+//
+// Callers pass now separately so tests are deterministic and so the same
+// snapshot yields the same boost inside a single scoring pass.
+func BurnBoost(fhPct, sdPct float64, fhResetsUnix, sdResetsUnix int64, now time.Time) float64 {
+	fh := windowBoost(fhPct, fhResetsUnix, FiveHourWindow, now)
+	sd := windowBoost(sdPct, sdResetsUnix, SevenDayWindow, now)
+	return math.Max(fh, sd)
+}
+
+func windowBoost(pct float64, resetsUnix int64, window time.Duration, now time.Time) float64 {
+	if resetsUnix <= 0 {
+		return 0
+	}
+	remaining := time.Unix(resetsUnix, 0).Sub(now)
+	// resets_at in the past: the poller hasn't refreshed since the window
+	// rolled over. The snapshot is telling us about the *previous* window,
+	// so we can't reason about "pace" for the current one — no boost.
+	if remaining <= 0 || remaining >= window {
+		return 0
+	}
+	elapsed := window - remaining
+	ideal := float64(elapsed) / float64(window)
+	actual := pct / 100
+	if actual < 0 {
+		actual = 0
+	}
+	if actual > 1 {
+		actual = 1
+	}
+	return math.Max(0, ideal-actual)
+}
+
 // weightedRandPick computes a usage-aware effective score for each candidate
 // and returns one chosen by weighted-random selection.
 //
@@ -393,9 +451,11 @@ func (p *Pool) weightedRandPick(ctx context.Context, tx *sql.Tx, candidates []we
 		fhPct  float64
 		sdPct  float64
 		head   float64
+		boost  float64
 		score  float64
 	}
 
+	now := time.Now()
 	entries := make([]scored, len(candidates))
 	bestWeight := 0
 	bestIdx := 0
@@ -403,12 +463,14 @@ func (p *Pool) weightedRandPick(ctx context.Context, tx *sql.Tx, candidates []we
 		s := scored{id: e.id, weight: e.weight, head: 1.0}
 
 		var capturedAt int64
+		var fhReset, sdReset sql.NullInt64
 		err := tx.QueryRowContext(ctx, `
-			SELECT five_hour_pct, seven_day_pct, captured_at
+			SELECT five_hour_pct, seven_day_pct, captured_at,
+			       five_hour_resets_at, seven_day_resets_at
 			FROM usage_history
 			WHERE credential_id=?
 			ORDER BY captured_at DESC LIMIT 1`, e.id).
-			Scan(&s.fhPct, &s.sdPct, &capturedAt)
+			Scan(&s.fhPct, &s.sdPct, &capturedAt, &fhReset, &sdReset)
 
 		if err == nil {
 			// Always use the most recent snapshot, regardless of age.
@@ -418,10 +480,18 @@ func (p *Pool) weightedRandPick(ctx context.Context, tx *sql.Tx, candidates []we
 			// Multiply the two windows' remaining room (independent ceilings)
 			// and penalise low 7d room harder via the exponent.
 			s.head = Room(s.fhPct) * math.Pow(Room(s.sdPct), SevenDayExp)
+			s.boost = BurnBoost(s.fhPct, s.sdPct, fhReset.Int64, sdReset.Int64, now)
 		}
-		// err == sql.ErrNoRows → no snapshot yet; keep head=1.0 (bootstrap)
+		// err == sql.ErrNoRows → no snapshot yet; keep head=1.0, boost=0
+		// (bootstrap). Only credentials with a real snapshot can be "behind
+		// pace", so unmeasurable providers (GLM, MiMo, custom) never get a
+		// burn boost — they compete on weight alone within their provider.
 
-		s.score = Score(e.weight, s.fhPct, s.sdPct)
+		// score = base × (1 + BurnCoef * behind_pace)
+		// Applied here — Score() stays the pure static formula so the web UI
+		// keeps showing the baseline; the burn multiplier is a runtime
+		// selection adjustment, not part of the credential's "capacity".
+		s.score = Score(e.weight, s.fhPct, s.sdPct) * (1 + BurnCoef*s.boost)
 		entries[i] = s
 
 		if e.weight > bestWeight {
@@ -449,6 +519,7 @@ func (p *Pool) weightedRandPick(ctx context.Context, tx *sql.Tx, candidates []we
 				"fh_pct", s.fhPct,
 				"7d_pct", s.sdPct,
 				"headroom", fmt.Sprintf("%.4f", s.head),
+				"burn_boost", fmt.Sprintf("%.4f", s.boost),
 				"score", fmt.Sprintf("%.4f", s.score),
 				"select_pct", fmt.Sprintf("%.1f", pct),
 			)

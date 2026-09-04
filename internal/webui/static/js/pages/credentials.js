@@ -5,6 +5,58 @@ import {
 import { sectionHead } from "../components.js";
 import { compactNum, relTime, localTime } from "../format.js";
 
+// parseTokenCount accepts "262000", "262k", "262K", "1m", "1M", "1_000_000".
+// Returns 0 on empty/invalid so callers can treat it as "unknown".
+function parseTokenCount(raw) {
+  if (raw == null) return 0;
+  const s = String(raw).trim().toLowerCase().replace(/_/g, "");
+  if (!s) return 0;
+  const m = s.match(/^(\d+(?:\.\d+)?)\s*([km])?$/);
+  if (!m) return 0;
+  const n = parseFloat(m[1]);
+  if (!isFinite(n) || n < 0) return 0;
+  const mult = m[2] === "m" ? 1_000_000 : m[2] === "k" ? 1_000 : 1;
+  return Math.round(n * mult);
+}
+
+// parseModelSpec parses one token of the Models field. Accepts:
+//   qwen38-27b                  -> { id }
+//   qwen38-27b[262k]            -> { id, context_window: 262000 }
+//   qwen38-27b[262k/8k]         -> { id, context_window, max_output: 8000 }
+//   qwen38-27b [ 1M / 128000 ]  -> whitespace tolerated
+// Returns null when the token has no id.
+function parseModelSpec(token) {
+  const t = String(token || "").trim();
+  if (!t) return null;
+  const m = t.match(/^([^\[\s]+)\s*(?:\[\s*([^\]]*)\s*\])?\s*$/);
+  if (!m) return null;
+  const id = m[1];
+  const out = { id, display_name: id };
+  if (m[2]) {
+    const [ctx, mx] = m[2].split("/").map((s) => s.trim());
+    const ctxN = parseTokenCount(ctx);
+    if (ctxN > 0) out.context_window = ctxN;
+    const mxN = parseTokenCount(mx);
+    if (mxN > 0) out.max_output = mxN;
+  }
+  return out;
+}
+
+// formatModelSpec renders a creds.Model back into the wizard's compact syntax
+// so probed results are round-trippable through the Models input.
+function formatModelSpec(m) {
+  const id = m.id || "";
+  const ctx = Number(m.context_window || 0);
+  const mx = Number(m.max_output || 0);
+  if (ctx <= 0 && mx <= 0) return id;
+  const humanize = (n) => (n % 1_000_000 === 0 ? (n / 1_000_000) + "M"
+                        : n % 1_000 === 0 ? (n / 1_000) + "k" : String(n));
+  const parts = [];
+  if (ctx > 0) parts.push(humanize(ctx));
+  if (mx > 0) parts.push(humanize(mx));
+  return `${id}[${parts.join("/")}]`;
+}
+
 export async function render(root) {
   clear(root);
   const head = sectionHead("Credentials", "Managed subscriptions and API keys in the rotation pool.", [
@@ -283,7 +335,7 @@ function addCredentialModal(root) {
   });
   const models = el("input", {
     class: "input", type: "text", spellcheck: "false",
-    placeholder: "discovered on test — comma-separated to override",
+    placeholder: "e.g. qwen38-27b[262k/8k], llama-3.3[128k] — comma-separated",
   });
   const label = el("input", { class: "input", type: "text", placeholder: "defaults to the provider or host name" });
   const plan = el("input", { class: "input", type: "text", placeholder: "lite | pro | max" });
@@ -298,7 +350,7 @@ function addCredentialModal(root) {
   const jsonRow = field("credentials.json", json,
     "Get a fresh file with: CLAUDE_CONFIG_DIR=/tmp/claude.proxy.tmp claude /login; cat /tmp/claude.proxy.tmp/.credentials.json — then paste the output here. Liveness is verified and duplicates are rejected.");
   const modelsRow = field("Models", models,
-    "Left blank, the host is asked what it serves. Translation shims often answer as a different name than the one requested — that reported name is what gets stored.");
+    "Left blank, the host is asked what it serves. Append [ctx] or [ctx/max_output] per model to declare context sizes the host doesn't publish itself — accepts 262000, 262k, 1M, etc. Claude Code uses these for its context management.");
   const planRow = field("Plan", plan, "Display only — it does not affect routing.");
 
   const advanced = el("details", { class: "form-adv" }, [
@@ -340,11 +392,11 @@ function addCredentialModal(root) {
   const testBtn = button("Test connection", {
     onClick: (ev) => busy(ev.currentTarget, "Testing…", async () => {
       if (!ep.value()) throw new Error("Enter an endpoint first.");
-      const model = models.value.split(",").map((v) => v.trim()).find(Boolean) || "";
+      const model = (parseModelSpec(models.value.split(",")[0] || "") || {}).id || "";
       const p = await api.probeHost({ provider: kindSel.value, base_url: ep.value(), api_key: key.value.trim(), model });
       probe.render(p, kindSel.value);
       if ((p.models || []).length && !models.value.trim()) {
-        models.value = p.models.map((m) => m.id).join(", ");
+        models.value = p.models.map(formatModelSpec).join(", ");
       }
     }),
   });
@@ -369,8 +421,7 @@ function addCredentialModal(root) {
           base_url: ep.value(),
           api_key: key.value.trim(),
           label: label.value.trim(),
-          models: models.value.split(",").map((v) => v.trim()).filter(Boolean)
-            .map((id) => ({ id, display_name: id })),
+          models: models.value.split(",").map(parseModelSpec).filter(Boolean),
           weight: Number(weight.value) || 0,
         });
       } else {
