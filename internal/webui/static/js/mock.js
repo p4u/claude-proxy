@@ -13,6 +13,9 @@ const CREDS = [
   { id: "cred_dz17", label: "enterprise-01", type: "enterprise", weight: 5, status: "active" },
   { id: "cred_er05", label: "pro-old", type: "pro", weight: 1, status: "disabled" },
   { id: "cred_gl01", label: "zai-main", type: "pro", weight: 1, status: "active", provider: "glm" },
+  { id: "cred_oa01", label: "local-openai", type: "", weight: 2, status: "active",
+    provider: "custom_openai", endpoint: "http://localhost:8000/v1",
+    models: [{ id: "local-model", display_name: "local-model" }] },
 ];
 
 const CODEX_ACCOUNTS = [
@@ -36,7 +39,7 @@ const MOCK_ENDPOINTS = {
 };
 const endpointOf = (c) => {
   const p = MOCK_ENDPOINTS[providerOf(c)];
-  return p ? (c.endpoint || p.default) : "";
+  return p ? (c.endpoint || p.default) : (c.endpoint || "");
 };
 const endpointNameOf = (c) => {
   const p = MOCK_ENDPOINTS[providerOf(c)];
@@ -286,6 +289,7 @@ const DB = {
       provider: providerOf(c), has_usage_api: hasUsageAPI(c),
       endpoint: endpointOf(c), endpoint_name: endpointNameOf(c),
       endpoint_editable: !hasUsageAPI(c),
+      models: c.models || [],
       request_count: [8200, 5400, 1200, 3600, 40, 970][i], last_request_at: c.status === "disabled" ? null : now - 60 * (i + 1),
       expires_at: now + 3600 * (5 - i), created_at: now - 86400 * (30 - i * 4),
     })),
@@ -499,8 +503,8 @@ window.fetch = async (input, init = {}) => {
       }
       return json({
         ok: true, auth_required: !!b.api_key, has_models_api: false,
-        has_count_tokens: true, reported_model: "demo-model-v1",
-        models: [{ id: "demo-model-v1", display_name: "demo-model-v1" }],
+        has_count_tokens: b.provider !== "custom_openai", reported_model: b.model || "demo-model-v1",
+        models: [{ id: b.model || "demo-model-v1", display_name: b.model || "demo-model-v1" }],
       });
     }
     if (path === "/credentials/custom" && method === "POST") {
@@ -508,7 +512,8 @@ window.fetch = async (input, init = {}) => {
       if (!b.base_url) return json({ error: "base URL is required" }, 400);
       const c = { id: "cred_" + Math.random().toString(36).slice(2, 6),
         label: b.label || new URL(b.base_url).host, type: "", weight: b.weight || 1,
-        status: "active", provider: "custom", endpoint: b.base_url };
+        status: "active", provider: b.provider || "custom", endpoint: b.base_url,
+        models: b.models || [] };
       CREDS.push(c);
       return json({ ok: true, id: c.id, label: c.label, base_url: b.base_url });
     }

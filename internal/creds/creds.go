@@ -164,6 +164,13 @@ func InsertCustomKey(ctx context.Context, db *store.DB, label, apiKey, baseURL s
 	return insert(ctx, db, provider.Custom, baseURL, models, label, "", apiKey, "", keyExpiry(), weight)
 }
 
+// InsertCustomOpenAIKey stores a bearer token for a custom OpenAI-compatible
+// Chat Completions host. Like a custom Anthropic host, it carries its own base
+// URL and model catalogue.
+func InsertCustomOpenAIKey(ctx context.Context, db *store.DB, label, apiKey, baseURL string, models []Model, weight int) (*Credential, error) {
+	return insert(ctx, db, provider.CustomOpenAI, baseURL, models, label, "", apiKey, "", keyExpiry(), weight)
+}
+
 func insert(ctx context.Context, db *store.DB, p provider.ID, baseURL string, models []Model, label, subType, access, refresh string, expiresAt time.Time, weight int) (*Credential, error) {
 	if p == "" {
 		p = provider.Default

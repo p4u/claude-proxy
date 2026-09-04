@@ -82,7 +82,8 @@ the selected window into equal intervals.
 
 ### Credential management (wraps `internal/creds`, `internal/ingest`)
 - `GET /api/credentials` → extended `credView` (reuse fields from `internal/admin`),
-  including `provider` (`anthropic` | `glm`) and `has_usage_api`. The latter is
+  including `provider` (`anthropic` | `glm` | `mimo` | `custom` |
+  `custom_openai`) and `has_usage_api`. The latter is
   false for providers publishing no utilization endpoint; the UI uses it to hide
   the usage meters, the expiry date and the OAuth-only row actions (Refresh,
   Update tokens) rather than showing 0% and a synthetic far-future date.
@@ -109,14 +110,16 @@ the selected window into equal intervals.
   `400` names the endpoint that rejected it. On success a `revoked`/`expired`/
   `limited` status is healed to `active`. `400` for OAuth credentials, whose
   endpoint is fixed.
-- `POST /api/credentials/probe` `{base_url, api_key?}` → interrogate a candidate
-  custom host **without storing anything**, so the modal can show what was found
+- `POST /api/credentials/probe` `{provider?, base_url, api_key?, model?}` →
+  interrogate a candidate custom host **without storing anything**, so the modal can show what was found
   and let the operator correct it: `{ok, error?, auth_required, has_models_api,
   has_count_tokens, reported_model, models:[{id,display_name,context_window?,
   max_output?}]}`. `context_window` is absent when the host publishes no
-  `/v1/models` — it is undiscoverable there and is never guessed.
-- `POST /api/credentials/custom` `{base_url, api_key?, label?, models?, weight?}`
-  → add a custom Anthropic-compatible host (`ingest.ImportCustomHost`). The host
+  `/v1/models` — it is undiscoverable there and is never guessed. Set provider
+  to `custom_openai` to probe `/models` and `/chat/completions`; omitted means
+  the existing `custom` Anthropic protocol.
+- `POST /api/credentials/custom` `{provider?, base_url, api_key?, label?, models?, weight?}`
+  → add a custom Anthropic or OpenAI API host. The host
   is probed again here rather than trusting the modal's earlier probe, since the
   URL or key may have changed since. `models` overrides discovery; omitted, the
   discovered catalogue is used. `400` if the host is unusable or no model could
@@ -178,7 +181,7 @@ queries must use the indexes on `request_log(ts)` / `usage_history(credential_id
 > **Add credential is one modal for every kind** (`addCredentialModal`). A type
 > selector switches between Anthropic subscription (paste `credentials.json`),
 > OpenAI Codex subscription (OAuth plus callback handoff), a provider API key
-> (GLM/MiMo), and a custom Anthropic-compatible host; the fields follow the
+> (GLM/MiMo), a Custom Anthropic API Host, and a Custom OpenAI API Host; the fields follow the
 > selection. The endpoint is an `<input list>` backed by a
 > `<datalist>` of the provider's presets — one editable control that both
 > suggests and accepts anything, rather than a `<select>` plus a separate

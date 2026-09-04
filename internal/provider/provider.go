@@ -35,6 +35,10 @@ const (
 	// Unlike the others it has no fixed base URL and no fixed model list: both
 	// live on the credential, because each custom host is its own upstream.
 	Custom ID = "custom"
+	// CustomOpenAI is any self-hosted or third-party endpoint implementing the
+	// OpenAI Chat Completions API. Requests and responses are translated at the
+	// proxy boundary so downstream clients continue to speak Anthropic.
+	CustomOpenAI ID = "custom_openai"
 )
 
 // Endpoint is one selectable base URL for a provider.
@@ -162,7 +166,7 @@ var registry = []Provider{
 	},
 	{
 		ID:              Custom,
-		Name:            "Custom Anthropic API",
+		Name:            "Custom Anthropic API Host",
 		BaseURL:         "",  // supplied per credential; there is no default
 		ModelPrefixes:   nil, // routed by the credential's declared model list
 		Refreshable:     false,
@@ -170,6 +174,19 @@ var registry = []Provider{
 		Augment1M:       false,
 		AdvertisePrefix: "claude-",
 		HasModelsAPI:    false, // probed per credential
+	},
+	{
+		ID:            CustomOpenAI,
+		Name:          "Custom OpenAI API Host",
+		BaseURL:       "",  // supplied per credential, normally ending in /v1
+		ModelPrefixes: nil, // routed by the credential's declared model list
+		Refreshable:   false,
+		PollsUsage:    false,
+		Augment1M:     false,
+		// A protocol-specific alias avoids collisions when Anthropic- and
+		// OpenAI-compatible hosts happen to publish the same native model ID.
+		AdvertisePrefix: "claude-openai-",
+		HasModelsAPI:    false, // discovered and stored per credential
 	},
 	{
 		ID:              MiMo,

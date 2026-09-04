@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -110,7 +111,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if prov == provider.Default && needsSticky(r) {
 		if list, lerr := creds.List(r.Context(), h.db); lerr == nil {
 			if m, ok := matchCustomModel(list, requestModel(body)); ok {
-				custom, prov = m, provider.Custom
+				custom, prov = m, m.Provider
 			}
 		}
 	}
@@ -118,7 +119,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Undo the advertising alias before anything else reads the body, so the
 	// prompt/conversation capture records the real model rather than the
 	// claude-prefixed name this proxy invented for the picker.
-	if prov == provider.Custom {
+	if prov == provider.Custom || prov == provider.CustomOpenAI {
 		// The host declared this name, so send exactly that — the alias the
 		// picker showed is ours, not something the upstream would recognise.
 		if rewritten, ok := setRequestModel(body, custom.Model); ok {
@@ -284,7 +285,32 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 	// base URL carries a path prefix (/api/anthropic), so this concatenates
 	// onto the base rather than swapping a host.
 	up := provider.Get(credProvider(cred))
-	upstreamURL := provider.ResolveBaseURL(up.ID, cred.BaseURL) + r.URL.RequestURI()
+	requestURI := r.URL.RequestURI()
+	openAIStream := false
+	if up.ID == provider.CustomOpenAI {
+		switch r.URL.Path {
+		case "/v1/messages/count_tokens":
+			payload, _ := json.Marshal(map[string]any{"input_tokens": approximateAnthropicTokens(body)})
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(payload)
+			_ = creds.MarkSuccess(r.Context(), h.db, cred.ID)
+			return http.StatusOK, int64(len(payload)), tokenUsage{}, ""
+		case "/v1/messages":
+			translated, stream, err := translateAnthropicToOpenAI(body)
+			if err != nil {
+				http.Error(w, "translate request: "+err.Error(), http.StatusBadRequest)
+				_ = creds.MarkError(r.Context(), h.db, cred.ID)
+				return http.StatusBadRequest, 0, tokenUsage{}, ""
+			}
+			body, openAIStream = translated, stream
+			requestURI = "/chat/completions"
+		default:
+			http.Error(w, "proxy: custom OpenAI hosts support /v1/messages and /v1/messages/count_tokens", http.StatusNotImplemented)
+			return http.StatusNotImplemented, 0, tokenUsage{}, ""
+		}
+	}
+	upstreamURL := provider.ResolveBaseURL(up.ID, cred.BaseURL) + requestURI
 
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, bytes.NewReader(body))
 	if err != nil {
@@ -295,8 +321,19 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 
 	copyHeaders(upstreamReq.Header, r.Header)
 	upstreamReq.Host = upstreamReq.URL.Host
-	upstreamReq.Header.Set("Authorization", "Bearer "+cred.AccessToken)
+	if cred.AccessToken != "" {
+		upstreamReq.Header.Set("Authorization", "Bearer "+cred.AccessToken)
+	} else {
+		upstreamReq.Header.Del("Authorization")
+	}
 	upstreamReq.Header.Del("X-Api-Key")
+	if up.ID == provider.CustomOpenAI {
+		upstreamReq.Header.Del("Anthropic-Version")
+		upstreamReq.Header.Del("Anthropic-Beta")
+		// Translation needs a plain response body. With this header absent Go's
+		// transport can negotiate and transparently decompress gzip itself.
+		upstreamReq.Header.Del("Accept-Encoding")
+	}
 	for k := range upstreamReq.Header {
 		if strings.HasPrefix(strings.ToLower(k), "x-router-") {
 			upstreamReq.Header.Del(k)
@@ -313,6 +350,43 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 		_ = creds.MarkError(r.Context(), h.db, cred.ID)
 		h.log.Error("upstream transport error", "cred", cred.ID, "err", err)
 		return -1, 0, tokenUsage{}, ""
+	}
+	if up.ID == provider.CustomOpenAI {
+		if resp.StatusCode >= 400 {
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+			_ = resp.Body.Close()
+			raw = translateOpenAIError(raw, resp.StatusCode)
+			resp.Body = io.NopCloser(bytes.NewReader(raw))
+			resp.ContentLength = int64(len(raw))
+			resp.Header.Set("Content-Type", "application/json")
+			resp.Header.Set("Content-Length", strconv.Itoa(len(raw)))
+			resp.Header.Del("Content-Encoding")
+		} else if openAIStream {
+			resp.Body = translateOpenAIStream(r.Context(), resp.Body)
+			resp.ContentLength = -1
+			resp.Header.Set("Content-Type", "text/event-stream")
+			resp.Header.Del("Content-Length")
+			resp.Header.Del("Content-Encoding")
+		} else {
+			raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
+			_ = resp.Body.Close()
+			if readErr != nil || len(raw) > maxBodyBytes {
+				http.Error(w, "translate response: response too large or unreadable", http.StatusBadGateway)
+				_ = creds.MarkError(r.Context(), h.db, cred.ID)
+				return -1, 0, tokenUsage{}, ""
+			}
+			translated, translateErr := translateOpenAIJSON(raw)
+			if translateErr != nil {
+				http.Error(w, "translate response: "+translateErr.Error(), http.StatusBadGateway)
+				_ = creds.MarkError(r.Context(), h.db, cred.ID)
+				return -1, 0, tokenUsage{}, ""
+			}
+			resp.Body = io.NopCloser(bytes.NewReader(translated))
+			resp.ContentLength = int64(len(translated))
+			resp.Header.Set("Content-Type", "application/json")
+			resp.Header.Set("Content-Length", strconv.Itoa(len(translated)))
+			resp.Header.Del("Content-Encoding")
+		}
 	}
 
 	h.log.Debug(

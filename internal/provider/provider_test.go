@@ -49,7 +49,7 @@ func TestGetFallsBackToDefault(t *testing.T) {
 }
 
 func TestValid(t *testing.T) {
-	for _, id := range []ID{Anthropic, GLM, MiMo, Custom, Codex} {
+	for _, id := range []ID{Anthropic, GLM, MiMo, Custom, CustomOpenAI, Codex} {
 		if !Valid(id) {
 			t.Errorf("Valid(%q) = false, want true", id)
 		}

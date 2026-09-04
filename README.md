@@ -65,7 +65,11 @@ to keep them alive.
 
 ## Features
 
-- **Multiple providers** — Anthropic subscriptions, [Z.AI GLM](https://docs.z.ai/devpack/tool/claude) coding plans and [Xiaomi MiMo](https://mimo.mi.com/docs/en-US/tokenplan/integration/claudecode) token plans in one pool. Their models appear in Claude Code's `/model` picker and are selectable transparently; see [Third-party providers](#glm-zai-and-mimo-support).
+- **Multiple providers** — Anthropic subscriptions, OpenAI-compatible custom
+  hosts, [Z.AI GLM](https://docs.z.ai/devpack/tool/claude) coding plans, and
+  [Xiaomi MiMo](https://mimo.mi.com/docs/en-US/tokenplan/integration/claudecode)
+  token plans in one pool. Their models appear in Claude Code's `/model` picker
+  and are selectable transparently.
 - **Sticky binding** — each Claude Code conversation pins to a single credential for its lifetime.
 - **Usage-aware weighted selection** for new conversations: each credential's score combines its configured weight with live 5h/7d usage headroom, and a credential that has hit either limit is excluded entirely. Default weights: `max`/`team`/`enterprise` = 5, `pro` = 1.
 - **Automatic refresh** — proactive (every 60 s if `expires_at < now+5min`) and reactive (on `401` retry once with a fresh token).
@@ -342,7 +346,7 @@ the loopback HTTP listener. You almost certainly want to keep
 > but anyone who learns your domain name can still reach the listener — the
 > bearer token is what stops them from spending your subscription quota.
 
-## Custom Anthropic-compatible hosts
+## Custom Anthropic API hosts
 
 Anything speaking the Anthropic Messages API can join the pool — a self-hosted
 model behind a translation shim, an internal gateway, another vendor:
@@ -351,7 +355,7 @@ model behind a translation shim, an internal gateway, another vendor:
 claude-proxy creds add-custom --url http://10.0.0.5:3456 --key sk-xxx
 ```
 
-or the web UI's **Add custom host** button. The host is probed and everything
+or **Credentials → Add credential → Custom Anthropic API Host**. The host is probed and everything
 discoverable is filled in for you:
 
 ```
@@ -372,6 +376,27 @@ to override or to declare several.
 Where a host serves `GET /v1/models`, its catalogue and **context windows** are
 taken wholesale. Where it doesn't, the context window is left unset rather than
 guessed — a wrong window misconfigures the client's context management.
+
+### Custom OpenAI API hosts
+
+Choose **Credentials → Add credential → Custom OpenAI API Host** to connect a
+self-hosted or third-party OpenAI-compatible endpoint. Enter the API base URL
+including its version prefix (for example `http://localhost:8000/v1`) and, when
+required, its bearer token. The token is stored like other API credentials and
+is never returned by the management API.
+
+The proxy discovers models from `GET /models`, verifies one with
+`POST /chat/completions`, and translates Anthropic Messages requests and replies
+at runtime. Text, images, system prompts, streaming, function tools/results,
+stop reasons, errors, and usage counters are supported. Because Chat
+Completions has no token-count endpoint, `/v1/messages/count_tokens` returns a
+local estimate for context preflight; it is not used for billing. Anthropic-only
+features such as signed thinking blocks and cache-control semantics cannot be
+preserved by a generic OpenAI-compatible API.
+
+Models appear in Claude Code as `claude-openai-<model>` and are restored to the
+host's native model ID on the wire. The protocol-specific prefix prevents a
+custom OpenAI model from colliding with Codex or a custom Anthropic host.
 
 The models then appear in the `/model` picker like any other, and requests route
 to the host that declared them. Two hosts declaring the same model name pool and
@@ -701,6 +726,12 @@ sidecar on a dedicated Docker network. Its API port is not published. OpenAI
 OAuth tokens are stored only under ignored `data/cliproxy-auth/`; the main
 database contains one internal gateway credential so its existing sticky
 routing, request logs and per-user limits keep working.
+
+Each connected OpenAI account has its own auth file and independent OAuth
+access/refresh token pair. `CLIPROXY_API_KEY` authenticates only the private
+proxy-to-sidecar hop; CLIProxyAPI replaces it with the selected account's OAuth
+token and never sends the internal key to OpenAI. Do not derive account tokens
+from this shared internal key.
 
 Open **Credentials → Add credential → OpenAI Codex subscription** and complete
 the browser login. Do not upload `~/.codex/auth.json`.

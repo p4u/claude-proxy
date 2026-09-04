@@ -233,25 +233,26 @@ real usage API omit `metered` entirely rather than carry a worse second number.
 > into a genuine utilization % feeding `pool.Score`. MiMo publishes per-MTok
 > prices but no quota formula, so it could only ever show estimated spend.
 
-### Custom hosts (`provider.Custom`, `internal/proxy/custom.go`)
+### Custom hosts (`provider.Custom`, `provider.CustomOpenAI`, `internal/proxy/custom.go`)
 
-Any endpoint speaking the Anthropic Messages API can be added. Unlike the
-registry providers, a custom host has **no fixed base URL and no fixed model
-list** — both live on the credential, because each host *is* its own upstream.
+An endpoint may speak Anthropic Messages (`custom`) or OpenAI Chat Completions
+(`custom_openai`). Unlike registry providers, a custom host has **no fixed base
+URL and no fixed model list** — both live on the credential, because each host
+*is* its own upstream.
 
 **Routing is dynamic, not prefix-based.** `provider.ForModel` places `glm-4.7`
 from a compile-time prefix; a custom host serves whatever its operator declared
 (`Qwen3.6-fable`, `my-llama`, …), so `matchCustomModel` asks which credential
 declares the requested name. That lookup runs against the credential list the
-request path already loaded. It resolves the advertised `claude-` alias and the
-native name to the same host, so picker selections and direct API calls agree.
+request path already loaded. Anthropic hosts advertise `claude-<model>`;
+OpenAI hosts advertise `claude-openai-<model>` so their names cannot collide
+with Codex or an Anthropic host. The declared native name goes upstream.
 
-**The mapping is model → credential IDs, not model → provider.** Two custom
-hosts are both provider `custom` while serving disjoint models, so provider
-alone is too coarse a filter: `pool.BindScoped` therefore takes an explicit
-candidate allowlist, and additionally scopes the sticky key by model
-(`<model>:custom:<conv>`) so a conversation switching between two custom models
-does not reuse a pin to a host that cannot serve the new one.
+**The mapping is model → credential IDs, not just model → provider.** Multiple
+hosts of one protocol share a provider while serving disjoint models, so
+`pool.BindScoped` takes an explicit candidate allowlist and additionally scopes
+the sticky key by model. A conversation switching custom models cannot reuse a
+pin to a host that cannot serve the new one.
 
 **Adding a host is a probe, not a form.** `ingest.ProbeCustomHost` interrogates
 the endpoint and fills in everything it can discover, because a translation shim
@@ -270,8 +271,15 @@ Context window is **omitted rather than guessed** when the host publishes no
 and a wrong window misconfigures the client's context management. Discovered
 values are editable — the probe is a starting point, not a verdict.
 
-Surfaces: `creds add-custom --url … [--model ID]…`, and the web UI's *Add custom
-host* modal (`POST /api/credentials/probe` then `/custom`).
+`ProbeCustomOpenAIHost` performs the parallel OpenAI checks at `GET /models`
+and `POST /chat/completions`. `openai.go` translates normal and streaming text,
+images, tools/results, stop reasons, errors, and usage. Chat Completions has no
+token-count operation, so the Anthropic count endpoint returns a local context
+preflight estimate, never a billing figure.
+
+Surfaces: `creds add-custom --url … [--model ID]…` for Anthropic hosts, and the
+web UI's two custom-host credential types (`POST /api/credentials/probe` then
+`/custom`).
 
 ### Conversation Key Derivation (4-priority, `internal/router/`)
 

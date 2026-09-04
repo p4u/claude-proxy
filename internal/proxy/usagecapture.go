@@ -32,9 +32,10 @@ func (u tokenUsage) apply(model string, b usageBlock, isStart bool) tokenUsage {
 	if model != "" {
 		u.Model = model
 	}
-	// input + cache counters are authoritative at message_start (SSE) or on the
-	// single non-stream body; message_delta only carries output_tokens.
-	if isStart {
+	// Anthropic puts input + cache counters at message_start, while translated
+	// OpenAI streams can only learn exact usage in their final chunk. Accept
+	// those fields whenever present so the latter can correct its initial zero.
+	if isStart || b.InputTokens != nil || b.CacheCreationInput != nil || b.CacheReadInput != nil {
 		if b.InputTokens != nil {
 			u.InputTokens = *b.InputTokens
 		}

@@ -271,6 +271,71 @@ func TestProbeCustomHostDiscovers(t *testing.T) {
 	}
 }
 
+func TestProbeAndImportCustomOpenAIHost(t *testing.T) {
+	db := keyTestDB(t)
+	var sawModels, sawChat, sawBearer bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			sawModels = true
+			if r.Header.Get("Authorization") != "Bearer openai-secret" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			sawBearer = true
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"model-a"},{"id":"model-b"}]}`))
+		case "/v1/chat/completions":
+			sawChat = true
+			if r.Header.Get("Authorization") == "" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			_, _ = w.Write([]byte(`{"id":"chatcmpl_1","model":"model-a","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(ts.Close)
+	orig := verifyClient
+	verifyClient = ts.Client()
+	t.Cleanup(func() { verifyClient = orig })
+
+	c, probe, err := ImportCustomOpenAIHost(context.Background(), db, "local", ts.URL+"/v1/", " openai-secret ", nil, 3)
+	if err != nil {
+		t.Fatalf("ImportCustomOpenAIHost: %v (probe=%+v)", err, probe)
+	}
+	if !sawModels || !sawChat || !sawBearer || !probe.OK || !probe.AuthRequired {
+		t.Fatalf("probe incomplete: models=%v chat=%v bearer=%v probe=%+v", sawModels, sawChat, sawBearer, probe)
+	}
+	if c.Provider != provider.CustomOpenAI || c.BaseURL != ts.URL+"/v1" || c.AccessToken != "openai-secret" || c.Weight != 3 {
+		t.Errorf("stored credential = %+v", c)
+	}
+	if len(c.Models) != 2 || c.Models[0].ID != "model-a" {
+		t.Errorf("models = %+v", c.Models)
+	}
+}
+
+func TestCustomOpenAIProbeNeedsModelWhenCatalogueIsAbsent(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/models" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_1","model":"manual-model","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	t.Cleanup(ts.Close)
+	orig := verifyClient
+	verifyClient = ts.Client()
+	t.Cleanup(func() { verifyClient = orig })
+
+	if p := ProbeCustomOpenAIHost(context.Background(), ts.URL+"/v1", "", ""); p.OK || !strings.Contains(p.Error, "supply") {
+		t.Fatalf("probe without model = %+v", p)
+	}
+	if p := ProbeCustomOpenAIHost(context.Background(), ts.URL+"/v1", "", "manual-model"); !p.OK || len(p.Models) != 1 {
+		t.Fatalf("probe with model = %+v", p)
+	}
+}
+
 // When the host does publish a catalogue, take it — including the context
 // windows, which are otherwise undiscoverable.
 func TestProbeCustomHostUsesModelsAPI(t *testing.T) {

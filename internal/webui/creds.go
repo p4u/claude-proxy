@@ -267,41 +267,63 @@ func (s *Server) addKeyCred(w http.ResponseWriter, r *http.Request) {
 // modal can show what was found and let the operator correct it before saving.
 func (s *Server) probeCustom(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		BaseURL string `json:"base_url"`
-		APIKey  string `json:"api_key"`
+		Provider string `json:"provider"`
+		BaseURL  string `json:"base_url"`
+		APIKey   string `json:"api_key"`
+		Model    string `json:"model"`
 	}
 	if err := decodeJSON(w, r, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, ingest.ProbeCustomHost(r.Context(), body.BaseURL, body.APIKey, ""))
+	switch provider.ID(body.Provider) {
+	case "", provider.Custom:
+		writeJSON(w, ingest.ProbeCustomHost(r.Context(), body.BaseURL, body.APIKey, body.Model))
+	case provider.CustomOpenAI:
+		writeJSON(w, ingest.ProbeCustomOpenAIHost(r.Context(), body.BaseURL, body.APIKey, body.Model))
+	default:
+		writeErr(w, http.StatusBadRequest, "provider must be custom or custom_openai")
+	}
 }
 
-// addCustomCred stores a custom Anthropic-compatible host. The host is probed
-// again here rather than trusting the modal's earlier probe: the operator may
+// addCustomCred stores a custom Anthropic- or OpenAI-compatible host. The host
+// is probed again rather than trusting the modal's earlier probe: the operator may
 // have edited the URL or key since, and storing an unusable host is the failure
 // this check exists to prevent.
 func (s *Server) addCustomCred(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Label   string        `json:"label"`
-		BaseURL string        `json:"base_url"`
-		APIKey  string        `json:"api_key"`
-		Models  []creds.Model `json:"models"`
-		Weight  int           `json:"weight"`
+		Provider string        `json:"provider"`
+		Label    string        `json:"label"`
+		BaseURL  string        `json:"base_url"`
+		APIKey   string        `json:"api_key"`
+		Models   []creds.Model `json:"models"`
+		Weight   int           `json:"weight"`
 	}
 	if err := decodeJSON(w, r, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	c, probe, err := ingest.ImportCustomHost(r.Context(), s.db,
-		body.Label, body.BaseURL, body.APIKey, body.Models, body.Weight)
+	var c *creds.Credential
+	var probe ingest.Probe
+	var err error
+	switch provider.ID(body.Provider) {
+	case "", provider.Custom:
+		c, probe, err = ingest.ImportCustomHost(r.Context(), s.db,
+			body.Label, body.BaseURL, body.APIKey, body.Models, body.Weight)
+	case provider.CustomOpenAI:
+		c, probe, err = ingest.ImportCustomOpenAIHost(r.Context(), s.db,
+			body.Label, body.BaseURL, body.APIKey, body.Models, body.Weight)
+	default:
+		writeErr(w, http.StatusBadRequest, "provider must be custom or custom_openai")
+		return
+	}
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	writeJSON(w, map[string]any{
 		"ok": true, "id": c.ID, "label": c.Label,
-		"base_url": c.BaseURL, "models": c.Models, "probe": probe,
+		"provider": string(c.Provider), "base_url": c.BaseURL, "models": c.Models, "probe": probe,
 	})
 }
 

@@ -65,6 +65,23 @@ func TestMatchCustomModel(t *testing.T) {
 	}
 }
 
+func TestMatchCustomOpenAIModelUsesProtocolSpecificAlias(t *testing.T) {
+	list := []*creds.Credential{
+		customCred("anthropic", "active", "shared-model", "openai-shared-model"),
+		{ID: "openai", Provider: provider.CustomOpenAI, Status: creds.StatusActive,
+			Models: []creds.Model{{ID: "shared-model"}}},
+	}
+	got, ok := matchCustomModel(list, "claude-openai-shared-model")
+	if !ok || got.Provider != provider.CustomOpenAI || got.Model != "shared-model" || len(got.CredIDs) != 1 || got.CredIDs[0] != "openai" {
+		t.Fatalf("OpenAI alias resolved as %+v, ok=%v", got, ok)
+	}
+	// Native ambiguity keeps the established Anthropic host behavior.
+	got, ok = matchCustomModel(list, "shared-model")
+	if !ok || got.Provider != provider.Custom || got.CredIDs[0] != "anthropic" {
+		t.Fatalf("native model resolution = %+v, ok=%v", got, ok)
+	}
+}
+
 // Advertising a model whose credential cannot serve it would offer the picker
 // something the proxy then has to reject.
 func TestCustomModelsGatedOnHealth(t *testing.T) {
@@ -75,7 +92,7 @@ func TestCustomModelsGatedOnHealth(t *testing.T) {
 		customCred("off", "disabled", "delta"),
 	}
 	got := map[string]bool{}
-	for _, e := range customModels(list) {
+	for _, e := range customModels(list, provider.Custom) {
 		got[e["id"].(string)] = true
 	}
 	if !got["alpha"] {
@@ -96,7 +113,7 @@ func TestCustomModelsDeduplicated(t *testing.T) {
 		customCred("c1", "active", "shared"),
 		customCred("c2", "active", "shared"),
 	}
-	if n := len(customModels(list)); n != 1 {
+	if n := len(customModels(list, provider.Custom)); n != 1 {
 		t.Errorf("got %d entries, want 1 — duplicates would show twice in the picker", n)
 	}
 }
@@ -112,7 +129,7 @@ func TestCustomModelsOmitUnknownContext(t *testing.T) {
 		},
 	}}
 	byID := map[string]map[string]any{}
-	for _, e := range customModels(list) {
+	for _, e := range customModels(list, provider.Custom) {
 		byID[e["id"].(string)] = e
 	}
 	if byID["known"]["max_input_tokens"] != 200000 {

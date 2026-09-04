@@ -268,8 +268,8 @@ func (h *Handler) serveModels(w http.ResponseWriter, r *http.Request, start time
 	for _, p := range provider.All() {
 		// Custom hosts have no single catalogue: each credential declares its
 		// own, so they are merged from the credential list rather than fetched.
-		if p.ID == provider.Custom {
-			entries := customModels(list)
+		if p.ID == provider.Custom || p.ID == provider.CustomOpenAI {
+			entries := customModels(list, p.ID)
 			if len(entries) == 0 {
 				continue
 			}

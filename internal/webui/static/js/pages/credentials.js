@@ -22,7 +22,7 @@ export async function render(root) {
     if (!credentials.length) {
       body.append(emptyState(
         "No credentials yet",
-        'Click "Add credential" to connect a subscription, provider API key, or Anthropic-compatible host.',
+        'Click "Add credential" to connect a subscription, provider API key, or custom API host.',
       ));
     } else {
       body.append(buildTable(credentials, root));
@@ -88,7 +88,10 @@ async function loadEndpoints() {
 // The badge style capitalizes its text, which turns "glm" into "Glm". Spell out
 // the display form instead of fighting the CSS; unknown providers fall back to
 // the raw id so a new one stays legible before this map is updated.
-const PROVIDER_LABELS = { anthropic: "Anthropic", glm: "GLM", mimo: "MiMo", custom: "Custom", codex: "OpenAI Codex" };
+const PROVIDER_LABELS = {
+  anthropic: "Anthropic", glm: "GLM", mimo: "MiMo", custom: "Custom Anthropic",
+  custom_openai: "Custom OpenAI", codex: "OpenAI Codex",
+};
 function providerLabel(id) {
   return PROVIDER_LABELS[id] || id || "Anthropic";
 }
@@ -123,12 +126,21 @@ const KINDS = {
     plan: true,
   },
   custom: {
-    label: "Custom Anthropic-compatible host",
+    label: "Custom Anthropic API Host",
     blurb: "Any endpoint speaking the Anthropic Messages API — a self-hosted model, a gateway, another vendor.",
     keyHelp: "Leave blank if the host needs no key.",
     endpointHelp: "Base URL of the host, e.g. http://10.0.0.5:3456 or https://host/anthropic.",
     models: true,
     freeEndpoint: true,
+  },
+  custom_openai: {
+    label: "Custom OpenAI API Host",
+    blurb: "Any endpoint speaking the OpenAI Chat Completions API. The proxy translates it to Anthropic Messages for clients.",
+    keyHelp: "Bearer token sent as Authorization: Bearer …. Leave blank if the host needs no authentication.",
+    endpointHelp: "API base URL including its version prefix, e.g. http://10.0.0.5:8000/v1 or https://host/v1.",
+    models: true,
+    freeEndpoint: true,
+    openAIProtocol: true,
   },
 };
 
@@ -203,6 +215,7 @@ function endpointInput(kind, value) {
     open(false);
     // Default to the provider's own default so the common case needs no typing.
     if (!input.value) input.value = ENDPOINTS[k]?.default || "";
+    input.placeholder = k === "custom_openai" ? "https://host/v1" : "https://host/anthropic";
   };
 
   toggle.addEventListener("click", () => open(menu.hidden));
@@ -229,14 +242,15 @@ function probePanel() {
   return {
     root,
     clear: () => clear(root),
-    render: (p) => {
+    render: (p, kind) => {
       clear(root);
       const yn = (b) => (b ? "yes" : "no");
       root.append(
         line("reachable", yn(p.ok), p.ok ? "good" : "bad"),
         line("auth enforced", yn(p.auth_required), p.auth_required ? "good" : "warn"),
         line("/v1/models", yn(p.has_models_api)),
-        line("count_tokens", yn(p.has_count_tokens)),
+        line(kind === "custom_openai" ? "/chat/completions" : "count_tokens",
+          kind === "custom_openai" ? yn(p.ok) : yn(p.has_count_tokens)),
       );
       if (p.reported_model) root.append(line("reports model", p.reported_model));
       if (p.error) root.append(line("error", p.error, "bad"));
@@ -326,8 +340,9 @@ function addCredentialModal(root) {
   const testBtn = button("Test connection", {
     onClick: (ev) => busy(ev.currentTarget, "Testing…", async () => {
       if (!ep.value()) throw new Error("Enter an endpoint first.");
-      const p = await api.probeHost({ base_url: ep.value(), api_key: key.value.trim() });
-      probe.render(p);
+      const model = models.value.split(",").map((v) => v.trim()).find(Boolean) || "";
+      const p = await api.probeHost({ provider: kindSel.value, base_url: ep.value(), api_key: key.value.trim(), model });
+      probe.render(p, kindSel.value);
       if ((p.models || []).length && !models.value.trim()) {
         models.value = p.models.map((m) => m.id).join(", ");
       }
@@ -347,9 +362,10 @@ function addCredentialModal(root) {
         const w = parseInt(weight.value, 10);
         if (!isNaN(w)) payload.weight = w;
         await api.post("/credentials", payload);
-      } else if (k === "custom") {
+      } else if (k === "custom" || k === "custom_openai") {
         if (!ep.value()) throw new Error("Enter the host's base URL.");
         await api.addCustom({
+          provider: k,
           base_url: ep.value(),
           api_key: key.value.trim(),
           label: label.value.trim(),
@@ -390,6 +406,7 @@ function addCredentialModal(root) {
     if (!cfg.managedOAuth) codexFlow.cancel();
     setHelp(endpointRow, cfg.endpointHelp);
     setHelp(keyRow, cfg.keyHelp);
+    keyRow.querySelector(".field-label").textContent = cfg.openAIProtocol ? "Bearer token" : "API key";
     // Presets belong to the selected provider; a custom host has none.
     ep.input.value = "";
     ep.setKind(k);
@@ -400,7 +417,7 @@ function addCredentialModal(root) {
 
   m = modal({
     title: "Add credential",
-    subtitle: "Subscription logins, provider API keys, and Anthropic-compatible hosts.",
+    subtitle: "Subscription logins, provider API keys, and custom Anthropic or OpenAI API hosts.",
     wide: true,
     body,
     actions: [button("Cancel", { onClick: () => { codexFlow.cancel(); m.close(); } }), testBtn, submit],

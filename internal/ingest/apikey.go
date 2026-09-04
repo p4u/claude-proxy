@@ -86,6 +86,13 @@ func ImportKey(ctx context.Context, db *store.DB, p provider.ID, label, plan, ap
 		return nil, fmt.Errorf("%s uses OAuth credentials, not API keys — use `creds import` instead",
 			provider.Get(p).Name)
 	}
+	if p == provider.Custom || p == provider.CustomOpenAI {
+		return nil, fmt.Errorf("%s requires a base URL and model catalogue — use the custom-host flow instead",
+			provider.Get(p).Name)
+	}
+	if p == provider.Codex {
+		return nil, fmt.Errorf("OpenAI Codex subscriptions are managed through OAuth")
+	}
 
 	dup, err := creds.HasAccessToken(ctx, db, apiKey)
 	if err != nil {
@@ -140,8 +147,25 @@ func UpdateKeyEndpoint(ctx context.Context, db *store.DB, id, endpoint string) (
 	if err != nil {
 		return nil, err
 	}
-	if err := VerifyKey(ctx, p, c.AccessToken, baseURL); err != nil {
-		return nil, fmt.Errorf("key is not usable at that endpoint: %w", err)
+	var verifyErr error
+	switch p {
+	case provider.Custom:
+		hint := firstModel(c.Models)
+		probe := ProbeCustomHost(ctx, baseURL, c.AccessToken, hint)
+		if !probe.OK {
+			verifyErr = fmt.Errorf("%s", probe.Error)
+		}
+	case provider.CustomOpenAI:
+		hint := firstModel(c.Models)
+		probe := ProbeCustomOpenAIHost(ctx, baseURL, c.AccessToken, hint)
+		if !probe.OK {
+			verifyErr = fmt.Errorf("%s", probe.Error)
+		}
+	default:
+		verifyErr = VerifyKey(ctx, p, c.AccessToken, baseURL)
+	}
+	if verifyErr != nil {
+		return nil, fmt.Errorf("key is not usable at that endpoint: %w", verifyErr)
 	}
 
 	stored := baseURL
@@ -163,9 +187,18 @@ func UpdateKeyEndpoint(ctx context.Context, db *store.DB, id, endpoint string) (
 	return creds.Get(ctx, db, id)
 }
 
-// Probe is what a single interrogation of a custom Anthropic-compatible host
-// discovered. Everything here is observed, never assumed: a field left zero
-// means the host did not tell us, not that the value is zero.
+func firstModel(models []creds.Model) string {
+	for _, m := range models {
+		if id := strings.TrimSpace(m.ID); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+// Probe is what a single interrogation of a custom Anthropic- or
+// OpenAI-compatible host discovered. Everything here is observed, never
+// assumed: a field left zero means the host did not tell us.
 type Probe struct {
 	BaseURL        string        `json:"base_url"`
 	OK             bool          `json:"ok"`
@@ -236,6 +269,127 @@ func ProbeCustomHost(ctx context.Context, baseURL, apiKey, modelHint string) Pro
 		p.Models = []creds.Model{{ID: reported, DisplayName: reported}}
 	}
 	return p
+}
+
+// ProbeCustomOpenAIHost interrogates an OpenAI-compatible Chat Completions
+// endpoint. baseURL is the API prefix (normally https://host/v1), so models is
+// read from baseURL+/models and completions are sent to baseURL+/chat/completions.
+func ProbeCustomOpenAIHost(ctx context.Context, baseURL, apiKey, modelHint string) Probe {
+	base := strings.TrimSuffix(strings.TrimSpace(baseURL), "/")
+	p := Probe{BaseURL: base}
+	if base == "" {
+		p.Error = "base URL is required"
+		return p
+	}
+	if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
+		p.Error = "base URL must start with http:// or https://"
+		return p
+	}
+
+	if entries, ok := probeOpenAIModelsAPI(ctx, base, apiKey); ok {
+		p.HasModelsAPI = true
+		p.Models = entries
+	}
+	model := strings.TrimSpace(modelHint)
+	if model == "" && len(p.Models) > 0 {
+		model = p.Models[0].ID
+	}
+	if model == "" {
+		p.Error = "the host did not list models; supply at least one model name"
+		return p
+	}
+	reported, err := probeOpenAIChat(ctx, base, apiKey, model)
+	if err != nil {
+		p.Error = err.Error()
+		return p
+	}
+	p.OK = true
+	p.ReportedModel = reported
+	p.AuthRequired = probeOpenAIAuthRequired(ctx, base, model)
+	if len(p.Models) == 0 {
+		id := reported
+		if id == "" {
+			id = model
+		}
+		p.Models = []creds.Model{{ID: id, DisplayName: id}}
+	}
+	return p
+}
+
+func probeOpenAIModelsAPI(ctx context.Context, base, apiKey string) ([]creds.Model, bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/models", nil)
+	if err != nil {
+		return nil, false
+	}
+	setBearer(req, apiKey)
+	resp, err := verifyClient.Do(req)
+	if err != nil {
+		return nil, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, false
+	}
+	var env struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&env); err != nil {
+		return nil, false
+	}
+	out := make([]creds.Model, 0, len(env.Data))
+	for _, e := range env.Data {
+		if id := strings.TrimSpace(e.ID); id != "" {
+			out = append(out, creds.Model{ID: id, DisplayName: id})
+		}
+	}
+	return out, len(out) > 0
+}
+
+func probeOpenAIChat(ctx context.Context, base, apiKey, model string) (string, error) {
+	body := fmt.Sprintf(`{"model":%q,"max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`, model)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/chat/completions", strings.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	setBearer(req, apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := verifyClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("contacting %s: %w", base, err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return "", fmt.Errorf("host rejected the bearer token (HTTP %d)", resp.StatusCode)
+	default:
+		return "", fmt.Errorf("host returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	var out struct {
+		Model   string `json:"model"`
+		Choices []any  `json:"choices"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil || len(out.Choices) == 0 {
+		return "", fmt.Errorf("host did not return an OpenAI chat completion: %s", strings.TrimSpace(string(raw)))
+	}
+	if out.Model == "" {
+		out.Model = model
+	}
+	return out.Model, nil
+}
+
+func probeOpenAIAuthRequired(ctx context.Context, base, model string) bool {
+	_, err := probeOpenAIChat(ctx, base, "", model)
+	return err != nil
+}
+
+func setBearer(req *http.Request, token string) {
+	if token = strings.TrimSpace(token); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 }
 
 func probeModelsAPI(ctx context.Context, base, apiKey string) ([]creds.Model, bool) {
@@ -381,6 +535,37 @@ func ImportCustomHost(ctx context.Context, db *store.DB, label, baseURL, apiKey 
 		label = hostLabel(p.BaseURL)
 	}
 	c, err := creds.InsertCustomKey(ctx, db, label, apiKey, p.BaseURL, p.Models, weight)
+	return c, p, err
+}
+
+// ImportCustomOpenAIHost probes and stores a custom OpenAI Chat Completions
+// host. models, when non-empty, supplies the probe hint and overrides the
+// discovered catalogue.
+func ImportCustomOpenAIHost(ctx context.Context, db *store.DB, label, baseURL, apiKey string, models []creds.Model, weight int) (*creds.Credential, Probe, error) {
+	apiKey = strings.TrimSpace(apiKey)
+	p := ProbeCustomOpenAIHost(ctx, baseURL, apiKey, firstModel(models))
+	if !p.OK {
+		return nil, p, fmt.Errorf("host is not usable: %s", p.Error)
+	}
+	if len(models) > 0 {
+		p.Models = models
+	}
+	if len(p.Models) == 0 {
+		return nil, p, fmt.Errorf("no models discovered; supply at least one model name")
+	}
+	if apiKey != "" {
+		dup, err := creds.HasAccessToken(ctx, db, apiKey)
+		if err != nil {
+			return nil, p, fmt.Errorf("duplicate check: %w", err)
+		}
+		if dup {
+			return nil, p, fmt.Errorf("that bearer token is already in the pool")
+		}
+	}
+	if label == "" {
+		label = hostLabel(p.BaseURL)
+	}
+	c, err := creds.InsertCustomOpenAIKey(ctx, db, label, apiKey, p.BaseURL, p.Models, weight)
 	return c, p, err
 }
 

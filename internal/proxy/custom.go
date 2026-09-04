@@ -22,8 +22,9 @@ import (
 
 // customMatch is the resolution of a model name against the custom credentials.
 type customMatch struct {
-	Model   string   // the model ID as the host declared it (alias stripped)
-	CredIDs []string // credentials that declare it, in list order
+	Model    string      // the model ID as the host declared it (alias stripped)
+	Provider provider.ID // protocol spoken by the matching custom host
+	CredIDs  []string    // credentials that declare it, in list order
 }
 
 // matchCustomModel finds the custom credentials serving a model.
@@ -38,19 +39,12 @@ func matchCustomModel(list []*creds.Credential, model string) (customMatch, bool
 	if want == "" {
 		return customMatch{}, false
 	}
-	// The name as sent first, then with the advertising prefix removed: a host
-	// that genuinely named a model "claude-foo" then still wins over the alias
-	// interpretation of the same string.
-	candidates := []string{want}
-	if p := provider.Get(provider.Custom).AdvertisePrefix; p != "" && strings.HasPrefix(want, p) {
-		candidates = append(candidates, strings.TrimPrefix(want, p))
-	}
-
-	for _, cand := range candidates {
+	customProviders := []provider.ID{provider.Custom, provider.CustomOpenAI}
+	match := func(prov provider.ID, cand string) (customMatch, bool) {
 		var ids []string
 		var declared string
 		for _, c := range list {
-			if credProvider(c) != provider.Custom {
+			if credProvider(c) != prov {
 				continue
 			}
 			for _, m := range c.Models {
@@ -62,7 +56,27 @@ func matchCustomModel(list []*creds.Credential, model string) (customMatch, bool
 			}
 		}
 		if len(ids) > 0 {
-			return customMatch{Model: declared, CredIDs: ids}, true
+			return customMatch{Model: declared, Provider: prov, CredIDs: ids}, true
+		}
+		return customMatch{}, false
+	}
+
+	// Picker aliases are protocol-specific. Resolve them before native names so
+	// an OpenAI picker entry cannot be captured by an Anthropic custom host.
+	for _, prov := range []provider.ID{provider.CustomOpenAI, provider.Custom} {
+		prefix := strings.ToLower(provider.Get(prov).AdvertisePrefix)
+		if prefix != "" && strings.HasPrefix(want, prefix) {
+			if got, ok := match(prov, strings.TrimPrefix(want, prefix)); ok {
+				return got, true
+			}
+		}
+	}
+	// Native names remain available to clients that do not use model discovery.
+	// Existing Anthropic custom hosts win an ambiguous native ID for backwards
+	// compatibility; the advertised aliases remain unambiguous.
+	for _, prov := range customProviders {
+		if got, ok := match(prov, want); ok {
+			return got, true
 		}
 	}
 	return customMatch{}, false
@@ -74,11 +88,11 @@ func matchCustomModel(list []*creds.Credential, model string) (customMatch, bool
 // Used by model discovery. Gating on credential health is the same rule the
 // registry providers follow: offering a model the proxy would then have to
 // reject is worse than omitting it.
-func customModels(list []*creds.Credential) []map[string]any {
+func customModels(list []*creds.Credential, prov provider.ID) []map[string]any {
 	seen := map[string]bool{}
 	out := []map[string]any{}
 	for _, c := range list {
-		if credProvider(c) != provider.Custom {
+		if credProvider(c) != prov {
 			continue
 		}
 		if c.Status != creds.StatusActive && c.Status != creds.StatusLimited {
