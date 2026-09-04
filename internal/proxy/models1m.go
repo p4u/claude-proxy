@@ -258,6 +258,14 @@ func (h *Handler) serveModels(w http.ResponseWriter, r *http.Request, start time
 	// transparently decompresses, so the buffered body is plain JSON.
 	r.Header.Del("Accept-Encoding")
 
+	// Anthropic's /v1/models requires anthropic-version; Claude Code always
+	// sends it, but plain curl/browser discovery calls don't, and without it
+	// the upstream 400s and the whole Anthropic catalogue is dropped from the
+	// merged list. Inject a safe default when missing.
+	if r.Header.Get("Anthropic-Version") == "" {
+		r.Header.Set("Anthropic-Version", "2023-06-01")
+	}
+
 	var (
 		merged    []map[string]any
 		answered  int
