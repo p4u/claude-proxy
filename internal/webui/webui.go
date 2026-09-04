@@ -10,7 +10,10 @@ import (
 	"io/fs"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/p4u/claude-proxy/internal/codexgateway"
 	"github.com/p4u/claude-proxy/internal/creds"
 	"github.com/p4u/claude-proxy/internal/store"
 )
@@ -28,12 +31,22 @@ type Server struct {
 	hmacKey []byte
 	static  fs.FS
 	limiter *loginLimiter
+	codex   *codexgateway.Client
+
+	codexOAuthMu   sync.Mutex
+	codexOAuthLast time.Time
 }
 
 // New builds the web UI HTTP handler. It authenticates itself via a signed
 // session cookie derived from password + a random boot salt, so restarting the
 // process invalidates all sessions.
 func New(db *store.DB, refresher *creds.Refresher, password string, secureCookies bool) http.Handler {
+	return NewWithCodex(db, refresher, password, secureCookies, nil)
+}
+
+// NewWithCodex builds the UI with optional access to a private CLIProxyAPI
+// sidecar. New remains for tests and deployments that do not enable Codex.
+func NewWithCodex(db *store.DB, refresher *creds.Refresher, password string, secureCookies bool, codex *codexgateway.Client) http.Handler {
 	sub, err := fs.Sub(staticFS, "static")
 	if err != nil {
 		// The embed directive guarantees the directory exists; this cannot fail
@@ -48,6 +61,7 @@ func New(db *store.DB, refresher *creds.Refresher, password string, secureCookie
 		hmacKey:       deriveKey(password),
 		static:        sub,
 		limiter:       newLoginLimiter(),
+		codex:         codex,
 	}
 }
 
@@ -120,6 +134,8 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, rest string) {
 		s.handleConversationSub(w, r, strings.TrimPrefix(rest, "/conversations/"))
 	case rest == "/credentials" || strings.HasPrefix(rest, "/credentials/"):
 		s.handleCredentials(w, r, strings.TrimPrefix(rest, "/credentials"))
+	case rest == "/codex" || strings.HasPrefix(rest, "/codex/"):
+		s.handleCodex(w, r, strings.TrimPrefix(rest, "/codex"))
 	case rest == "/users" || strings.HasPrefix(rest, "/users/"):
 		s.handleUsers(w, r, strings.TrimPrefix(rest, "/users"))
 	default:

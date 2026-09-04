@@ -397,6 +397,11 @@ button.legend__item.is-solo .legend__lbl { color: var(--ink); font-weight: 600; 
 
 /* ---------- Tables ---------- */
 .table-card { padding: 0; overflow: hidden; }
+.table-card__note {
+  margin: 0; padding: 11px 14px; font-size: 11.5px; line-height: 1.45;
+  color: var(--ink-muted); background: var(--surface-2); border-bottom: 1px solid var(--border);
+}
+.table-card__note--error { color: var(--critical); }
 .table-scroll { overflow-x: auto; }
 .table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .table th { text-align: left; font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-muted); font-weight: 500; padding: 12px 14px; border-bottom: 1px solid var(--border); white-space: nowrap; }
@@ -423,6 +428,7 @@ td.actions { text-align: right; white-space: nowrap; }
 
 /* ---------- Buttons ---------- */
 .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; font-size: 12.5px; font-weight: 540; padding: 7px 13px; border-radius: var(--r-sm); border: 1px solid var(--border-strong); background: var(--surface-2); color: var(--ink); cursor: pointer; transition: background 0.14s, border-color 0.14s, transform 0.05s; white-space: nowrap; }
+.btn[hidden] { display: none; }
 .btn:hover { background: var(--surface-3); }
 .btn:active { transform: translateY(0.5px); }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
@@ -472,6 +478,9 @@ td.actions { text-align: right; white-space: nowrap; }
 
 .form { display: flex; flex-direction: column; gap: 14px; }
 .form-row { display: flex; flex-direction: column; gap: 6px; }
+.codex-oauth { display: flex; flex-direction: column; gap: 12px; }
+.codex-oauth[hidden] { display: none; }
+.codex-oauth__actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .form-grid { display: grid; grid-template-columns: 1fr 140px; gap: 12px; }
 .field-label { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-muted); }
 .input { width: 100%; background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: var(--r-sm); color: var(--ink); font-size: 13.5px; padding: 9px 11px; font-family: var(--sans); transition: border-color 0.14s, background 0.14s; }

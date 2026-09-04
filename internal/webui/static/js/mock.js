@@ -15,6 +15,13 @@ const CREDS = [
   { id: "cred_gl01", label: "zai-main", type: "pro", weight: 1, status: "active", provider: "glm" },
 ];
 
+const CODEX_ACCOUNTS = [
+  { name: "codex-owner-pro-91c7.json", auth_index: "mock-codex-owner", email: "owner@example.com",
+    account_type: "pro", status: "active", disabled: false, unavailable: false,
+    success: 418, failed: 3, weight: 5, last_refresh: new Date(Date.now() - 42 * 60 * 1000).toISOString() },
+];
+let codexOAuthPolls = 0;
+
 // Mirrors internal/provider: only Anthropic publishes a utilization API.
 const providerOf = (c) => c.provider || "anthropic";
 const MOCK_ENDPOINTS = {
@@ -283,6 +290,8 @@ const DB = {
       expires_at: now + 3600 * (5 - i), created_at: now - 86400 * (30 - i * 4),
     })),
   "/credentials/endpoints": () => MOCK_ENDPOINTS,
+  "/codex/accounts": () => ({ configured: true, accounts: CODEX_ACCOUNTS }),
+  "/codex/oauth/status": () => ({ status: ++codexOAuthPolls > 2 ? "ok" : "wait" }),
   "/users": () =>
     USERS.map((u, i) => ({
       id: u.id, name: u.name, status: u.status, full_capture: u.full_capture,
@@ -433,6 +442,36 @@ window.fetch = async (input, init = {}) => {
 
   // Mutations: acknowledge.
   if (method !== "GET") {
+    if (path === "/codex/oauth/start") {
+      codexOAuthPolls = 0;
+      return json({ url: "about:blank#mock-openai-login", state: "mock_codex_state", callback_mode: "localhost_or_manual" });
+    }
+    if (path === "/codex/oauth/callback") return json({ ok: true });
+    if (path === "/codex/oauth/cancel") return json({ ok: true });
+    if (path === "/codex/accounts/status") {
+      const b = JSON.parse(init.body || "{}");
+      const a = CODEX_ACCOUNTS.find((x) => x.name === b.name);
+      if (!a) return json({ error: "account not found" }, 404);
+      a.disabled = !!b.disabled;
+      return json({ ok: true });
+    }
+    if (path === "/codex/accounts/weight") {
+      const b = JSON.parse(init.body || "{}");
+      const a = CODEX_ACCOUNTS.find((x) => x.name === b.name);
+      if (!a) return json({ error: "account not found" }, 404);
+      if (!Number.isInteger(b.weight) || b.weight < 1 || b.weight > 1_000_000) {
+        return json({ error: "weight must be between 1 and 1000000" }, 400);
+      }
+      a.weight = b.weight;
+      return json({ ok: true, weight: a.weight });
+    }
+    if (path === "/codex/accounts/delete") {
+      const b = JSON.parse(init.body || "{}");
+      const i = CODEX_ACCOUNTS.findIndex((x) => x.name === b.name);
+      if (i < 0) return json({ error: "account not found" }, 404);
+      CODEX_ACCOUNTS.splice(i, 1);
+      return json({ ok: true });
+    }
     if (path === "/users" && method === "POST") return json({ id: "utok_new", name: JSON.parse(init.body || "{}").name || "new", token: "cpu_" + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2) });
     // Adding a key appends to CREDS so the credentials table reflects it for
     // the rest of the mock session, matching how the real endpoint behaves.

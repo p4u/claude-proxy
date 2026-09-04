@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/p4u/claude-proxy/internal/admin"
+	"github.com/p4u/claude-proxy/internal/codexgateway"
 	"github.com/p4u/claude-proxy/internal/creds"
 	"github.com/p4u/claude-proxy/internal/ingest"
 	"github.com/p4u/claude-proxy/internal/pool"
@@ -198,6 +199,23 @@ func runServe(args []string) {
 	r := creds.NewRefresher(db)
 	go r.Loop(ctx)
 
+	codexClient, err := codexgateway.New(codexgateway.Config{
+		BaseURL:       os.Getenv("CLAUDE_PROXY_CODEX_BASE_URL"),
+		APIKey:        os.Getenv("CLAUDE_PROXY_CODEX_API_KEY"),
+		ManagementKey: os.Getenv("CLAUDE_PROXY_CODEX_MANAGEMENT_KEY"),
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "configure OpenAI Codex gateway: %v\n", err)
+		os.Exit(1)
+	}
+	if err := codexgateway.ReconcileCredential(ctx, db, codexClient); err != nil {
+		fmt.Fprintf(os.Stderr, "reconcile OpenAI Codex gateway: %v\n", err)
+		os.Exit(1)
+	}
+	if codexClient != nil {
+		logger.Info("OpenAI Codex gateway enabled", "base_url", codexClient.BaseURL())
+	}
+
 	p := pool.NewWithLogger(db, logger)
 	go p.Janitor(ctx)
 
@@ -226,7 +244,7 @@ func runServe(args []string) {
 	uiEnabled := *uiPassword != ""
 	if uiEnabled {
 		secureCookies := isTruthy(os.Getenv("CLAUDE_PROXY_UI_SECURE_COOKIES"))
-		uiH := webui.New(db, r, *uiPassword, secureCookies)
+		uiH := webui.NewWithCodex(db, r, *uiPassword, secureCookies, codexClient)
 		// The UI owns the root: reserved prefixes (/v1/, /admin/, /health) are
 		// registered above and win by ServeMux's longest-match rule; everything
 		// else (static assets, SPA deep links, /api/*, legacy /ui redirect)

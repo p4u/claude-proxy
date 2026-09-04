@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/p4u/claude-proxy/internal/codexgateway"
 	"github.com/p4u/claude-proxy/internal/creds"
 	"github.com/p4u/claude-proxy/internal/ingest"
 	"github.com/p4u/claude-proxy/internal/provider"
@@ -73,6 +74,10 @@ func (s *Server) handleCredentials(w http.ResponseWriter, r *http.Request, rest 
 }
 
 func (s *Server) credAction(w http.ResponseWriter, r *http.Request, id, action string) {
+	if id == codexgateway.GatewayCredentialID {
+		writeErr(w, http.StatusConflict, "the OpenAI Codex gateway is managed through the Codex accounts panel")
+		return
+	}
 	ctx := r.Context()
 	switch {
 	case action == "disable" && r.Method == http.MethodPost:
@@ -162,6 +167,13 @@ func (s *Server) listCreds(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]credView, 0, len(list))
 	for _, c := range list {
+		// The Codex gateway credential is an internal hop to CLIProxyAPI, not an
+		// owner's subscription. Exposing it here makes it look like an account
+		// whose tokens can be edited or deleted. Real Codex accounts are listed
+		// by /api/codex/accounts and managed through their OAuth controls.
+		if c.ID == codexgateway.GatewayCredentialID {
+			continue
+		}
 		v := credView{
 			ID: c.ID, Label: c.Label,
 			SubscriptionType: c.SubscriptionType,

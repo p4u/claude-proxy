@@ -14,19 +14,42 @@ export async function render(root) {
   root.append(head, body);
 
   try {
-    const [rows] = await Promise.all([api.credentials(), loadEndpoints()]);
+    const [rows, , codex] = await Promise.all([
+      api.credentials(), loadEndpoints(), api.codexAccounts().catch((error) => ({ configured: true, error })),
+    ]);
     clear(body);
-    if (!rows || !rows.length) {
+    const credentials = [...(rows || []), ...codexCredentialRows(codex)];
+    if (!credentials.length) {
       body.append(emptyState(
         "No credentials yet",
-        'Click "Add credential" to bring an Anthropic subscription, a provider API key, or any Anthropic-compatible host into the pool.',
+        'Click "Add credential" to connect a subscription, provider API key, or Anthropic-compatible host.',
       ));
-      return;
+    } else {
+      body.append(buildTable(credentials, root));
     }
-    body.append(buildTable(rows, root));
+    if (codex?.error) {
+      body.append(el("p", {
+        class: "table-card__note table-card__note--error",
+        text: `OpenAI Codex accounts could not be loaded: ${codex.error.message}`,
+      }));
+    }
   } catch (e) {
     clear(body).append(errorState(e.message, () => render(root)));
   }
+}
+
+function codexCredentialRows(data) {
+  if (!data?.configured || data.error) return [];
+  return (data.accounts || []).map((account) => ({
+    id: `codex:${account.name}`,
+    label: account.email || account.label || account.account || account.name,
+    provider: "codex",
+    subscription_type: account.account_type || "subscription",
+    status: account.disabled ? "disabled" : (account.unavailable ? "errored" : (account.status || "active")),
+    weight: account.weight ?? 1,
+    request_count: (account.success || 0) + (account.failed || 0),
+    codex_account: account,
+  }));
 }
 
 function buildTable(rows, root) {
@@ -65,7 +88,7 @@ async function loadEndpoints() {
 // The badge style capitalizes its text, which turns "glm" into "Glm". Spell out
 // the display form instead of fighting the CSS; unknown providers fall back to
 // the raw id so a new one stays legible before this map is updated.
-const PROVIDER_LABELS = { anthropic: "Anthropic", glm: "GLM", mimo: "MiMo", custom: "Custom" };
+const PROVIDER_LABELS = { anthropic: "Anthropic", glm: "GLM", mimo: "MiMo", custom: "Custom", codex: "OpenAI Codex" };
 function providerLabel(id) {
   return PROVIDER_LABELS[id] || id || "Anthropic";
 }
@@ -78,6 +101,11 @@ const KINDS = {
     label: "Anthropic subscription",
     blurb: "A Pro/Max/Team/Enterprise login. The proxy keeps its token refreshed for you.",
     needsJSON: true,
+  },
+  codex: {
+    label: "OpenAI Codex subscription",
+    blurb: "Authorize a personal ChatGPT/Codex subscription with OAuth. Tokens stay in the private sidecar.",
+    managedOAuth: true,
   },
   glm: {
     label: "Z.AI GLM",
@@ -229,6 +257,7 @@ function probePanel() {
 // that had drifted apart. They ask for overlapping things, so they are now one
 // form whose fields follow the selected kind.
 function addCredentialModal(root) {
+  let m;
   const kindSel = el("select", { class: "input" },
     Object.entries(KINDS).map(([k, v]) => el("option", { value: k, text: v.label })));
 
@@ -253,7 +282,7 @@ function addCredentialModal(root) {
   const endpointRow = field("Endpoint", ep.root, "");
   const keyRow = field("API key", key, "");
   const jsonRow = field("credentials.json", json,
-    "Run `claude /login` with a dedicated CLAUDE_CONFIG_DIR, then paste that file. Liveness is verified and duplicates are rejected.");
+    "Get a fresh file with: CLAUDE_CONFIG_DIR=/tmp/claude.proxy.tmp claude /login; cat /tmp/claude.proxy.tmp/.credentials.json — then paste the output here. Liveness is verified and duplicates are rejected.");
   const modelsRow = field("Models", models,
     "Left blank, the host is asked what it serves. Translation shims often answer as a different name than the one requested — that reported name is what gets stored.");
   const planRow = field("Plan", plan, "Display only — it does not affect routing.");
@@ -267,8 +296,13 @@ function addCredentialModal(root) {
     ]),
   ]);
 
+  const codexFlow = codexOAuthControls(root, () => {
+    m.close();
+    render(root);
+  });
+
   const body = el("div", { class: "form" }, [
-    kindRow, endpointRow, keyRow, jsonRow, modelsRow, advanced, probe.root, err,
+    kindRow, endpointRow, keyRow, jsonRow, modelsRow, advanced, probe.root, codexFlow.root, err,
   ]);
 
   const busy = async (btn, verb, fn) => {
@@ -344,12 +378,16 @@ function addCredentialModal(root) {
     const k = kindSel.value;
     const cfg = KINDS[k];
     setHelp(kindRow, cfg.blurb);
-    endpointRow.hidden = !!cfg.needsJSON;
-    keyRow.hidden = !!cfg.needsJSON;
+    endpointRow.hidden = !!cfg.needsJSON || !!cfg.managedOAuth;
+    keyRow.hidden = !!cfg.needsJSON || !!cfg.managedOAuth;
     jsonRow.hidden = !cfg.needsJSON;
     modelsRow.hidden = !cfg.models;
     planRow.hidden = !cfg.plan;
-    testBtn.hidden = !!cfg.needsJSON;
+    testBtn.hidden = !!cfg.needsJSON || !!cfg.managedOAuth;
+    advanced.hidden = !!cfg.managedOAuth;
+    codexFlow.root.hidden = !cfg.managedOAuth;
+    submit.hidden = !!cfg.managedOAuth;
+    if (!cfg.managedOAuth) codexFlow.cancel();
     setHelp(endpointRow, cfg.endpointHelp);
     setHelp(keyRow, cfg.keyHelp);
     // Presets belong to the selected provider; a custom host has none.
@@ -360,14 +398,155 @@ function addCredentialModal(root) {
   };
   kindSel.addEventListener("change", sync);
 
-  const m = modal({
+  m = modal({
     title: "Add credential",
-    subtitle: "Anthropic subscriptions, provider API keys, and any Anthropic-compatible host.",
+    subtitle: "Subscription logins, provider API keys, and Anthropic-compatible hosts.",
     wide: true,
     body,
-    actions: [button("Cancel", { onClick: () => m.close() }), testBtn, submit],
+    actions: [button("Cancel", { onClick: () => { codexFlow.cancel(); m.close(); } }), testBtn, submit],
   });
   sync();
+  return m;
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI Codex OAuth (managed by CLIProxyAPI)
+// ---------------------------------------------------------------------------
+
+function codexOAuthControls(root, onConnected) {
+  const status = el("p", {
+    class: "field-help",
+    text: "Connect the owner's ChatGPT/Codex subscription. OAuth tokens remain in the private sidecar and refresh automatically.",
+  });
+  const manual = el("textarea", {
+    class: "input input--code", rows: "4", spellcheck: "false",
+    placeholder: "http://127.0.0.1:8317/codex/callback?code=…&state=…",
+  });
+  const manualRow = field(
+    "Callback URL",
+    manual,
+    "If the final loopback page cannot open, paste its complete localhost:1455 or 127.0.0.1:8317 URL here. The authorization code is accepted once and is never stored.",
+  );
+  manualRow.hidden = true;
+  const err = el("p", { class: "form-err", role: "alert" });
+  const submitCallback = button("Submit callback URL", {
+    onClick: async (ev) => {
+      err.textContent = "";
+      if (!state) { err.textContent = "Start OpenAI sign-in first."; return; }
+      if (!manual.value.trim()) { err.textContent = "Paste the complete callback URL first."; return; }
+      ev.currentTarget.disabled = true;
+      try {
+        await api.submitCodexCallback(state, manual.value.trim());
+        status.textContent = "Callback accepted. Finishing authorization…";
+      } catch (e) {
+        err.textContent = e.message || "Could not submit the callback.";
+      } finally {
+        ev.currentTarget.disabled = false;
+      }
+    },
+  });
+  submitCallback.hidden = true;
+  const start = button("Connect with OpenAI", { kind: "primary", onClick: () => begin() });
+  const controls = el("div", { class: "codex-oauth__actions" }, [start, submitCallback]);
+  const flowRoot = el("div", { class: "codex-oauth" }, [
+    status,
+    el("p", { class: "field-help", text: "OpenAI first returns to localhost:1455. CLIProxyAPI may then redirect the browser to 127.0.0.1:8317/codex/callback; either complete URL is accepted below." }),
+    controls,
+    manualRow,
+    err,
+  ]);
+  let state = "";
+  let popup = null;
+  let run = 0;
+
+  async function begin() {
+    const previousState = state;
+    const thisRun = ++run;
+    state = "";
+    if (previousState) api.cancelCodexOAuth(previousState).catch(() => {});
+    if (popup && !popup.closed) popup.close();
+    // Open synchronously so popup blockers recognize the user gesture.
+    popup = window.open("about:blank", "codex-oauth", "popup,width=720,height=800");
+    err.textContent = "";
+    manual.value = "";
+    manualRow.hidden = true;
+    submitCallback.hidden = true;
+    start.disabled = true;
+    start.textContent = "Starting…";
+    status.textContent = "Starting a secure OpenAI authorization…";
+    try {
+      const started = await api.startCodexOAuth();
+      if (run !== thisRun || !flowRoot.isConnected) {
+        await api.cancelCodexOAuth(started.state).catch(() => {});
+        return;
+      }
+      state = started.state;
+      manualRow.hidden = false;
+      submitCallback.hidden = false;
+      status.textContent = "Complete sign-in in the OpenAI window. This page will detect completion automatically.";
+      if (popup) popup.location.href = started.url;
+      else throw new Error("The sign-in window was blocked. Allow popups and try again.");
+      start.disabled = false;
+      start.textContent = "Restart sign-in";
+
+      const deadline = Date.now() + 5 * 60 * 1000;
+      while (flowRoot.isConnected && run === thisRun && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        if (!flowRoot.isConnected || run !== thisRun) return;
+        const current = await api.codexOAuthStatus(state);
+        if (current.status === "wait") continue;
+        if (current.status === "ok") {
+          if (popup && !popup.closed) popup.close();
+          state = "";
+          toast("OpenAI Codex account connected", "good");
+          onConnected();
+          return;
+        }
+        throw new Error(current.error || "OpenAI authorization failed.");
+      }
+      if (!flowRoot.isConnected && run === thisRun) {
+        cancel();
+        return;
+      }
+      if (flowRoot.isConnected && run === thisRun) {
+        await api.cancelCodexOAuth(state).catch(() => {});
+        state = "";
+        err.textContent = "Authorization timed out. Start sign-in again.";
+      }
+    } catch (e) {
+      if (popup && !popup.closed) popup.close();
+      state = "";
+      err.textContent = e.message || "Could not start OpenAI authorization.";
+      status.textContent = "Authorization was not completed.";
+      start.disabled = false;
+      start.textContent = "Try again";
+    }
+  }
+
+  function cancel() {
+    run++;
+    const pending = state;
+    state = "";
+    if (pending) api.cancelCodexOAuth(pending).catch(() => {});
+    if (popup && !popup.closed) popup.close();
+  }
+
+  return { root: flowRoot, cancel };
+}
+
+function codexOAuthModal(root) {
+  let m;
+  const flow = codexOAuthControls(root, () => {
+    m.close();
+    render(root);
+  });
+  m = modal({
+    title: "Refresh OpenAI Codex login",
+    subtitle: "Run OAuth again for the owner's ChatGPT account.",
+    wide: true,
+    body: flow.root,
+    actions: [button("Close", { onClick: () => { flow.cancel(); m.close(); } })],
+  });
   return m;
 }
 
@@ -433,6 +612,8 @@ function endpointModal(c, root) {
 }
 
 function credRow(c, root) {
+  if (c.codex_account) return codexCredRow(c, root);
+
   const id = c.id || c.credential_id;
   const disabled = (c.status || "").toLowerCase() === "disabled";
   // A static API key has no OAuth lineage: there is nothing to refresh and no
@@ -478,6 +659,54 @@ function credRow(c, root) {
   ]);
 }
 
+function codexCredRow(c, root) {
+  const a = c.codex_account;
+  const disabled = c.status === "disabled";
+  const label = c.label || a.name;
+  const actions = el("div", { class: "row-actions" }, [
+    button("Weight", {
+      onClick: () => weightModal(c.id, c.weight, root, {
+        save: (weight) => api.setCodexAccountWeight(a.name, weight),
+        help: "Higher weight sends this account more new Codex conversations. It only competes with other OpenAI Codex accounts.",
+      }),
+    }),
+    button(disabled ? "Enable" : "Disable", {
+      onClick: () => act(
+        () => api.setCodexAccountDisabled(a.name, a.auth_index, !disabled),
+        disabled ? "OpenAI account enabled" : "OpenAI account disabled", root,
+      ),
+    }),
+    button("Refresh login", {
+      title: "Run OpenAI OAuth again. Normal access-token refreshes happen automatically.",
+      onClick: () => codexOAuthModal(root),
+    }),
+    button("Delete", {
+      kind: "danger-ghost",
+      onClick: async () => {
+        const ok = await confirmDialog({
+          title: "Delete OpenAI credential?",
+          message: `"${label}" and its OAuth tokens will be removed from the sidecar. This can't be undone.`,
+          confirmLabel: "Delete",
+        });
+        if (ok) act(() => api.deleteCodexAccount(a.name), "OpenAI account deleted", root);
+      },
+    }),
+  ]);
+  const refreshed = a.last_refresh ? relTime(tsOf(a.last_refresh)) : "never";
+  return el("tr", {}, [
+    el("td", {}, [el("span", { class: "cell-strong", text: label }), el("span", { class: "cell-id", text: a.name })]),
+    el("td", {}, el("span", { class: "badge", text: providerLabel(c.provider) })),
+    el("td", { text: "Private sidecar", title: "OAuth tokens are stored by CLIProxyAPI" }),
+    el("td", { text: c.subscription_type }),
+    el("td", { title: a.status_message || "" }, statusBadge(c.status)),
+    el("td", { class: "num", text: String(c.weight) }),
+    el("td", { class: "num", text: compactNum(c.request_count) }),
+    el("td", { text: refreshed, title: "Last OAuth token refresh" }),
+    el("td", { text: "Auto-refresh" }),
+    el("td", { class: "actions" }, actions),
+  ]);
+}
+
 function tsOf(v) {
   if (v == null) return 0;
   if (typeof v === "number") return v;
@@ -495,14 +724,14 @@ async function act(fn, okMsg, root) {
   }
 }
 
-function weightModal(id, current, root) {
-  const input = el("input", { class: "input", type: "number", min: "0", step: "1", value: String(current ?? 1) });
+function weightModal(id, current, root, options = {}) {
+  const input = el("input", { class: "input", type: "number", min: "1", max: "1000000", step: "1", value: String(current ?? 1) });
   const m = modal({
     title: "Set selection weight",
     subtitle: "Higher weight → more new conversations.",
     body: el("div", { class: "form" }, [
       field("Weight", input,
-        "Weights only compete within one provider. Anthropic defaults: pro 1, max/team/enterprise 5. API keys default to 1."),
+        options.help || "Weights only compete within one provider. Anthropic defaults: pro 1, max/team/enterprise 5. API keys default to 1."),
     ]),
     actions: [
       button("Cancel", { onClick: () => m.close() }),
@@ -510,9 +739,12 @@ function weightModal(id, current, root) {
         kind: "primary",
         onClick: async () => {
           const w = parseInt(input.value, 10);
-          if (isNaN(w) || w < 0) return toast("Enter a non-negative integer", "warning");
+          if (isNaN(w) || w < 1 || w > 1_000_000) return toast("Enter an integer from 1 to 1000000", "warning");
           m.close();
-          act(() => api.post(`/credentials/${id}/weight`, { weight: w }), "Weight updated", root);
+          act(
+            () => options.save ? options.save(w) : api.post(`/credentials/${id}/weight`, { weight: w }),
+            "Weight updated", root,
+          );
         },
       }),
     ],

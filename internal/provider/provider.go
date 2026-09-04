@@ -27,6 +27,10 @@ const (
 	Anthropic ID = "anthropic"
 	GLM       ID = "glm"
 	MiMo      ID = "mimo"
+	// Codex is an OpenAI ChatGPT/Codex subscription served through the private
+	// CLIProxyAPI sidecar. The sidecar owns OAuth refresh and account selection;
+	// this proxy sees one internal gateway credential.
+	Codex ID = "codex"
 	// Custom is any self-hosted or third-party Anthropic-compatible endpoint.
 	// Unlike the others it has no fixed base URL and no fixed model list: both
 	// live on the credential, because each custom host is its own upstream.
@@ -193,6 +197,17 @@ var registry = []Provider{
 			{Name: "cn", Desc: "Token Plan — China", URL: "https://token-plan-cn.xiaomimimo.com/anthropic"},
 			{Name: "payg", Desc: "Pay-as-you-go (api.xiaomimimo.com)", URL: "https://api.xiaomimimo.com/anthropic"},
 		},
+	},
+	{
+		ID:              Codex,
+		Name:            "OpenAI Codex",
+		BaseURL:         "", // supplied by the internal gateway credential
+		ModelPrefixes:   []string{"gpt-"},
+		Refreshable:     false, // CLIProxyAPI refreshes the OAuth credentials
+		PollsUsage:      false,
+		Augment1M:       false,
+		AdvertisePrefix: "claude-",
+		HasModelsAPI:    true,
 	},
 }
 

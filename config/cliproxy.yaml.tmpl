@@ -1,0 +1,30 @@
+# Rendered inside the CLIProxyAPI container. The placeholder is replaced from
+# CLIPROXY_API_KEY at startup; keep the resulting file in the container tmpfs.
+host: ""
+port: 8317
+
+tls:
+  enable: false
+
+remote-management:
+  # MANAGEMENT_PASSWORD enables authenticated Docker-network access. The
+  # management UI remains disabled and port 8317 is never published.
+  allow-remote: false
+  secret-key: ""
+  disable-control-panel: true
+
+auth-dir: "/auth"
+
+api-keys:
+  - "__CLIPROXY_API_KEY__"
+
+debug: false
+logging-to-file: false
+usage-statistics-enabled: false
+passthrough-headers: false
+
+routing:
+  strategy: "round-robin"
+  session-affinity: true
+  session-affinity-ttl: "1h"
+  session-affinity-subagents: true

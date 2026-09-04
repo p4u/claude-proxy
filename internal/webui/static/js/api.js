@@ -104,6 +104,17 @@ export const api = {
   // Interrogate a candidate custom host without storing anything.
   probeHost: (body) => request("POST", "/credentials/probe", body),
   addCustom: (body) => request("POST", "/credentials/custom", body),
+  codexAccounts: () => request("GET", "/codex/accounts"),
+  startCodexOAuth: () => request("POST", "/codex/oauth/start"),
+  codexOAuthStatus: (state) => request("GET", `/codex/oauth/status?state=${enc(state)}`),
+  submitCodexCallback: (state, redirectURL) =>
+    request("POST", "/codex/oauth/callback", { state, redirect_url: redirectURL }),
+  cancelCodexOAuth: (state) => request("POST", "/codex/oauth/cancel", { state }),
+  setCodexAccountDisabled: (name, authIndex, disabled) =>
+    request("POST", "/codex/accounts/status", { name, auth_index: authIndex || "", disabled: !!disabled }),
+  setCodexAccountWeight: (name, weight) =>
+    request("POST", "/codex/accounts/weight", { name, weight }),
+  deleteCodexAccount: (name) => request("POST", "/codex/accounts/delete", { name }),
   users: () => request("GET", "/users"),
 
   // Per-user capture mode. `full` true ⇒ store both sides of every conversation.

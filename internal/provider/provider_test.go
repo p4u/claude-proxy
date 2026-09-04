@@ -23,7 +23,8 @@ func TestForModel(t *testing.T) {
 		{"surrounding space", "  glm-4.7  ", GLM},
 		// Anything unclaimed falls to the default so unknown/future Claude IDs
 		// keep working without this table being updated.
-		{"unknown model", "gpt-5", Anthropic},
+		{"codex", "gpt-5", Codex},
+		{"unknown model", "future-model", Anthropic},
 		{"empty", "", Anthropic},
 	}
 	for _, tc := range tests {
@@ -48,7 +49,7 @@ func TestGetFallsBackToDefault(t *testing.T) {
 }
 
 func TestValid(t *testing.T) {
-	for _, id := range []ID{Anthropic, GLM} {
+	for _, id := range []ID{Anthropic, GLM, MiMo, Custom, Codex} {
 		if !Valid(id) {
 			t.Errorf("Valid(%q) = false, want true", id)
 		}
@@ -174,6 +175,29 @@ func TestMiMoRouting(t *testing.T) {
 	}
 	if len(p.StaticModels) == 0 {
 		t.Error("MiMo needs a static catalogue since it cannot be discovered")
+	}
+}
+
+func TestCodexRouting(t *testing.T) {
+	for _, tc := range []struct {
+		model string
+		want  ID
+	}{
+		{"gpt-5.6-codex", Codex},
+		{"claude-gpt-5.6-codex", Codex},
+		{"claude-gpt-5.6-codex[1m]", Codex},
+		{"GPT-5.6-CODEX", Codex},
+		{"claude-sonnet-5", Anthropic},
+	} {
+		if got := ForModel(tc.model); got != tc.want {
+			t.Errorf("ForModel(%q) = %q, want %q", tc.model, got, tc.want)
+		}
+	}
+	if got := AdvertisedID("gpt-5.6-codex", Codex); got != "claude-gpt-5.6-codex" {
+		t.Errorf("AdvertisedID = %q", got)
+	}
+	if got := WireModel("claude-gpt-5.6-codex"); got != "gpt-5.6-codex" {
+		t.Errorf("WireModel = %q", got)
 	}
 }
 

@@ -39,7 +39,7 @@ help: ## Show this help.
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) }' $(MAKEFILE_LIST)
 
 env: ## Create or upgrade .env: sync UID/GID to host shell, add missing auth token.
-	@mkdir -p data creds data/letsencrypt
+	@mkdir -p data creds data/letsencrypt data/cliproxy-auth
 	@if [ ! -f $(ENV_FILE) ]; then cp .env.example $(ENV_FILE); echo "wrote fresh $(ENV_FILE)"; fi
 	@HOST_UID=$$(id -u); HOST_GID=$$(id -g); \
 	 if grep -q '^PROXY_UID=' $(ENV_FILE); then \
@@ -67,6 +67,17 @@ env: ## Create or upgrade .env: sync UID/GID to host shell, add missing auth tok
 		fi; \
 		echo "added UI_PASSWORD to $(ENV_FILE)"; \
 	fi
+	@for NAME in CLIPROXY_API_KEY CLIPROXY_MANAGEMENT_KEY; do \
+		if ! grep -q "^$$NAME=..*" $(ENV_FILE); then \
+			VALUE=$$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | xxd -p -c 256); \
+			if grep -q "^$$NAME=" $(ENV_FILE); then \
+				sed -i.bak "s|^$$NAME=.*|$$NAME=$$VALUE|" $(ENV_FILE) && rm -f $(ENV_FILE).bak; \
+			else \
+				echo "$$NAME=$$VALUE" >> $(ENV_FILE); \
+			fi; \
+			echo "added $$NAME to $(ENV_FILE)"; \
+		fi; \
+	done
 
 token: ## Print the configured PROXY_AUTH_TOKEN (for setting ANTHROPIC_AUTH_TOKEN on clients).
 	@if [ ! -f $(ENV_FILE) ]; then echo "no $(ENV_FILE) yet — run 'make env'" >&2; exit 1; fi
