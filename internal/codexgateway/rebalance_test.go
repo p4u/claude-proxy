@@ -54,6 +54,37 @@ func TestParseCodexQuotaMapsByWindowMinutes(t *testing.T) {
 	}
 }
 
+// Live shape from CLIProxyAPI v7.2.149: the top-level quota block is
+// `{"signals":{}}` and the real headers sit under model_quotas keyed by model.
+func TestLatestQuotaFallsBackToNewestModelBlock(t *testing.T) {
+	file := rawAccount{
+		RawQuota: rawQuotaBlob{Signals: map[string]string{}},
+		ModelQuotas: map[string]rawQuotaBlob{
+			"gpt-5.6-luna": {
+				ObservedAt: "2026-09-05T04:31:21.399327709+08:00",
+				Signals:    map[string]string{"X-Codex-Primary-Used-Percent": "7", "X-Codex-Primary-Window-Minutes": "10080"},
+			},
+			"gpt-5.3-codex": {
+				ObservedAt: "2026-09-05T02:00:00+08:00",
+				Signals:    map[string]string{"X-Codex-Primary-Used-Percent": "3", "X-Codex-Primary-Window-Minutes": "10080"},
+			},
+			"stale": {ObservedAt: "2026-09-06T00:00:00Z"},
+		},
+	}
+	q := parseCodexQuota(latestQuota(file))
+	if !q.HasSignals || q.SevenDayPct != 7 {
+		t.Fatalf("expected newest model block (7%%), got %+v", q)
+	}
+	if none := latestQuota(rawAccount{}); none.Signals != nil {
+		t.Fatalf("no blocks → empty, got %+v", none)
+	}
+	// Top-level wins when present.
+	file.RawQuota.Signals = map[string]string{"X-Codex-Primary-Used-Percent": "42", "X-Codex-Primary-Window-Minutes": "10080"}
+	if q := parseCodexQuota(latestQuota(file)); q.SevenDayPct != 42 {
+		t.Fatalf("top-level quota must take precedence, got %+v", q)
+	}
+}
+
 func TestEffectiveWeightsScalesByScore(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	accounts := []Account{

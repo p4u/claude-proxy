@@ -22,8 +22,11 @@ type usageWindow struct {
 // credential so the UI can explain why traffic is (or isn't) routed to it. The
 // score/room math is shared with internal/pool so the two can never drift.
 type selectionView struct {
-	Room5h    float64 `json:"room_5h"`
-	Room7d    float64 `json:"room_7d"`
+	Room5h float64 `json:"room_5h"`
+	Room7d float64 `json:"room_7d"`
+	// Urgency is the 7-day use-it-or-lose-it term (pool.Urgency); Score
+	// already includes it, so score = weight × room_5h × room_7d^1.5 × (1+urgency).
+	Urgency   float64 `json:"urgency"`
 	Score     float64 `json:"score"`
 	SharePct  float64 `json:"share_pct"`
 	Saturated bool    `json:"saturated"`
@@ -120,6 +123,7 @@ func (s *Server) handleUsageCurrent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	now := time.Now()
 	out := make([]usageCurrent, 0, len(list))
 	for _, c := range list {
 		// The synthetic gateway_codex row represents N Codex accounts, not
@@ -166,23 +170,24 @@ func (s *Server) handleUsageCurrent(w http.ResponseWriter, r *http.Request) {
 				SevenDay: metered7d[c.ID],
 			}
 		}
-		// Selection scoring mirrors the pool exactly. With no snapshot the pcts
-		// are 0 → rooms 1 → score = weight (the pool's bootstrap headroom).
+		// Selection scoring mirrors the pool exactly, urgency included. With
+		// no snapshot the pcts are 0 and the reset unknown → rooms 1,
+		// urgency 0 → score = weight (the pool's bootstrap headroom).
 		uc.Selection = selectionView{
 			Room5h:    pool.Room(uc.FiveHour.Pct),
 			Room7d:    pool.Room(uc.SevenDay.Pct),
-			Score:     pool.Score(c.Weight, uc.FiveHour.Pct, uc.SevenDay.Pct),
+			Urgency:   pool.Urgency(uc.SevenDay.Pct, sdReset.Int64, now),
+			Score:     pool.EffectiveScore(c.Weight, uc.FiveHour.Pct, uc.SevenDay.Pct, sdReset.Int64, now),
 			Saturated: pool.Saturated(uc.FiveHour.Pct, uc.SevenDay.Pct),
 		}
 		out = append(out, uc)
 	}
 
 	// Codex accounts live in the sidecar, not usage_history. One row per
-	// account, with quota lifted from quota.signals and score computed
-	// through the same formula RebalanceLoop uses.
+	// account, with quota lifted from the sidecar's X-Codex-* signals and
+	// score computed through the same formula RebalanceLoop uses.
 	if s.codex != nil {
 		if accounts, err := s.codex.Accounts(ctx); err == nil {
-			now := time.Now()
 			base, _ := codexgateway.BaseWeightsMap(ctx, s.db)
 			for _, a := range accounts {
 				status := "active"
@@ -208,9 +213,14 @@ func (s *Server) handleUsageCurrent(w http.ResponseWriter, r *http.Request) {
 					Label:            label,
 					SubscriptionType: a.AccountType,
 					Provider:         string(provider.Codex),
-					HasUsageAPI:      a.Quota.HasSignals,
-					Status:           status,
-					Weight:           int(bw),
+					// Codex accounts do publish utilization (the sidecar
+					// records OpenAI's X-Codex-* headers), so they render
+					// as meters like Anthropic. Before the first request
+					// there is simply no snapshot yet — same as a freshly
+					// imported Anthropic credential — not "no usage API".
+					HasUsageAPI: true,
+					Status:      status,
+					Weight:      int(bw),
 				}
 				if a.Quota.HasSignals {
 					uc.FiveHour.Pct = a.Quota.FiveHourPct
@@ -229,6 +239,7 @@ func (s *Server) handleUsageCurrent(w http.ResponseWriter, r *http.Request) {
 				uc.Selection = selectionView{
 					Room5h:    pool.Room(uc.FiveHour.Pct),
 					Room7d:    pool.Room(uc.SevenDay.Pct),
+					Urgency:   pool.Urgency(a.Quota.SevenDayPct, a.Quota.SevenDayResets, now),
 					Score:     codexgateway.AccountScore(int(bw), a.Quota, now),
 					Saturated: pool.Saturated(uc.FiveHour.Pct, uc.SevenDay.Pct),
 				}

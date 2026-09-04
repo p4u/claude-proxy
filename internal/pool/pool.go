@@ -377,70 +377,71 @@ func Saturated(fhPct, sdPct float64) bool {
 }
 
 // Window lengths for the two Anthropic quota windows the poller tracks. Used
-// by BurnBoost to translate a resets_at instant into "elapsed fraction of the
-// window", so pace can be compared to actual utilization.
+// by Urgency to translate a resets_at instant into "remaining fraction of the
+// window".
 const (
 	FiveHourWindow = 5 * time.Hour
 	SevenDayWindow = 7 * 24 * time.Hour
 )
 
-// BurnCoef caps how much the burn boost can multiply a credential's score.
-// score *= 1 + BurnCoef*boost, and boost ∈ [0, 1]. Coef 2 → up to 3× score
-// for a credential fully "behind pace" (e.g. 0% used with the window nearly
-// over — leftover quota that would otherwise reset unspent).
-const BurnCoef = 2.0
+// minRemainingFraction floors the remaining share of the 7-day window when
+// computing Urgency, so the term stays finite as a reset approaches. One hour
+// of a week: an unspent window in its final hour gets at most ~167× the score
+// of one that is exactly on pace.
+const minRemainingFraction = 1.0 / (7 * 24)
 
-// BurnBoost returns the "behind pace" boost for one credential's latest
-// snapshot, in [0, 1]. Zero means "on or ahead of ideal pace" (or unknown
-// reset time); one means "the entire quota is unspent and the window is
-// about to reset".
+// Urgency is the 7-day "use it or lose it" term of the selection score:
 //
-// Ideal pace assumes linear consumption over each window: at fraction f of
-// the window elapsed, ideal utilization is f. If actual utilization is
-// below that, the difference is the per-window boost — quota we're at risk
-// of leaving on the table when the window resets. We take the max across
-// the two windows so a credential that is way behind on either one gets
-// pulled up; averaging would let a fresh 7-day window mask an about-to-
-// -reset 5-hour one.
+//	urgency = max(0, room_7d / remaining_fraction_7d − 1)
 //
-// Callers pass now separately so tests are deterministic and so the same
-// snapshot yields the same boost inside a single scoring pass.
-func BurnBoost(fhPct, sdPct float64, fhResetsUnix, sdResetsUnix int64, now time.Time) float64 {
-	fh := windowBoost(fhPct, fhResetsUnix, FiveHourWindow, now)
-	sd := windowBoost(sdPct, sdResetsUnix, SevenDayWindow, now)
-	return math.Max(fh, sd)
+// room_7d / remaining_fraction is the burn rate (in "whole windows per
+// window") needed to consume the remaining weekly allowance before it resets;
+// 1 is the even-pace baseline. So a credential that is on or ahead of pace
+// contributes 0, and one that is behind grows hyperbolically as the reset
+// nears: 0% used with 1h45m left is ~95, 0% used with 2.5 days left is
+// ~1.8. That ordering is the point — quota in a window about to reset is
+// free to spend, whereas a window with days left will still be there
+// tomorrow.
+//
+// Only the 7-day window counts. Spending inside an about-to-reset 5-hour
+// window still charges the weekly allowance, so it is not "free"; the 5-hour
+// window is a ceiling (handled by room_5h) rather than an expiring budget.
+//
+// Zero when the reset time is unknown or in the past (the poller has not
+// refreshed since the window rolled over, so the snapshot describes the
+// previous window). Callers pass now separately so tests are deterministic
+// and one scoring pass sees one clock.
+func Urgency(sdPct float64, sdResetsUnix int64, now time.Time) float64 {
+	if sdResetsUnix <= 0 {
+		return 0
+	}
+	remaining := time.Unix(sdResetsUnix, 0).Sub(now)
+	if remaining <= 0 || remaining >= SevenDayWindow {
+		return 0
+	}
+	f := math.Max(float64(remaining)/float64(SevenDayWindow), minRemainingFraction)
+	return math.Max(0, Room(sdPct)/f-1)
 }
 
-func windowBoost(pct float64, resetsUnix int64, window time.Duration, now time.Time) float64 {
-	if resetsUnix <= 0 {
-		return 0
-	}
-	remaining := time.Unix(resetsUnix, 0).Sub(now)
-	// resets_at in the past: the poller hasn't refreshed since the window
-	// rolled over. The snapshot is telling us about the *previous* window,
-	// so we can't reason about "pace" for the current one — no boost.
-	if remaining <= 0 || remaining >= window {
-		return 0
-	}
-	elapsed := window - remaining
-	ideal := float64(elapsed) / float64(window)
-	actual := pct / 100
-	if actual < 0 {
-		actual = 0
-	}
-	if actual > 1 {
-		actual = 1
-	}
-	return math.Max(0, ideal-actual)
+// EffectiveScore is what the picker actually weighs:
+//
+//	Score(weight, fh%, sd%) × (1 + Urgency(sd%, sd_resets_at, now))
+//
+// Shared by the pool, the web UI's selection view and the Codex rebalance
+// loop so no surface can show a different number from the one used to route.
+func EffectiveScore(weight int, fhPct, sdPct float64, sdResetsUnix int64, now time.Time) float64 {
+	return Score(weight, fhPct, sdPct) * (1 + Urgency(sdPct, sdResetsUnix, now))
 }
 
 // weightedRandPick computes a usage-aware effective score for each candidate
 // and returns one chosen by weighted-random selection.
 //
-// Score formula: weight × room_5h × room_7d^sevenDayExp   (room = 1 − util).
-// The two windows are independent ceilings, so their remaining room is
-// multiplied rather than averaged: saturation on either window drives the
-// score toward zero. See pickActiveLocked for the full rationale.
+// Score formula: weight × room_5h × room_7d^sevenDayExp × (1 + urgency),
+// room = 1 − util. The two windows are independent ceilings, so their
+// remaining room is multiplied rather than averaged: saturation on either
+// window drives the score toward zero. Urgency (see Urgency) favours weekly
+// windows about to reset with allowance unspent. See pickActiveLocked for
+// the full rationale.
 //
 // The most recent usage snapshot is used regardless of age. headroom=1.0 is
 // used only when no snapshot exists for a credential (newly imported).
@@ -463,14 +464,13 @@ func (p *Pool) weightedRandPick(ctx context.Context, tx *sql.Tx, candidates []we
 		s := scored{id: e.id, weight: e.weight, head: 1.0}
 
 		var capturedAt int64
-		var fhReset, sdReset sql.NullInt64
+		var sdReset sql.NullInt64
 		err := tx.QueryRowContext(ctx, `
-			SELECT five_hour_pct, seven_day_pct, captured_at,
-			       five_hour_resets_at, seven_day_resets_at
+			SELECT five_hour_pct, seven_day_pct, captured_at, seven_day_resets_at
 			FROM usage_history
 			WHERE credential_id=?
 			ORDER BY captured_at DESC LIMIT 1`, e.id).
-			Scan(&s.fhPct, &s.sdPct, &capturedAt, &fhReset, &sdReset)
+			Scan(&s.fhPct, &s.sdPct, &capturedAt, &sdReset)
 
 		if err == nil {
 			// Always use the most recent snapshot, regardless of age.
@@ -480,18 +480,15 @@ func (p *Pool) weightedRandPick(ctx context.Context, tx *sql.Tx, candidates []we
 			// Multiply the two windows' remaining room (independent ceilings)
 			// and penalise low 7d room harder via the exponent.
 			s.head = Room(s.fhPct) * math.Pow(Room(s.sdPct), SevenDayExp)
-			s.boost = BurnBoost(s.fhPct, s.sdPct, fhReset.Int64, sdReset.Int64, now)
+			s.boost = Urgency(s.sdPct, sdReset.Int64, now)
 		}
 		// err == sql.ErrNoRows → no snapshot yet; keep head=1.0, boost=0
-		// (bootstrap). Only credentials with a real snapshot can be "behind
-		// pace", so unmeasurable providers (GLM, MiMo, custom) never get a
-		// burn boost — they compete on weight alone within their provider.
+		// (bootstrap). Only credentials with a real snapshot carry a reset
+		// time, so unmeasurable providers (GLM, MiMo, custom) never get an
+		// urgency boost — they compete on weight alone within their provider.
 
-		// score = base × (1 + BurnCoef * behind_pace)
-		// Applied here — Score() stays the pure static formula so the web UI
-		// keeps showing the baseline; the burn multiplier is a runtime
-		// selection adjustment, not part of the credential's "capacity".
-		s.score = Score(e.weight, s.fhPct, s.sdPct) * (1 + BurnCoef*s.boost)
+		// Same formula the web UI and the Codex rebalance loop use.
+		s.score = EffectiveScore(e.weight, s.fhPct, s.sdPct, sdReset.Int64, now)
 		entries[i] = s
 
 		if e.weight > bestWeight {
@@ -519,7 +516,7 @@ func (p *Pool) weightedRandPick(ctx context.Context, tx *sql.Tx, candidates []we
 				"fh_pct", s.fhPct,
 				"7d_pct", s.sdPct,
 				"headroom", fmt.Sprintf("%.4f", s.head),
-				"burn_boost", fmt.Sprintf("%.4f", s.boost),
+				"urgency", fmt.Sprintf("%.4f", s.boost),
 				"score", fmt.Sprintf("%.4f", s.score),
 				"select_pct", fmt.Sprintf("%.1f", pct),
 			)

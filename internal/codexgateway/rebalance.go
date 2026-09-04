@@ -58,9 +58,7 @@ func parseFloatSignal(m map[string]string, k string) float64 {
 // AccountScore is the effective selection score for one Codex account, using
 // the same math the Anthropic pool uses per pick.
 func AccountScore(baseWeight int, q CodexQuota, now time.Time) float64 {
-	base := pool.Score(baseWeight, q.FiveHourPct, q.SevenDayPct)
-	boost := pool.BurnBoost(q.FiveHourPct, q.SevenDayPct, q.FiveHourResets, q.SevenDayResets, now)
-	return base * (1 + pool.BurnCoef*boost)
+	return pool.EffectiveScore(baseWeight, q.FiveHourPct, q.SevenDayPct, q.SevenDayResets, now)
 }
 
 // BaseWeight returns the operator-configured weight for a Codex account.

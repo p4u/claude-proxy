@@ -210,7 +210,8 @@ const DB = {
     const fives = [72, 41, 100, 18, 0, 0];
     const sevens = [58, 63, 92, 22, 0, 0];
     const sonnets = [44, 51, 78, 15, 0, 0];
-    // Score mirrors the pool: weight × room_5h × room_7d^1.5. Disabled creds and
+    // Score mirrors the pool: weight × room_5h × room_7d^1.5 × (1 + urgency),
+    // urgency = max(0, room_7d / remaining_fraction_7d − 1). Disabled creds and
     // saturated snapshots (≥100% on either window) are excluded from the share.
     const rows = CREDS.map((c, i) => {
       const five = fives[i], seven = sevens[i];
@@ -218,14 +219,16 @@ const DB = {
       const room7 = Math.max(0, 1 - seven / 100);
       const saturated = five >= 100 || seven >= 100;
       const active = c.status !== "disabled" && !saturated;
-      const score = active ? c.weight * room5 * Math.pow(room7, 1.5) : 0;
-      return { c, i, five, seven, sonnet: sonnets[i], room5, room7, saturated, score };
+      const remaining7d = (2 + i) / 7; // matches seven_day.resets_at below
+      const urgency = hasUsageAPI(c) ? Math.max(0, room7 / remaining7d - 1) : 0;
+      const score = active ? c.weight * room5 * Math.pow(room7, 1.5) * (1 + urgency) : 0;
+      return { c, i, five, seven, sonnet: sonnets[i], room5, room7, urgency, saturated, score };
     });
     // Share is totalled per provider, matching the backend: the pool filters by
     // provider before scoring, so a GLM key only competes with other GLM keys.
     const sums = {};
     for (const r of rows) sums[providerOf(r.c)] = (sums[providerOf(r.c)] || 0) + r.score;
-    const anthropicLike = rows.map(({ c, i, five, seven, sonnet, room5, room7, saturated, score }) => ({
+    const anthropicLike = rows.map(({ c, i, five, seven, sonnet, room5, room7, urgency, saturated, score }) => ({
       credential_id: c.id, label: c.label, subscription_type: c.type, status: c.status, weight: c.weight,
       provider: providerOf(c), has_usage_api: hasUsageAPI(c),
       five_hour: { pct: five, resets_at: now + (3600 * (1 + i)) },
@@ -239,13 +242,15 @@ const DB = {
                      cache_read_tokens: 52_000_000, cache_creation_tokens: 880_000 },
       },
       selection: {
-        room_5h: room5, room_7d: room7, score,
+        room_5h: room5, room_7d: room7, urgency, score,
         share_pct: score > 0 ? (score / (sums[providerOf(c)] || 1)) * 100 : 0,
         saturated,
       },
     }));
     // Codex accounts appear as siblings of Anthropic subs, with per-account
-    // quota lifted from quota.signals (5h/7d, resets_at, saturation).
+    // quota lifted from the sidecar's X-Codex-* signals (5h/7d, resets_at,
+    // saturation). They always render as meters; before the first request
+    // there is just no snapshot yet.
     const codexRows = CODEX_ACCOUNTS.map((a) => {
       const bw = a.base_weight ?? 1;
       const five = a.quota?.five_hour_pct ?? 0;
@@ -257,14 +262,14 @@ const DB = {
       return {
         credential_id: "codex:" + a.name, label: a.email || a.label || a.name,
         subscription_type: a.account_type || "subscription", provider: "codex",
-        has_usage_api: !!a.quota?.has_signals,
+        has_usage_api: true,
         status: a.disabled ? "disabled" : (a.unavailable ? "errored" : "active"),
         weight: bw,
-        five_hour: { pct: five, resets_at: now + 4 * 3600 },
-        seven_day: { pct: seven, resets_at: now + 6 * 86400 },
+        five_hour: { pct: five, resets_at: a.quota?.has_signals ? now + 4 * 3600 : null },
+        seven_day: { pct: seven, resets_at: a.quota?.has_signals ? now + 6 * 86400 : null },
         seven_day_sonnet: { pct: 0, resets_at: null },
         captured_at: a.quota?.has_signals ? now - 120 : null,
-        selection: { room_5h: room5, room_7d: room7, score, share_pct: score > 0 ? 100 : 0, saturated },
+        selection: { room_5h: room5, room_7d: room7, urgency: 0, score, share_pct: score > 0 ? 100 : 0, saturated },
       };
     });
     return [...anthropicLike, ...codexRows];

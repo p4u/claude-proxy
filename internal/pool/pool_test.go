@@ -469,41 +469,63 @@ func TestScoreSharedFormula(t *testing.T) {
 	}
 }
 
-func TestBurnBoostRules(t *testing.T) {
+func TestUrgencyRules(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
-	fhWindow := int64(FiveHourWindow / time.Second)
 	sdWindow := int64(SevenDayWindow / time.Second)
+	hour := int64(3600)
 
 	cases := []struct {
-		name               string
-		fhPct, sdPct       float64
-		fhResets, sdResets int64 // seconds from now, negative = past, 0 = unknown
-		wantMin, wantMax   float64
+		name             string
+		sdPct            float64
+		sdResets         int64 // seconds from now, negative = past, 0 = unknown
+		wantMin, wantMax float64
 	}{
-		{"no resets known", 50, 50, 0, 0, 0, 0},
-		{"resets in past", 10, 10, -10, -10, 0, 0},
-		{"start of 5h window, 0% used", 0, 0, fhWindow - 1, sdWindow - 1, 0, 0.01},
-		{"halfway 5h at 50%", 50, 0, fhWindow / 2, sdWindow - 1, 0, 0.01},
-		{"halfway 5h at 10% → 0.4 boost", 10, 0, fhWindow / 2, sdWindow - 1, 0.39, 0.41},
-		{"about to reset 5h at 0% → boost near 1", 0, 0, 60, sdWindow - 1, 0.99, 1.0},
-		{"about to reset 7d at 20% → 0.8 boost", 0, 20, fhWindow - 1, 60, 0.79, 0.81},
-		{"take max across windows", 20, 90, fhWindow / 2, 60, 0.29, 0.31},
+		{"no reset known", 50, 0, 0, 0},
+		{"reset in past", 10, -10, 0, 0},
+		{"fresh window, 0% used → on pace", 0, sdWindow - 1, 0, 0.01},
+		{"halfway at 50% → on pace", 50, sdWindow / 2, 0, 0.01},
+		{"halfway at 70% → ahead of pace", 70, sdWindow / 2, 0, 0},
+		{"halfway at 0% → 1.0", 0, sdWindow / 2, 0.99, 1.01},
+		{"2.5 days left at 0% → ~1.8", 0, 60 * hour, 1.75, 1.85},
+		{"1h45m left at 0% → ~95", 0, 105 * 60, 94, 96},
+		{"1h45m left at 50% → ~47", 50, 105 * 60, 46, 48},
+		{"floor: 1 minute left at 0% → capped at 167", 0, 60, 166, 168},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			fh := int64(0)
-			if c.fhResets != 0 {
-				fh = now.Unix() + c.fhResets
-			}
 			sd := int64(0)
 			if c.sdResets != 0 {
 				sd = now.Unix() + c.sdResets
 			}
-			got := BurnBoost(c.fhPct, c.sdPct, fh, sd, now)
+			got := Urgency(c.sdPct, sd, now)
 			if got < c.wantMin || got > c.wantMax {
-				t.Fatalf("BurnBoost=%.4f, want in [%.4f,%.4f]", got, c.wantMin, c.wantMax)
+				t.Fatalf("Urgency=%.4f, want in [%.4f,%.4f]", got, c.wantMin, c.wantMax)
 			}
 		})
+	}
+}
+
+// TestEffectiveScoreOrdersByReset pins the production scenario that motivated
+// Urgency: three max accounts with equal weight, one of which has an unspent
+// weekly window resetting in under two hours. It must take the clear majority
+// of new bindings; the plain Score gave it 41%, level with a fresh account
+// whose window had days left.
+func TestEffectiveScoreOrdersByReset(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	soon := now.Add(105 * time.Minute).Unix()
+	days := now.Add(60 * time.Hour).Unix()
+	far := now.Add(5 * 24 * time.Hour).Unix()
+
+	logins := EffectiveScore(20, 3, 0, soon, now)
+	tarat := EffectiveScore(20, 1, 0, days, now)
+	ops := EffectiveScore(20, 51, 11, far, now)
+	total := logins + tarat + ops
+	if share := logins / total; share < 0.9 {
+		t.Fatalf("about-to-reset credential share = %.2f, want ≥ 0.9 (logins=%.1f tarat=%.1f ops=%.1f)",
+			share, logins, tarat, ops)
+	}
+	if tarat <= ops {
+		t.Fatalf("fresher window must still outrank the used one: tarat=%.1f ops=%.1f", tarat, ops)
 	}
 }
 

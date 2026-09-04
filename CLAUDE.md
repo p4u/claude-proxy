@@ -320,11 +320,16 @@ other Codex accounts inside the sidecar; the proxy sees the gateway as one
 credential.
 
 **Per-Codex-account balancing reuses the Anthropic pool math.** The sidecar
-captures per-account quota (`quota.signals` — OpenAI response headers:
-primary/secondary used-percent, reset-at, window-minutes). A background loop
+captures per-account quota from OpenAI's `X-Codex-*` response headers
+(primary/secondary used-percent, reset-at, window-minutes). CLIProxyAPI
+≥ 7.2.149 records them under `model_quotas.<model>.signals` — one block per
+model that served a request — and leaves the top-level `quota.signals` empty,
+so `latestQuota` takes the top-level block when it has signals and otherwise
+the most recently observed per-model block (the account-level windows are the
+same in every model's block). A background loop
 (`codexgateway.RebalanceLoop`, every 90s) reads accounts, computes each
-effective score as `pool.Score(base_weight, fh%, sd%) * (1 + pool.BurnCoef *
-pool.BurnBoost(...))` — identical formula to `weightedRandPick` — normalizes
+effective score with `pool.EffectiveScore(base_weight, fh%, sd%,
+sd_resets_at, now)` — the same function `weightedRandPick` uses — normalizes
 to an integer in `[1, 1000]`, and pushes it via `SetWeight`. The sidecar's
 routing strategy must therefore be `weighted-round-robin`
 (`config/cliproxy.yaml.tmpl`); with `round-robin` the computed weights are
@@ -384,7 +389,9 @@ port 8317 is kept off the host network.
 
 ### Selection Algorithm (`internal/pool/pool.go`)
 
-`pickActiveLocked` → `weightedRandPick`: each candidate gets `score = weight × room_5h × room_7d^1.5`, where `room_X = max(0, 1 − utilization/100)`. The 5h and 7d windows are **independent ceilings** (a request 429s on whichever it hits first), so their remaining room is **multiplied**, not averaged — saturation on either window drives the score toward zero. The `^1.5` on the 7d term protects the slow-resetting weekly quota harder than the cheap 5h window (`sevenDayExp` constant). `seven_day_sonnet_pct` is intentionally ignored. The most recent `usage_history` snapshot is used regardless of age — stale data beats assuming 0% usage; `headroom=1.0` when no snapshot exists (newly imported creds).
+`pickActiveLocked` → `weightedRandPick`: each candidate gets `score = weight × room_5h × room_7d^1.5 × (1 + urgency)`, where `room_X = max(0, 1 − utilization/100)`. The 5h and 7d windows are **independent ceilings** (a request 429s on whichever it hits first), so their remaining room is **multiplied**, not averaged — saturation on either window drives the score toward zero. The `^1.5` on the 7d term protects the slow-resetting weekly quota harder than the cheap 5h window (`sevenDayExp` constant). `seven_day_sonnet_pct` is intentionally ignored. The most recent `usage_history` snapshot is used regardless of age — stale data beats assuming 0% usage; `headroom=1.0` when no snapshot exists (newly imported creds).
+
+**Urgency — use it or lose it** (`pool.Urgency`): `urgency = max(0, room_7d / remaining_fraction_7d − 1)`, i.e. how much faster than even pace the weekly allowance would have to be burned to be used up before it resets. On or ahead of pace → 0; 0% used with 2.5 days left → ~1.8 (×2.8); 0% used with 1h45m left → ~95 (×96). It is deliberately hyperbolic in time-to-reset: quota in a window about to reset is *free* to spend, while a window with days left will still be there tomorrow, so an about-to-reset unspent account should take nearly all new bindings. The remaining fraction is floored at one hour of the week so the term stays finite. **Only the 7-day window counts** — spending inside an about-to-reset 5-hour window still charges the weekly allowance, so it is not free; the 5h window is a ceiling (`room_5h`), not an expiring budget. Zero when the reset time is unknown or already past (the snapshot describes the previous window). `pool.EffectiveScore` bundles `Score × (1 + Urgency)` and is the **single function** used by `weightedRandPick`, the web UI's `/api/usage/current` selection view (which therefore shows the real routing share, not a baseline), and the Codex rebalance loop. An earlier version used a bounded "behind linear pace" boost capped at 3×; it gave a fresh account with days left nearly the same boost as one resetting within the hour, which is exactly the case that matters.
 
 **Hard saturation cutoff:** a credential whose latest snapshot reports either window at **≥100%** is excluded from the active candidate set *before* scoring (`NOT EXISTS` clause in the active query) — a maxed-out subscription is never selected, regardless of weight. If every active credential is saturated, the pool falls through to `limited` credentials (to obtain a real 429 + Retry-After), and returns `ErrNoCredentials` only if there are none.
 

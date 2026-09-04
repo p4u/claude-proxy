@@ -114,11 +114,37 @@ type rawAccount struct {
 	Type     string       `json:"type"`
 	Provider string       `json:"provider"`
 	RawQuota rawQuotaBlob `json:"quota"`
+	// ModelQuotas is where CLIProxyAPI ≥ 7.2.149 actually records the
+	// X-Codex-* headers: one block per model that served a request, keyed by
+	// model name. The top-level quota block is left empty on those builds.
+	ModelQuotas map[string]rawQuotaBlob `json:"model_quotas"`
 }
 
 type rawQuotaBlob struct {
 	ObservedAt string            `json:"observed_at"`
 	Signals    map[string]string `json:"signals"`
+}
+
+// latestQuota picks the quota block to score from: the top-level one when it
+// carries signals, otherwise the most recently observed per-model block. The
+// account-level windows (Primary/Secondary) are the same in every model's
+// block — only the model-specific extras differ — so the newest is the truest.
+func latestQuota(file rawAccount) rawQuotaBlob {
+	if len(file.RawQuota.Signals) > 0 {
+		return file.RawQuota
+	}
+	var best rawQuotaBlob
+	var bestAt time.Time
+	for _, q := range file.ModelQuotas {
+		if len(q.Signals) == 0 {
+			continue
+		}
+		at, _ := time.Parse(time.RFC3339Nano, q.ObservedAt)
+		if best.Signals == nil || at.After(bestAt) {
+			best, bestAt = q, at
+		}
+	}
+	return best
 }
 
 func (c *Client) Accounts(ctx context.Context) ([]Account, error) {
@@ -134,7 +160,7 @@ func (c *Client) Accounts(ctx context.Context) ([]Account, error) {
 			continue
 		}
 		acc := file.Account
-		acc.Quota = parseCodexQuota(file.RawQuota)
+		acc.Quota = parseCodexQuota(latestQuota(file))
 		accounts = append(accounts, acc)
 	}
 	return accounts, nil

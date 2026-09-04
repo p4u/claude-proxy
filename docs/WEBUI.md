@@ -225,9 +225,12 @@ queries must use the indexes on `request_log(ts)` / `usage_history(credential_id
   `{buckets:[ts...], requests:[...], errors:[...],
     tokens:{input:[...],output:[...],cache_read:[...],cache_creation:[...]}}`.
 - **`GET /api/usage/current`**: each entry gains
-  `"selection": {room_5h, room_7d, score, share_pct, saturated}` — score mirrors the
-  pool exactly (`weight × room_5h × room_7d^1.5`, sevenDayExp exported/shared from
-  internal/pool), `share_pct` = score/Σscore×100 across active credentials,
+  `"selection": {room_5h, room_7d, urgency, score, share_pct, saturated}` — score
+  mirrors the pool exactly (`pool.EffectiveScore` = `weight × room_5h × room_7d^1.5
+  × (1 + urgency)`, where `urgency = max(0, room_7d / remaining_fraction_7d − 1)`
+  favours weekly windows about to reset with allowance unspent; the same
+  function drives `weightedRandPick` and the Codex rebalance loop),
+  `share_pct` = score/Σscore×100 across active credentials of the same provider,
   `saturated` = latest snapshot ≥100% on either window (excluded from new bindings).
 - **`GET /api/stats/selection?period|from,to&buckets`** → how often each credential is
   picked for NEW conversations (from `conversations.created_at`):

@@ -785,6 +785,12 @@ func credsUsage(ctx context.Context, args []string) {
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	for _, c := range list {
+		// usage.Fetch is Anthropic's /api/oauth/usage; other providers have
+		// no usage API and would just answer 401 to a foreign token.
+		if !provider.Get(c.Provider).PollsUsage {
+			fmt.Printf("%s  %s  [%s]\n  (no usage API for provider %s)\n\n", c.ID, c.Label, string(c.Status), c.Provider)
+			continue
+		}
 		u, fetchErr := usage.Fetch(ctx, client, c.AccessToken)
 		fmt.Printf("%s  %s  [%s]\n", c.ID, c.Label, string(c.Status))
 		if fetchErr != nil {
