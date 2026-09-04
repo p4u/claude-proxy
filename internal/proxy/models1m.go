@@ -258,13 +258,14 @@ func (h *Handler) serveModels(w http.ResponseWriter, r *http.Request, start time
 	// transparently decompresses, so the buffered body is plain JSON.
 	r.Header.Del("Accept-Encoding")
 
-	// Anthropic's /v1/models requires anthropic-version; Claude Code always
-	// sends it, but plain curl/browser discovery calls don't, and without it
-	// the upstream 400s and the whole Anthropic catalogue is dropped from the
-	// merged list. Inject a safe default when missing.
-	if r.Header.Get("Anthropic-Version") == "" {
-		r.Header.Set("Anthropic-Version", "2023-06-01")
-	}
+	// The client's Anthropic-Version travels with every forward; on providers
+	// that translate to Anthropic (the CLIProxyAPI sidecar for Codex) its
+	// presence flips the response into an Anthropic-shaped, obfuscated
+	// catalogue that hides the real OpenAI model IDs. Strip it here and
+	// re-inject only for the Anthropic provider itself (which does need it,
+	// or upstream 400s and its catalogue drops out of the merged list).
+	originalVersion := r.Header.Get("Anthropic-Version")
+	r.Header.Del("Anthropic-Version")
 
 	var (
 		merged    []map[string]any
@@ -311,6 +312,16 @@ func (h *Handler) serveModels(w http.ResponseWriter, r *http.Request, start time
 			h.log.Info("models static catalogue",
 				"provider", string(p.ID), "cred", cred.ID, "models", len(entries))
 			continue
+		}
+
+		if p.ID == provider.Anthropic {
+			v := originalVersion
+			if v == "" {
+				v = "2023-06-01"
+			}
+			r.Header.Set("Anthropic-Version", v)
+		} else {
+			r.Header.Del("Anthropic-Version")
 		}
 
 		rec := newBufferedRW()
