@@ -98,7 +98,8 @@ function codexCredentialRows(data) {
     provider: "codex",
     subscription_type: account.account_type || "subscription",
     status: account.disabled ? "disabled" : (account.unavailable ? "errored" : (account.status || "active")),
-    weight: account.weight ?? 1,
+    weight: account.base_weight ?? 1,
+    effective_weight: account.effective_weight ?? null,
     request_count: (account.success || 0) + (account.failed || 0),
     codex_account: account,
   }));
@@ -735,7 +736,7 @@ function codexCredRow(c, root) {
     button("Weight", {
       onClick: () => weightModal(c.id, c.weight, root, {
         save: (weight) => api.setCodexAccountWeight(a.name, weight),
-        help: "Higher weight sends this account more new Codex conversations. It only competes with other OpenAI Codex accounts.",
+        help: "Operator bias — one input to the same usage/reset-aware selection formula used for Anthropic. The sidecar's effective weight is computed automatically from base × current quota and refreshed every 90s.",
       }),
     }),
     button(disabled ? "Enable" : "Disable", {
@@ -767,7 +768,13 @@ function codexCredRow(c, root) {
     el("td", { text: "Private sidecar", title: "OAuth tokens are stored by CLIProxyAPI" }),
     el("td", { text: c.subscription_type }),
     el("td", { title: a.status_message || "" }, statusBadge(c.status)),
-    el("td", { class: "num", text: String(c.weight) }),
+    el("td", {
+      class: "num",
+      text: c.effective_weight != null ? `${c.weight} → ${c.effective_weight}` : String(c.weight),
+      title: c.effective_weight != null
+        ? `Base weight ${c.weight} (operator) × usage/reset heuristic → ${c.effective_weight} pushed to sidecar. Refreshes every 90s.`
+        : "Operator base weight",
+    }),
     el("td", { class: "num", text: compactNum(c.request_count) }),
     el("td", { text: refreshed, title: "Last OAuth token refresh" }),
     el("td", { text: "Auto-refresh" }),

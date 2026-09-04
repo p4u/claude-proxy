@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Project Is
 
-`claude-proxy` is a sticky multi-subscription OAuth proxy for Claude Code. It sits between Claude Code clients and its upstream providers, managing multiple credentials with **usage-aware weighted-random selection** and stable per-conversation credential pinning. Built as a single static Go binary backed by SQLite.
+`claude-proxy` is a sticky multi-subscription credential proxy for Claude Code. It sits between Claude Code clients and its upstream providers, managing OAuth subscriptions, API keys, custom-host model declarations, and a sidecar-backed Codex gateway with **usage-aware weighted-random selection** and stable per-conversation credential pinning. The main service is a single static Go binary backed by SQLite; OpenAI Codex account OAuth is delegated to a private sidecar.
 
-It serves `/v1/*` as a transparent pass-through, swapping in a managed credential's `Authorization` header. This is what Claude Code clients connect to.
+It serves `/v1/*` as a transparent pass-through for Anthropic-compatible upstreams, swapping in a managed credential's `Authorization` header. Custom OpenAI-compatible hosts are translated at the boundary while clients still speak the Anthropic Messages API. This is what Claude Code clients connect to.
 
-Four upstreams are supported (`internal/provider`): **Anthropic** OAuth subscriptions, **Z.AI GLM** coding plans, **Xiaomi MiMo** token plans, and **any custom Anthropic-compatible host** (self-hosted vLLM/Ollama shims, gateways, …). The provider that serves a request is decided by the model the client asked for, so a user picks a GLM model in Claude Code's `/model` picker and it just works. See [Providers](#providers-multi-upstream).
+Six provider modes are supported (`internal/provider`): **Anthropic** OAuth subscriptions, **Z.AI GLM** coding plans, **Xiaomi MiMo** token plans, **OpenAI Codex** subscriptions through a private CLIProxyAPI sidecar, and dynamic **custom Anthropic** or **custom OpenAI-compatible** hosts. The provider that serves a request is decided by the model the client asked for, so a user picks a GLM, GPT, or custom-host model in Claude Code's `/model` picker and it just works. See [Providers](#providers-multi-upstream).
 
 ## Build & Test Commands
 
@@ -21,12 +21,19 @@ make lint           # gofmt + go vet + golangci-lint
 # Install golangci-lint v2 (CI version)
 make lint-install
 
+# Verify/build all Go packages without Docker
+go build ./...
+# Run locally in the foreground (Ctrl-C to stop)
+go run ./cmd/claude-proxy serve --addr 127.0.0.1:8787 --db ./data/proxy.db
+
 # Build Docker image from source
 make build
 
 # Pull latest published image
 make pull
 ```
+
+The module and Docker build use Go 1.26.2 (`go.mod` / `Dockerfile`).
 
 Running the proxy (Docker-based workflow):
 ```bash
@@ -72,7 +79,10 @@ Claude Code (ANTHROPIC_BASE_URL → proxy)
       → forward to the provider's base URL with swapped Authorization header
       → GET /v1/models: union of every provider that has a usable credential,
         Anthropic entries augmented with "[1m]" variants, cached 5min
-        (internal/proxy/models1m.go) for Claude Code gateway model discovery
+        (internal/proxy/models1m.go) for Claude Code gateway model discovery;
+        it strips an incoming Anthropic-Version while querying providers and
+        reinjects it only for Anthropic, because the Codex sidecar's translated
+        catalogue becomes obfuscated when that header is forwarded
       → on 401: OAuth credential → refresher triggers token refresh → retry;
         API key → marked revoked immediately (nothing to refresh)
       → on 429: mark credential "limited", synthesize Retry-After if missing → pass 429 to client
@@ -98,6 +108,18 @@ nothing else tests for a provider by name.
 | `[1m]` variants | yes | no — 400s on the suffixed form | no — 400s on the suffixed form |
 | Advertised as | native ID | `claude-`-prefixed alias | `claude-`-prefixed alias |
 | Endpoints | one | global / cn | sgp / ams / cn / payg |
+
+The provider registry also contains these non-default modes:
+
+| Mode | Base URL / model source | Boundary behavior | Picker alias |
+|---|---|---|---|
+| OpenAI Codex | private CLIProxyAPI sidecar; accounts live there | sidecar translates the Anthropic request to OpenAI | `gpt-*` → `claude-gpt-*` |
+| Custom Anthropic | per-credential URL and model catalogue | Anthropic Messages pass-through | native ID → `claude-<id>` |
+| Custom OpenAI | per-credential URL and model catalogue | `internal/proxy/openai.go` translates Chat Completions | native ID → `claude-openai-<id>` |
+
+Codex uses the private sidecar described below; `custom` and `custom_openai` get
+their base URL and model catalogue from each credential rather than from the
+fixed registry defaults.
 
 **Endpoints are per credential, not per provider** (`credentials.base_url`,
 empty = the provider default). A MiMo Token Plan key is bound to one regional
@@ -281,6 +303,52 @@ Surfaces: `creds add-custom --url … [--model ID]…` for Anthropic hosts, and 
 web UI's two custom-host credential types (`POST /api/credentials/probe` then
 `/custom`).
 
+### OpenAI Codex subscriptions (`internal/codexgateway/`)
+
+Codex is a separate provider backed by a private, pinned CLIProxyAPI Docker
+sidecar. The sidecar owns the OpenAI OAuth files under `data/cliproxy-auth/`;
+the main database stores only one synthetic `gateway_codex` credential with the
+sidecar URL and internal API key. `codexgateway.ReconcileCredential` creates or
+disables that row at startup, so the existing proxy authentication, sticky
+bindings, request logs, usage parsing, and per-user limits remain in the main
+request path without copying Codex tokens into `proxy.db` or the browser.
+
+`gpt-*` models route to the Codex provider and are advertised as
+`claude-gpt-*` so Claude Code's gateway model filter accepts them. The alias is
+removed before the request reaches CLIProxyAPI. Codex weights compete only with
+other Codex accounts inside the sidecar; the proxy sees the gateway as one
+credential.
+
+**Per-Codex-account balancing reuses the Anthropic pool math.** The sidecar
+captures per-account quota (`quota.signals` — OpenAI response headers:
+primary/secondary used-percent, reset-at, window-minutes). A background loop
+(`codexgateway.RebalanceLoop`, every 90s) reads accounts, computes each
+effective score as `pool.Score(base_weight, fh%, sd%) * (1 + pool.BurnCoef *
+pool.BurnBoost(...))` — identical formula to `weightedRandPick` — normalizes
+to an integer in `[1, 1000]`, and pushes it via `SetWeight`. The sidecar's
+routing strategy must therefore be `weighted-round-robin`
+(`config/cliproxy.yaml.tmpl`); with `round-robin` the computed weights are
+ignored. Windows are picked by their published length (300 min → 5h, 10080
+min → 7d), not by primary/secondary name, because the mapping is
+plan-dependent (`prolite` puts the weekly window under `primary`).
+
+The operator's base weight lives in a new table `codex_account_weight(name PK,
+weight INT)` — not in the sidecar. The web UI's *Weight* input for Codex
+accounts writes only to that table (`SetBaseWeight`); the rebalance loop is
+the sole writer to the sidecar's weight field, so the previous tick's score
+can never become the next tick's input. `GET /api/codex/accounts` is
+decorated with `base_weight` (from DB) and `effective_weight` (what the loop
+will push next), so the browser view matches the sidecar's next state. `internal/codexgateway` exposes only the typed, sanitized management
+operations used by the web UI (start/poll/cancel OAuth, callback submission,
+list/disable/weight/delete accounts).
+
+The web UI starts a fresh sidecar-owned OAuth flow; it must not upload
+`~/.codex/auth.json`. The OAuth callback listener is bound to host loopback on
+`127.0.0.1:1455` because OpenAI's registered redirect is fixed to localhost.
+For a remote browser, forward that port over SSH or use the UI's manual
+loopback-callback handoff. `CLIPROXY_MANAGEMENT_KEY` is server-side only, and
+port 8317 is kept off the host network.
+
 ### Conversation Key Derivation (4-priority, `internal/router/`)
 
 1. `X-Router-Conversation-ID` header (explicit override)
@@ -296,6 +364,7 @@ web UI's two custom-host credential types (`POST /api/credentials/probe` then
 | `internal/tui/` | Interactive Bubble Tea management UI (credentials + users tabs) for `claude-proxy tui` |
 | `internal/webui/` | Embedded browser dashboard (`go:embed`), served at `/` when `CLAUDE_PROXY_UI_PASSWORD` is set (old `/ui` 308-redirects); cookie-authenticated JSON API under `/api` (contract: `docs/WEBUI.md`) |
 | `internal/provider/` | Per-upstream behaviour table (base URL, model prefixes, refreshability, usage API, `[1m]` support) |
+| `internal/codexgateway/` | Private CLIProxyAPI client, sanitized Codex OAuth/account management, and synthetic gateway-credential reconciliation |
 | `internal/proxy/` | Proxy-mode HTTP handler + `AuthMiddleware` (two-tier auth, request logging); `routing.go` maps model → provider |
 | `internal/pool/` | Usage-aware weighted-random selection + sticky conversation→credential binding |
 | `internal/creds/` | Credential model, status management, proactive/reactive token refresh |
@@ -326,8 +395,9 @@ web UI's two custom-host credential types (`POST /api/credentials/probe` then
 ### Storage Schema (SQLite)
 
 Eight tables (`internal/store/schema.go`): `credentials` (incl. `provider`:
-`anthropic` | `glm`, added via the swallow-duplicate `ALTER TABLE` mechanism —
-its `DEFAULT 'anthropic'` is what migrates existing rows, no backfill needed),
+`anthropic` | `glm` | `mimo` | `codex` | `custom` | `custom_openai`, added via
+the swallow-duplicate `ALTER TABLE` mechanism — its `DEFAULT 'anthropic'` is
+what migrates existing rows, no backfill needed),
 `conversations` (whose `id` is the provider-qualified sticky key), `rr_cursor` (legacy round-robin state), `user_tokens` (named bearer tokens, plus the per-user usage cap `limit_output_tokens` / `limit_window_seconds`, `0` = unlimited, and `block_suggestions` = suppress Claude Code's prompt-suggestion requests), `request_log` (one row per forwarded request, for per-user stats), `usage_history` (utilization snapshots driving selection), `prompt_log` (last user prompt per `POST /v1/messages`, `user_token_id` FK `ON DELETE SET NULL`; never stores responses, gated + retained by `CLAUDE_PROXY_PROMPT_RETENTION_DAYS`, captured in `internal/proxy/promptcapture.go` and pruned by its hourly janitor), `conversation_message` (opt-in whole-conversation capture: `UNIQUE(conv_id, seq)` where `seq` is the message's index in the request's `messages` array, so re-sent history is idempotent; same retention window and janitor as `prompt_log`). Deleting a credential cascades to `usage_history` (`ON DELETE CASCADE`); `conversations` bindings are cleared inside `creds.Delete`'s transaction, since older DBs created that FK without a cascade clause. `request_log` additionally carries per-request token usage columns (`model`, `input_tokens`, `output_tokens`, `cache_creation_tokens`, `cache_read_tokens`), added via the existing swallow-duplicate `ALTER TABLE` migration mechanism and populated by `internal/proxy/usagecapture.go` from the tee'd response stream (SSE and non-streaming JSON) — this feeds the web UI's token stats and never affects what the client receives. Core dependency: `modernc.org/sqlite` (pure Go, no CGO required); `guptarohit/asciigraph` for usage charts and `charmbracelet/bubbletea`+`lipgloss`+`bubbles` for the management TUI.
 
 ### Write contention (`internal/store/store.go`, `retry.go`)
@@ -369,7 +439,10 @@ busy timeout.
 
 ## Configuration
 
-All runtime config comes from `.env` (copy from `.env.example`). Key variables:
+The Docker/Compose workflow reads runtime configuration from `.env` (copy from
+`.env.example`; `make env` also generates missing auth and Codex keys). A direct
+`go run`/binary invocation reads flags and `CLAUDE_PROXY_*` environment variables
+instead; it does not load `.env` automatically. Key Compose variables:
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -382,7 +455,14 @@ All runtime config comes from `.env` (copy from `.env.example`). Key variables:
 | `UI_PASSWORD` | _(empty)_ | Web UI password (`CLAUDE_PROXY_UI_PASSWORD`); empty = UI disabled. UI is served at `/` (old `/ui/*` paths 308-redirect); API prefixes `/v1/`, `/admin/`, `/api/`, `/health` are reserved |
 | `MODELS_1M` | _(enabled)_ | Append `[1m]` model variants to `GET /v1/models` for Claude Code gateway model discovery (`CLAUDE_PROXY_MODELS_1M`); set `0` to disable |
 | `UI_SECURE_COOKIES` | _(empty)_ | Force `Secure` UI session cookies (`CLAUDE_PROXY_UI_SECURE_COOKIES`); auto-detected behind Traefik via `X-Forwarded-Proto` |
+| `PROMPT_RETENTION_DAYS` | `7` | Retain prompt/full-capture rows; `0` disables capture (`CLAUDE_PROXY_PROMPT_RETENTION_DAYS`) |
+| `CLIPROXY_API_KEY` | _(generated)_ | Private proxy-to-CLIProxyAPI API key; never sent to OpenAI |
+| `CLIPROXY_MANAGEMENT_KEY` | _(generated)_ | Server-side key for Codex OAuth/account management; never expose to browsers |
+| `CLIPROXY_IMAGE` | pinned digest in `.env.example` | CLIProxyAPI sidecar image; upgrade deliberately and rerun Codex translation/tool/streaming tests |
 | `TLS_DOMAIN` | _(empty)_ | Set (with `TLS_EMAIL`) to enable Traefik + Let's Encrypt |
+| `TLS_EMAIL` | _(empty)_ | Required contact address when `TLS_DOMAIN` is set |
+| `TLS_CASERVER` | Let's Encrypt production | Use the staging directory while diagnosing certificate issuance |
+| `TRAEFIK_LOG_LEVEL` | `INFO` | Traefik log level |
 | `CLAUDE_PROXY_IMAGE` | `ghcr.io/p4u/claude-proxy:latest` | Override to use local build |
 
 ## Credential Management
@@ -400,23 +480,26 @@ TUI keys — Credentials tab: `r` refresh token, `u` update token from a fresh l
 `.credentials.json` directly (multi-line; `ctrl+s` to import). Users tab: `c` create,
 `R` rotate token, `d` disable/enable, `x` delete. `tab` switches tabs, `q` quits.
 
-TUI keys also include `k` — add a static API key (GLM).
+TUI keys also include `k` — add a static API key (GLM or MiMo).
 
-### Adding a GLM (Z.AI) API key
+### Adding a GLM (Z.AI) or MiMo API key
 
 ```bash
 # Reads the key from stdin, which keeps it out of shell history and out of
 # `ps` output (where a --key flag would be visible to any local user).
 echo "$ZAI_KEY" | claude-proxy creds add-key --provider glm --label zai-main --plan pro
 make add-key PROVIDER=glm LABEL=zai-main            # prompts for the key
+make add-key PROVIDER=mimo LABEL=mimo-main ENDPOINT=sgp  # regional Token Plan key
 ```
 
-The key is verified with a live `GET /v1/models` before it is stored, mirroring
-the liveness check `ingest.insertVerified` applies to OAuth imports: a credential
-that cannot authenticate must never enter the pool, because the selector would
-then hand live conversations to it. Duplicates are rejected by access token
-(`creds.HasAccessToken`) — `HasRefreshToken` cannot work here, since every API-key
-row stores an empty refresh token and would collide with every other.
+The key is verified with a live `POST /v1/messages` using `max_tokens:1` before
+it is stored. `GET /v1/models` is not an authentication check: some providers
+return 200 for a garbage bearer token, and MiMo does not expose that endpoint at
+all. A credential that cannot authenticate must never enter the pool, because the
+selector would then hand live conversations to it. Duplicates are rejected by
+access token (`creds.HasAccessToken`) — `HasRefreshToken` cannot work here, since
+every API-key row stores an empty refresh token and would collide with every
+other.
 
 Key credentials store `expires_at` ~100 years out: the column is `NOT NULL` and
 the refresher compares against it, so a date the refresh window can never reach
@@ -428,8 +511,9 @@ as "never" rather than a date in 2126.
 make import FROM=path/to/.credentials.json LABEL=myaccount [WEIGHT=5]
 make update ID=cred_xxx FROM=path/to/new.credentials.json  # replace tokens from a fresh login
 make list                        # Show all credentials with status/counters
-make usage                       # Fetch live 5h/7d usage % from Anthropic for all creds
-make usage ID=cred_xxx           # Usage % for one credential
+make usage                       # Fetch live Anthropic 5h/7d usage for credentials
+                                # (non-Anthropic providers have no usage API)
+make usage ID=cred_xxx           # Fetch Anthropic usage for one credential
 make usage-history PERIOD=24h    # Chart stored usage history (optional ID=cred_xxx)
 make disable ID=...              # Exclude from selection
 make rm ID=...                   # Delete credential

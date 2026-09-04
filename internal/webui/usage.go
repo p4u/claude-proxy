@@ -7,6 +7,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/p4u/claude-proxy/internal/codexgateway"
 	"github.com/p4u/claude-proxy/internal/creds"
 	"github.com/p4u/claude-proxy/internal/pool"
 	"github.com/p4u/claude-proxy/internal/provider"
@@ -121,6 +122,12 @@ func (s *Server) handleUsageCurrent(w http.ResponseWriter, r *http.Request) {
 
 	out := make([]usageCurrent, 0, len(list))
 	for _, c := range list {
+		// The synthetic gateway_codex row represents N Codex accounts, not
+		// a subscription — real Codex rows are appended below with per-
+		// account quota surfaced by the sidecar.
+		if c.ID == codexgateway.GatewayCredentialID {
+			continue
+		}
 		uc := usageCurrent{
 			CredentialID:     c.ID,
 			Label:            c.Label,
@@ -168,6 +175,66 @@ func (s *Server) handleUsageCurrent(w http.ResponseWriter, r *http.Request) {
 			Saturated: pool.Saturated(uc.FiveHour.Pct, uc.SevenDay.Pct),
 		}
 		out = append(out, uc)
+	}
+
+	// Codex accounts live in the sidecar, not usage_history. One row per
+	// account, with quota lifted from quota.signals and score computed
+	// through the same formula RebalanceLoop uses.
+	if s.codex != nil {
+		if accounts, err := s.codex.Accounts(ctx); err == nil {
+			now := time.Now()
+			base, _ := codexgateway.BaseWeightsMap(ctx, s.db)
+			for _, a := range accounts {
+				status := "active"
+				switch {
+				case a.Disabled:
+					status = "disabled"
+				case a.Unavailable:
+					status = "errored"
+				}
+				bw := base[a.Name]
+				if bw < 1 {
+					bw = 1
+				}
+				label := a.Email
+				if label == "" {
+					label = a.Label
+				}
+				if label == "" {
+					label = a.Name
+				}
+				uc := usageCurrent{
+					CredentialID:     "codex:" + a.Name,
+					Label:            label,
+					SubscriptionType: a.AccountType,
+					Provider:         string(provider.Codex),
+					HasUsageAPI:      a.Quota.HasSignals,
+					Status:           status,
+					Weight:           int(bw),
+				}
+				if a.Quota.HasSignals {
+					uc.FiveHour.Pct = a.Quota.FiveHourPct
+					uc.SevenDay.Pct = a.Quota.SevenDayPct
+					if a.Quota.FiveHourResets > 0 {
+						uc.FiveHour.ResetsAt = rfc3339Ptr(sql.NullInt64{Int64: a.Quota.FiveHourResets, Valid: true})
+					}
+					if a.Quota.SevenDayResets > 0 {
+						uc.SevenDay.ResetsAt = rfc3339Ptr(sql.NullInt64{Int64: a.Quota.SevenDayResets, Valid: true})
+					}
+					if a.Quota.ObservedAtUnix > 0 {
+						ca := time.Unix(a.Quota.ObservedAtUnix, 0).UTC().Format(time.RFC3339)
+						uc.CapturedAt = &ca
+					}
+				}
+				uc.Selection = selectionView{
+					Room5h:    pool.Room(uc.FiveHour.Pct),
+					Room7d:    pool.Room(uc.SevenDay.Pct),
+					Score:     codexgateway.AccountScore(int(bw), a.Quota, now),
+					Saturated: pool.Saturated(uc.FiveHour.Pct, uc.SevenDay.Pct),
+				}
+				out = append(out, uc)
+			}
+		}
 	}
 
 	// share_pct = score / Σscore × 100 across ACTIVE credentials (the pool's
@@ -247,6 +314,14 @@ func (s *Server) handleUsageHistory(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		// Quantize captured_at to 60s so credentials polled in the same
+		// cycle share a bucket. The poller iterates sequentially, so each
+		// row's captured_at is Now().Unix() at write time — a few seconds
+		// of stagger otherwise gave each cred its own bucket in the union
+		// and every other cred a null at that column.
+		for i := range points {
+			points[i].TS = (points[i].TS / 60) * 60
+		}
 		perCred[c.ID] = points
 		order = append(order, c.ID)
 		labels[c.ID] = c.Label
@@ -287,9 +362,32 @@ func (s *Server) handleUsageHistory(w http.ResponseWriter, r *http.Request) {
 			g.SevenDayPct[i] = &sd
 			g.SevenDaySonnetPct[i] = &ss
 		}
+		// Forward-fill gaps: utilization is stateful, so the last observed
+		// value is the correct estimate until the next snapshot. Leading
+		// nulls (before the first snapshot) stay null — a newly-added
+		// credential must not appear to have existed retroactively.
+		forwardFill(g.FiveHourPct)
+		forwardFill(g.SevenDayPct)
+		forwardFill(g.SevenDaySonnetPct)
 		out = append(out, g)
 	}
 	writeJSON(w, map[string]any{"buckets": buckets, "series": out})
+}
+
+// forwardFill replaces nulls following an observation with the last observed
+// value. Leading nulls are left alone (see call site for rationale).
+func forwardFill(arr []*float64) {
+	var last *float64
+	for i := range arr {
+		if arr[i] != nil {
+			last = arr[i]
+			continue
+		}
+		if last != nil {
+			v := *last
+			arr[i] = &v
+		}
+	}
 }
 
 // downsample reduces ts to at most maxN evenly-spaced entries, always keeping

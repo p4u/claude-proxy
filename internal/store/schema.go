@@ -131,4 +131,9 @@ CREATE TABLE IF NOT EXISTS usage_history (
 );
 CREATE INDEX IF NOT EXISTS idx_usage_history_cred_time
   ON usage_history(credential_id, captured_at);
+
+CREATE TABLE IF NOT EXISTS codex_account_weight (
+  name    TEXT PRIMARY KEY,
+  weight  INTEGER NOT NULL DEFAULT 1
+);
 `

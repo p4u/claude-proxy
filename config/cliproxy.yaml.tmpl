@@ -24,7 +24,9 @@ usage-statistics-enabled: false
 passthrough-headers: false
 
 routing:
-  strategy: "round-robin"
+  # weighted-round-robin honors the per-account weight the claude-proxy
+  # rebalance loop pushes; see internal/codexgateway/rebalance.go.
+  strategy: "weighted-round-robin"
   session-affinity: true
   session-affinity-ttl: "1h"
   session-affinity-subagents: true

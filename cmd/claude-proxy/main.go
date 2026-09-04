@@ -214,6 +214,7 @@ func runServe(args []string) {
 	}
 	if codexClient != nil {
 		logger.Info("OpenAI Codex gateway enabled", "base_url", codexClient.BaseURL())
+		go codexgateway.RebalanceLoop(ctx, db, codexClient, logger, 90*time.Second)
 	}
 
 	p := pool.NewWithLogger(db, logger)

@@ -84,13 +84,41 @@ type Account struct {
 	Success       int64  `json:"success"`
 	Failed        int64  `json:"failed"`
 	LastRefresh   string `json:"last_refresh,omitempty"`
-	Weight        *int64 `json:"weight,omitempty"`
+	// Weight is the effective selection weight held by the sidecar. The
+	// operator's base weight lives in claude-proxy's DB; RebalanceLoop is
+	// the only writer to this field.
+	Weight *int64     `json:"weight,omitempty"`
+	Quota  CodexQuota `json:"quota,omitempty"`
+	// BaseWeight and EffectiveWeight are populated by the web UI decoration
+	// pass. BaseWeight is the operator's input (stored in codex_account_weight);
+	// EffectiveWeight is what the rebalance loop will push to the sidecar next.
+	BaseWeight      int64 `json:"base_weight,omitempty"`
+	EffectiveWeight int64 `json:"effective_weight,omitempty"`
+}
+
+// CodexQuota is derived from a sidecar quota.signals block (OpenAI response
+// headers). Fields are zero-valued when the account has never handled a
+// request under the current session.
+type CodexQuota struct {
+	FiveHourPct    float64 `json:"five_hour_pct"`
+	FiveHourResets int64   `json:"five_hour_resets_at,omitempty"`
+	SevenDayPct    float64 `json:"seven_day_pct"`
+	SevenDayResets int64   `json:"seven_day_resets_at,omitempty"`
+	PlanType       string  `json:"plan_type,omitempty"`
+	ObservedAtUnix int64   `json:"observed_at,omitempty"`
+	HasSignals     bool    `json:"has_signals"`
 }
 
 type rawAccount struct {
 	Account
-	Type     string `json:"type"`
-	Provider string `json:"provider"`
+	Type     string       `json:"type"`
+	Provider string       `json:"provider"`
+	RawQuota rawQuotaBlob `json:"quota"`
+}
+
+type rawQuotaBlob struct {
+	ObservedAt string            `json:"observed_at"`
+	Signals    map[string]string `json:"signals"`
 }
 
 func (c *Client) Accounts(ctx context.Context) ([]Account, error) {
@@ -105,7 +133,9 @@ func (c *Client) Accounts(ctx context.Context) ([]Account, error) {
 		if !strings.EqualFold(file.Type, "codex") && !strings.EqualFold(file.Provider, "codex") {
 			continue
 		}
-		accounts = append(accounts, file.Account)
+		acc := file.Account
+		acc.Quota = parseCodexQuota(file.RawQuota)
+		accounts = append(accounts, acc)
 	}
 	return accounts, nil
 }

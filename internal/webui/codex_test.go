@@ -113,8 +113,15 @@ func TestCodexManagementAPI(t *testing.T) {
 		t.Fatalf("accounts = %d %s", accounts.Code, accounts.Body.String())
 	}
 	weight := do(t, h, http.MethodPost, "/api/codex/accounts/weight", `{"name":"owner.json","weight":7}`, cookie)
-	if weight.Code != http.StatusOK || !strings.Contains(weightBody, `"name":"owner.json"`) || !strings.Contains(weightBody, `"weight":7`) {
+	if weight.Code != http.StatusOK {
 		t.Fatalf("weight = %d %s; upstream=%s", weight.Code, weight.Body.String(), weightBody)
+	}
+	// Option A: /weight stores the operator's base weight in our DB; the
+	// rebalance loop is the only writer to the sidecar's weight field.
+	// Verify round-trip via /accounts.
+	afterWeight := do(t, h, http.MethodGet, "/api/codex/accounts", "", cookie)
+	if !strings.Contains(afterWeight.Body.String(), `"base_weight":7`) {
+		t.Fatalf("base weight not persisted: %s", afterWeight.Body.String())
 	}
 	invalidWeight := do(t, h, http.MethodPost, "/api/codex/accounts/weight", `{"name":"owner.json","weight":0}`, cookie)
 	if invalidWeight.Code != http.StatusBadRequest {

@@ -21,7 +21,9 @@ const CREDS = [
 const CODEX_ACCOUNTS = [
   { name: "codex-owner-pro-91c7.json", auth_index: "mock-codex-owner", email: "owner@example.com",
     account_type: "pro", status: "active", disabled: false, unavailable: false,
-    success: 418, failed: 3, weight: 5, last_refresh: new Date(Date.now() - 42 * 60 * 1000).toISOString() },
+    success: 418, failed: 3, weight: 733, base_weight: 5, effective_weight: 733,
+    quota: { five_hour_pct: 12, seven_day_pct: 3, plan_type: "pro", has_signals: true },
+    last_refresh: new Date(Date.now() - 42 * 60 * 1000).toISOString() },
 ];
 let codexOAuthPolls = 0;
 
@@ -223,14 +225,12 @@ const DB = {
     // provider before scoring, so a GLM key only competes with other GLM keys.
     const sums = {};
     for (const r of rows) sums[providerOf(r.c)] = (sums[providerOf(r.c)] || 0) + r.score;
-    return rows.map(({ c, i, five, seven, sonnet, room5, room7, saturated, score }) => ({
+    const anthropicLike = rows.map(({ c, i, five, seven, sonnet, room5, room7, saturated, score }) => ({
       credential_id: c.id, label: c.label, subscription_type: c.type, status: c.status, weight: c.weight,
       provider: providerOf(c), has_usage_api: hasUsageAPI(c),
       five_hour: { pct: five, resets_at: now + (3600 * (1 + i)) },
       seven_day: { pct: seven, resets_at: now + (86400 * (2 + i)) },
       seven_day_sonnet: { pct: sonnet, resets_at: now + (86400 * (2 + i)) },
-      // No usage API ⇒ no snapshot was ever recorded, but the proxy still
-      // meters what it forwarded.
       captured_at: hasUsageAPI(c) ? now - 300 - i * 90 : null,
       metered: hasUsageAPI(c) ? undefined : {
         five_hour: { requests: 412, input_tokens: 380_000, output_tokens: 96_000,
@@ -244,6 +244,30 @@ const DB = {
         saturated,
       },
     }));
+    // Codex accounts appear as siblings of Anthropic subs, with per-account
+    // quota lifted from quota.signals (5h/7d, resets_at, saturation).
+    const codexRows = CODEX_ACCOUNTS.map((a) => {
+      const bw = a.base_weight ?? 1;
+      const five = a.quota?.five_hour_pct ?? 0;
+      const seven = a.quota?.seven_day_pct ?? 0;
+      const room5 = Math.max(0, 1 - five / 100);
+      const room7 = Math.max(0, 1 - seven / 100);
+      const saturated = five >= 100 || seven >= 100;
+      const score = a.disabled || saturated ? 0 : bw * room5 * Math.pow(room7, 1.5);
+      return {
+        credential_id: "codex:" + a.name, label: a.email || a.label || a.name,
+        subscription_type: a.account_type || "subscription", provider: "codex",
+        has_usage_api: !!a.quota?.has_signals,
+        status: a.disabled ? "disabled" : (a.unavailable ? "errored" : "active"),
+        weight: bw,
+        five_hour: { pct: five, resets_at: now + 4 * 3600 },
+        seven_day: { pct: seven, resets_at: now + 6 * 86400 },
+        seven_day_sonnet: { pct: 0, resets_at: null },
+        captured_at: a.quota?.has_signals ? now - 120 : null,
+        selection: { room_5h: room5, room_7d: room7, score, share_pct: score > 0 ? 100 : 0, saturated },
+      };
+    });
+    return [...anthropicLike, ...codexRows];
   },
   "/usage/history": (q) => {
     // Aligned grid: shared buckets, one value per bucket per series, null gaps.
@@ -466,8 +490,8 @@ window.fetch = async (input, init = {}) => {
       if (!Number.isInteger(b.weight) || b.weight < 1 || b.weight > 1_000_000) {
         return json({ error: "weight must be between 1 and 1000000" }, 400);
       }
-      a.weight = b.weight;
-      return json({ ok: true, weight: a.weight });
+      a.base_weight = b.weight;
+      return json({ ok: true, weight: a.base_weight });
     }
     if (path === "/codex/accounts/delete") {
       const b = JSON.parse(init.body || "{}");

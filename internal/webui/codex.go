@@ -1,11 +1,14 @@
 package webui
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/p4u/claude-proxy/internal/codexgateway"
 )
 
 const codexOAuthStartInterval = 3 * time.Second
@@ -27,6 +30,7 @@ func (s *Server) handleCodex(w http.ResponseWriter, r *http.Request, rest string
 			writeErr(w, http.StatusBadGateway, err.Error())
 			return
 		}
+		s.decorateCodexAccounts(r.Context(), accounts)
 		writeJSON(w, map[string]any{"configured": true, "accounts": accounts})
 	case rest == "/oauth/start" && r.Method == http.MethodPost:
 		s.startCodexOAuth(w, r)
@@ -89,15 +93,39 @@ func (s *Server) setCodexAccountWeight(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if *body.Weight < 1 || *body.Weight > 1_000_000 {
-		writeErr(w, http.StatusBadRequest, "weight must be between 1 and 1000000")
+	// Store the operator's base weight in our DB; the rebalance loop is the
+	// only writer to the sidecar's effective weight, computed from base ×
+	// pool heuristics. See internal/codexgateway/rebalance.go.
+	if err := codexgateway.SetBaseWeight(r.Context(), s.db, strings.TrimSpace(body.Name), *body.Weight); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.codex.SetWeight(r.Context(), strings.TrimSpace(body.Name), *body.Weight); err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
-		return
-	}
+	// Kick a single rebalance so the sidecar reflects the change before the
+	// next scheduled tick.
+	go func() {
+		_ = codexgateway.RebalanceOnce(r.Context(), s.db, s.codex, nil, time.Now())
+	}()
 	writeJSON(w, map[string]any{"ok": true, "weight": *body.Weight})
+}
+
+// decorateCodexAccounts attaches per-account base_weight (from our DB) and
+// effective_weight (what the rebalance loop will push next) so the UI shows
+// the same score the sidecar will see. Errors are silent — the raw account
+// data is still useful.
+func (s *Server) decorateCodexAccounts(ctx context.Context, accounts []codexgateway.Account) {
+	base, err := codexgateway.BaseWeightsMap(ctx, s.db)
+	if err != nil {
+		return
+	}
+	eff := codexgateway.EffectiveWeights(accounts, base, time.Now())
+	for i := range accounts {
+		w := base[accounts[i].Name]
+		if w < 1 {
+			w = 1
+		}
+		accounts[i].BaseWeight = w
+		accounts[i].EffectiveWeight = eff[accounts[i].Name]
+	}
 }
 
 func (s *Server) startCodexOAuth(w http.ResponseWriter, r *http.Request) {
