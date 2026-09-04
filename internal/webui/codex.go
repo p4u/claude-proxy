@@ -101,9 +101,14 @@ func (s *Server) setCodexAccountWeight(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Kick a single rebalance so the sidecar reflects the change before the
-	// next scheduled tick.
+	// next scheduled tick. Detached from the request context: that one is
+	// cancelled as soon as this handler returns, which would abort the push
+	// and silently leave the sidecar on its old weights until the loop's
+	// next 90s pass.
 	go func() {
-		_ = codexgateway.RebalanceOnce(r.Context(), s.db, s.codex, nil, time.Now())
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_ = codexgateway.RebalanceOnce(ctx, s.db, s.codex, nil, time.Now())
 	}()
 	writeJSON(w, map[string]any{"ok": true, "weight": *body.Weight})
 }
