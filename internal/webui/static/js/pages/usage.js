@@ -101,16 +101,34 @@ function subCard(r) {
     // against, and inventing one would read as authoritative when it is not.
     noUsageAPI
       ? meteredRows(r.metered)
-      : el("div", { class: "sub-card__meters" }, [
-        meter({ label: "5-hour window", value: five.pct, resets: countdown(five.resets_at) }),
-        meter({ label: "7-day window", value: seven.pct, resets: countdown(seven.resets_at) }),
-        meter({ label: "7-day Sonnet", value: sonnet.pct, resets: countdown(sonnet.resets_at) }),
-      ]),
+      : el("div", { class: "sub-card__meters" }, quotaMeters(r, five, seven, sonnet)),
     sel ? selectionRow(sel) : null,
     el("div", { class: "sub-card__foot", text: noUsageAPI
       ? "metered by this proxy — no quota API upstream"
       : (r.captured_at ? `snapshot ${relTime(tsOf(r.captured_at))}` : "no snapshot yet") }),
   ]);
+}
+
+// quotaMeters lists the utilization windows the upstream actually enforces.
+// Anthropic publishes 5h, 7d and a Sonnet-only 7d. OpenAI Codex publishes a
+// 5-hour and a weekly limit — and not every plan has both: "prolite" reports
+// only the weekly one (its 5h window has zero length), so a window with no
+// reset instant is not drawn rather than shown as a permanent 0%. Before the
+// first request there are no signals at all; then both are drawn empty so the
+// card has the same shape it will have once traffic arrives.
+function quotaMeters(r, five, seven, sonnet) {
+  if (r.provider !== "codex") {
+    return [
+      meter({ label: "5-hour window", value: five.pct, resets: countdown(five.resets_at) }),
+      meter({ label: "7-day window", value: seven.pct, resets: countdown(seven.resets_at) }),
+      meter({ label: "7-day Sonnet", value: sonnet.pct, resets: countdown(sonnet.resets_at) }),
+    ];
+  }
+  const noSignals = !five.resets_at && !seven.resets_at;
+  const out = [];
+  if (noSignals || five.resets_at) out.push(meter({ label: "5-hour limit", value: five.pct, resets: countdown(five.resets_at) }));
+  if (noSignals || seven.resets_at) out.push(meter({ label: "Weekly limit", value: seven.pct, resets: countdown(seven.resets_at) }));
+  return out;
 }
 
 // Selection metric row: pool share + effective score

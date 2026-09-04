@@ -208,10 +208,17 @@ func (s *Server) handleUsageCurrent(w http.ResponseWriter, r *http.Request) {
 				if label == "" {
 					label = a.Name
 				}
+				// OpenAI's plan name ("team", "prolite", …) is what the
+				// operator recognises; the sidecar's account_type is just
+				// "oauth".
+				plan := a.Quota.PlanType
+				if plan == "" {
+					plan = a.AccountType
+				}
 				uc := usageCurrent{
 					CredentialID:     "codex:" + a.Name,
 					Label:            label,
-					SubscriptionType: a.AccountType,
+					SubscriptionType: plan,
 					Provider:         string(provider.Codex),
 					// Codex accounts do publish utilization (the sidecar
 					// records OpenAI's X-Codex-* headers), so they render

@@ -73,7 +73,11 @@ the selected window into equal intervals.
   rolling window. The UI renders these where the meters would go, with no bar:
   there is no published allowance, so there is deliberately no percentage, and
   the figure counts only traffic through this proxy. Credentials with a real
-  usage API omit `metered`. `selection.share_pct` is totalled
+  usage API omit `metered`. Codex rows (`provider: "codex"`) carry OpenAI's
+  plan name in `subscription_type` (`team`, `prolite`, …) and only the windows
+  OpenAI enforces: `seven_day_sonnet` is always empty, and a plan without a
+  5-hour limit (`prolite`) leaves `five_hour.resets_at` null, which the UI
+  reads as "do not draw this meter". `selection.share_pct` is totalled
   **per provider**, matching the pool's provider-scoped candidate set: a lone
   GLM key takes 100% of GLM traffic, not a few percent of the global total.
 - `GET /api/usage/history?period&credential_id?` → time series of pct values per
