@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS conversations (
   credential_id   TEXT NOT NULL REFERENCES credentials(id) ON DELETE CASCADE,
   created_at      INTEGER NOT NULL,
   last_seen_at    INTEGER NOT NULL,
+  bound_at        INTEGER NOT NULL DEFAULT 0,
   request_count   INTEGER NOT NULL DEFAULT 0,
   status          TEXT NOT NULL DEFAULT 'active'
 );

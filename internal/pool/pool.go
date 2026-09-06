@@ -25,15 +25,22 @@ var (
 type Pool struct {
 	db  *store.DB
 	log *slog.Logger
-	mu  sync.Mutex // guards selection atomicity
+	mu  sync.Mutex // guards selection and request-lease atomicity
+
+	sessions     map[string]*sessionState
+	destinations map[string]time.Time
+	now          func() time.Time
 }
 
 func New(db *store.DB) *Pool {
-	return &Pool{db: db, log: slog.Default()}
+	return &Pool{db: db, log: slog.Default(), now: time.Now,
+		sessions: make(map[string]*sessionState), destinations: make(map[string]time.Time)}
 }
 
 func NewWithLogger(db *store.DB, log *slog.Logger) *Pool {
-	return &Pool{db: db, log: log}
+	p := New(db)
+	p.log = log
+	return p
 }
 
 // Bind returns the credential to use for this conversation, creating the
@@ -67,6 +74,10 @@ func (p *Pool) BindScoped(ctx context.Context, convID string, prov provider.ID, 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	return p.bindLocked(ctx, convID, prov, scope, allowed, true)
+}
+
+func (p *Pool) bindLocked(ctx context.Context, convID string, prov provider.ID, scope string, allowed []string, touch bool) (*creds.Credential, bool, error) {
 	if prov == "" {
 		prov = provider.Default
 	}
@@ -76,7 +87,7 @@ func (p *Pool) BindScoped(ctx context.Context, convID string, prov provider.ID, 
 	)
 	err := store.Retry(ctx, func() error {
 		var err error
-		c, isNew, err = p.bindOnce(ctx, convID, prov, scope, allowed)
+		c, isNew, err = p.bindOnce(ctx, convID, prov, scope, allowed, touch)
 		return err
 	})
 	return c, isNew, err
@@ -111,7 +122,7 @@ func KeyScoped(convID string, prov provider.ID, scope string) string {
 	return key
 }
 
-func (p *Pool) bindOnce(ctx context.Context, convID string, prov provider.ID, scope string, allowed []string) (*creds.Credential, bool, error) {
+func (p *Pool) bindOnce(ctx context.Context, convID string, prov provider.ID, scope string, allowed []string, touch bool) (*creds.Credential, bool, error) {
 	tx, err := p.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, false, err
@@ -134,17 +145,19 @@ func (p *Pool) bindOnce(ctx context.Context, convID string, prov provider.ID, sc
 		}
 		now := time.Now().Unix()
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO conversations (id, credential_id, created_at, last_seen_at, request_count, status)
-			VALUES (?, ?, ?, ?, 1, 'active')`, convKey, credID, now, now); err != nil {
+			INSERT INTO conversations (id, credential_id, created_at, last_seen_at, bound_at, request_count, status)
+			VALUES (?, ?, ?, ?, ?, 1, 'active')`, convKey, credID, now, now, now); err != nil {
 			return nil, false, err
 		}
 	case err != nil:
 		return nil, false, err
 	default:
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE conversations SET last_seen_at=?, request_count=request_count+1 WHERE id=?`,
-			time.Now().Unix(), convKey); err != nil {
-			return nil, false, err
+		if touch {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE conversations SET last_seen_at=?, request_count=request_count+1 WHERE id=?`,
+				time.Now().Unix(), convKey); err != nil {
+				return nil, false, err
+			}
 		}
 	}
 
@@ -174,7 +187,7 @@ func (p *Pool) bindOnce(ctx context.Context, convID string, prov provider.ID, sc
 				return nil, false, perr
 			}
 			if _, uerr := tx.ExecContext(ctx,
-				`UPDATE conversations SET credential_id=?, last_seen_at=? WHERE id=?`,
+				`UPDATE conversations SET credential_id=?, last_seen_at=?, bound_at=unixepoch() WHERE id=?`,
 				newCredID, time.Now().Unix(), convKey); uerr != nil {
 				return nil, false, uerr
 			}
@@ -202,7 +215,7 @@ func (p *Pool) bindOnce(ctx context.Context, convID string, prov provider.ID, sc
 					return nil, false, perr
 				case newCredID != credID:
 					if _, uerr := tx.ExecContext(ctx,
-						`UPDATE conversations SET credential_id=?, last_seen_at=? WHERE id=?`,
+						`UPDATE conversations SET credential_id=?, last_seen_at=?, bound_at=unixepoch() WHERE id=?`,
 						newCredID, time.Now().Unix(), convKey); uerr != nil {
 						return nil, false, uerr
 					}
@@ -583,7 +596,7 @@ func getCredTx(ctx context.Context, tx *sql.Tx, id string) (*creds.Credential, e
 	return creds.ScanCred(row)
 }
 
-// Janitor heals limited→active when retry_after passes, every 30s.
+// Janitor heals limited→active and prunes idle request-lease state every 30s.
 func (p *Pool) Janitor(ctx context.Context) {
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
@@ -592,6 +605,7 @@ func (p *Pool) Janitor(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			p.pruneRebalances(p.now())
 			now := time.Now().Unix()
 			_, _ = p.db.ExecContext(ctx, `
 				UPDATE credentials

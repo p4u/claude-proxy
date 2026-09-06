@@ -87,6 +87,9 @@ func Open(path string) (*DB, error) {
 		// Per-credential model catalogue, JSON, for custom Anthropic- or
 		// OpenAI-compatible hosts. Empty for registry providers.
 		`ALTER TABLE credentials ADD COLUMN models TEXT NOT NULL DEFAULT ''`,
+		// Current pin age, not conversation age. Legacy rows use created_at
+		// until their first rebind, avoiding an unbounded startup backfill.
+		`ALTER TABLE conversations ADD COLUMN bound_at INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := sdb.Exec(alter); err != nil && !isDuplicateColumn(err) {
 			_ = sdb.Close()

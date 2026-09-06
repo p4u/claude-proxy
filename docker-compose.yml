@@ -24,6 +24,8 @@ services:
       # traefik is auto-detected from X-Forwarded-Proto.
       CLAUDE_PROXY_UI_SECURE_COOKIES: "${UI_SECURE_COOKIES:-}"
       CLAUDE_PROXY_MODELS_1M: "${MODELS_1M:-}"
+      # Proactive Anthropic long-session rebalance; 0 disables it.
+      CLAUDE_PROXY_REBALANCE_SESSIONS: "${REBALANCE_SESSIONS:-1}"
       # Days to retain captured user prompts (last user message only, never
       # responses). Default 7; 0 disables prompt capture.
       CLAUDE_PROXY_PROMPT_RETENTION_DAYS: "${PROMPT_RETENTION_DAYS:-}"

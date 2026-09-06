@@ -146,6 +146,14 @@ func runServe(args []string) {
 	logFormat := fs.String("log-format", "auto", "log format: auto|pretty|text|json")
 	logColor := fs.String("log-color", "auto", "log color: auto|always|never")
 
+	// The flag default is on; a non-empty CLAUDE_PROXY_REBALANCE_SESSIONS
+	// overrides it (unset/empty keeps it enabled).
+	rebalanceDefault := true
+	if v, ok := os.LookupEnv("CLAUDE_PROXY_REBALANCE_SESSIONS"); ok && strings.TrimSpace(v) != "" {
+		rebalanceDefault = isTruthy(v)
+	}
+	rebalanceSessions := fs.Bool("rebalance-sessions", rebalanceDefault,
+		"proactive Anthropic long-session rebalance with API header notice (env CLAUDE_PROXY_REBALANCE_SESSIONS); 0 disables.")
 	_ = fs.Parse(args)
 
 	db := openDB(*dbPath)
@@ -223,6 +231,13 @@ func runServe(args []string) {
 	go usage.NewPoller(db, logger).Loop(ctx)
 
 	proxyH := proxy.New(db, p, r, logger)
+	// Proactive Anthropic long-session rebalance: enabled by default; an
+	// operator can turn it off with --rebalance-sessions=false or
+	// CLAUDE_PROXY_REBALANCE_SESSIONS=0. Emergency failover is unchanged.
+	proxyH.RebalanceSessions = *rebalanceSessions
+	if *rebalanceSessions {
+		logger.Info("anthropic long-session rebalance enabled")
+	}
 	// [1m] model-discovery augmentation is on by default; CLAUDE_PROXY_MODELS_1M=0 disables it.
 	if v, ok := os.LookupEnv("CLAUDE_PROXY_MODELS_1M"); ok {
 		proxyH.Augment1M = isTruthy(v)

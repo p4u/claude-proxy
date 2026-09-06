@@ -75,7 +75,9 @@ Claude Code (ANTHROPIC_BASE_URL → proxy)
       → enforceUserLimit(): POST /v1/messages only — 429 + X-Router-Reason: user-quota
         when the user is over their rolling usage cap (internal/proxy/userlimit.go)
       → router.Derive(): compute stable conversation key (4-priority algorithm)
-      → pool.Bind(): get/create sticky credential for (conversation, provider)
+      → pool.AcquireScoped(): get/create the sticky binding + request lease;
+        emergency rebind for unusable or saturated pins; when enabled, announce
+        and later revalidate a proactive rebalance of long-lived Anthropic pins
       → forward to the provider's base URL with swapped Authorization header
       → GET /v1/models: union of every provider that has a usable credential,
         Anthropic entries augmented with "[1m]" variants, cached 5min
@@ -397,6 +399,34 @@ port 8317 is kept off the host network.
 
 **Sticky rebinding:** the ≥100% cutoff also applies to *existing* bindings. On each `Bind()`, if the pinned credential's latest snapshot is saturated, the conversation is migrated onto a fresh non-saturated credential (the `conversations` row's `credential_id` is updated and the caller sees `isNew=true`). When no healthy alternative exists the saturated pin is kept, so the request still reaches Anthropic for a real 429. The scoring math (`Score`, `Room`, `Saturated`, `SevenDayExp`) is exported from `internal/pool` and reused verbatim by the web UI's `/api/usage/current` selection view, so the two can never drift.
 
+**Proactive long-session rebalancing** (`internal/pool/rebalance.go`): long-lived
+pins may move to a substantially better-provisioned Anthropic subscription after
+an API header notice — on by default (`REBALANCE_SESSIONS`, `--rebalance-sessions`);
+the Codex sidecar and emergency failover paths are untouched (exhaustion of a
+pinned credential is still handled by the pre-existing emergency rebind). Dwell/
+cooldown both key off the durable `bound_at` timestamp: pins must be at least
+an hour old, with at most one proactive switch per conversation per hour; this
+survives restart. A separate per-process gate allows at most one elective move
+per destination per 5 min and resets on restart. These are request-time checks,
+not a fixed-time scheduler. A destination qualifies when its token expiry is
+> 5 min in the future, its 5h/7d usage is ≤ 60%, its effective score is
+≥ 4× the source's **and** (unweighted room score ≥ 2× **or** weekly urgency
+factor ≥ 4×), required for the two latest usage samples (≥ 5 min apart,
+latest ≤ 15 min old, older ≤ 30 min old, resets consistent/future when
+known). The first successful response on the old account announces the
+move (`X-Router-Rebalance: pending` + a generic `X-Router-Message`); a later
+eligible request revalidates and switches after this conversation binding's
+prior in-flight responses drain, and the header reads `switched`. `count_tokens` and
+background Haiku calls join the lease but never drive a switch. The pending
+announcement expires after 15 min and restarts discard it (re-announced);
+if the destination stops qualifying the pending switch is cancelled. The
+cancellable wait on in-flight responses can add latency, in-flight streams are
+never interrupted, and the new account's prompt cache may need a cold rebuild. Requests
+with account-scoped files/containers/server tools are excluded (body guard).
+In-flight tracking is local to one pool/process — a single serving instance
+is recommended (not cross-process safe). The headers are not necessarily
+displayed by Claude Code, and no account IDs/names/usage are exposed.
+
 > Selection stays **weighted-random** rather than greedy-best on purpose: bindings are sticky and usage is only polled every 10 min, so greedy would dump every new conversation onto one cred between polls (thundering herd) and overshoot. Weighted-random spreads load and self-corrects each poll cycle.
 
 ### Storage Schema (SQLite)
@@ -461,6 +491,7 @@ instead; it does not load `.env` automatically. Key Compose variables:
 | `LOG_COLOR` | `auto` | `auto\|always\|never` |
 | `UI_PASSWORD` | _(empty)_ | Web UI password (`CLAUDE_PROXY_UI_PASSWORD`); empty = UI disabled. UI is served at `/` (old `/ui/*` paths 308-redirect); API prefixes `/v1/`, `/admin/`, `/api/`, `/health` are reserved |
 | `MODELS_1M` | _(enabled)_ | Append `[1m]` model variants to `GET /v1/models` for Claude Code gateway model discovery (`CLAUDE_PROXY_MODELS_1M`); set `0` to disable |
+| `REBALANCE_SESSIONS` | `1` | Proactive long-session rebalance for direct Anthropic subscriptions, announced via an API header notice (`CLAUDE_PROXY_REBALANCE_SESSIONS`; `0` disables it). Emergency failover is unchanged. |
 | `UI_SECURE_COOKIES` | _(empty)_ | Force `Secure` UI session cookies (`CLAUDE_PROXY_UI_SECURE_COOKIES`); auto-detected behind Traefik via `X-Forwarded-Proto` |
 | `PROMPT_RETENTION_DAYS` | `7` | Retain prompt/full-capture rows; `0` disables capture (`CLAUDE_PROXY_PROMPT_RETENTION_DAYS`) |
 | `CLIPROXY_API_KEY` | _(generated)_ | Private proxy-to-CLIProxyAPI API key; never sent to OpenAI |

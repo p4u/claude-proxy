@@ -42,6 +42,10 @@ type Handler struct {
 	// promptcapture.go); 0 disables capture entirely. Set from
 	// CLAUDE_PROXY_PROMPT_RETENTION_DAYS at startup.
 	PromptRetentionDays int
+
+	// RebalanceSessions enables announced, conservative migration of long-lived
+	// Anthropic pins. Emergency failover is independent of this setting.
+	RebalanceSessions bool
 }
 
 func New(db *store.DB, p *pool.Pool, r *creds.Refresher, log *slog.Logger) *Handler {
@@ -53,7 +57,8 @@ func New(db *store.DB, p *pool.Pool, r *creds.Refresher, log *slog.Logger) *Hand
 		client: &http.Client{
 			Timeout: 0, // streaming responses; rely on context
 		},
-		Augment1M: true,
+		Augment1M:         true,
+		RebalanceSessions: true,
 	}
 }
 
@@ -64,6 +69,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	start := time.Now()
+	notice := &rebalanceWriter{ResponseWriter: w}
+	w = notice
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	r.Body.Close()
@@ -150,15 +157,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// (conversation, provider) could hand a request to a host that cannot
 		// serve it. See pool.BindScoped.
 		convID = pool.KeyScoped(dr.ConvID, prov, custom.Model)
-		c, isNew, err := h.pool.BindScoped(r.Context(), dr.ConvID, prov, custom.Model, custom.CredIDs)
+		lease, err := h.pool.AcquireScoped(r.Context(), dr.ConvID, prov, custom.Model, custom.CredIDs, pool.RequestOptions{
+			Rebalance:   h.RebalanceSessions && provider.Get(prov).PollsUsage && portableRebalanceRequest(body),
+			ObserveOnly: r.URL.Path == "/v1/messages/count_tokens" || strings.Contains(requestModel(body), "haiku"),
+		})
 		if err != nil {
 			h.log.Warn("bind failed", "err", err, "conv", convID, "src", string(convSrc), "provider", string(prov))
 			h.failBind(w, err, prov)
 			return
 		}
-		cred = c
+		defer func() { lease.Release(notice.pendingEmitted() && r.Context().Err() == nil) }()
+		notice.state = lease.Rebalance
+		cred = lease.Credential
 		h.log.Info("bind",
-			"conv", convID, "src", string(convSrc), "new", isNew,
+			"conv", convID, "src", string(convSrc), "new", lease.IsNew,
 			"provider", string(prov),
 			"cred", cred.ID, "label", cred.Label,
 			"sub", cred.SubscriptionType, "weight", cred.Weight,
