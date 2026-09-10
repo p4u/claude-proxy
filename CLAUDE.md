@@ -193,6 +193,21 @@ so **both** `CLAUDE_CODE_USE_GATEWAY=1` (which promotes `ANTHROPIC_BASE_URL` +
 gateway branch) are required. With only `ANTHROPIC_BASE_URL` set the client is
 `firstParty`, never requests the list, and nothing this proxy serves can affect
 the picker — which is equally true of the pre-existing `MODELS_1M` feature.
+
+**Some Anthropic models need a `-gw` picker alias** (`gatewayPickerHidden` in
+`internal/proxy/models1m.go`). Claude Code's gateway discovery drops models its
+bundled catalog recognises by exact ID (assuming a built-in picker row covers
+them), while in gateway mode the built-in rows resolve through the catalog's
+per-provider alias table, which pins gateway users to older models — as of
+Claude Code 2.1.259, `aliases.opus.per_provider.gateway = claude-opus-4-7` and
+`aliases.sonnet.per_provider.gateway = claude-sonnet-4-6`. Net effect: the
+"Opus" row labelled *Opus 5* silently selects Opus 4.7, and the real
+`claude-opus-5` / `claude-sonnet-5` are unreachable. The proxy therefore
+advertises extra `<id>-gw` rows for those models (unknown IDs survive the
+client dedup, exactly like the `[1m]` and `claude-glm-*` aliases) and
+`stripPickerAlias` removes the suffix in `rewriteModel` before forwarding —
+only IDs in `gatewayPickerHidden` are ever stripped, so a real model name
+ending in `-gw` cannot be mangled.
 Verified end-to-end: the discovered entries land in `~/.claude.json` under
 `additionalModelOptionsCache`, which is what the picker renders.
 

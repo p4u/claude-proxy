@@ -182,6 +182,20 @@ client-side, so keep `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL` exports
 `[1m]` variant without picking it once via `/model`. Set `MODELS_1M=0` in
 `.env` to turn the augmentation off.
 
+> **Why the picker's "Opus" row is not Opus 5 behind a proxy.** Claude Code
+> drops gateway-discovered models its bundled catalog recognises (assuming its
+> built-in rows cover them), and in gateway mode those built-in rows resolve
+> through a per-provider alias table that pins **older** models: "Opus"
+> (labelled *Opus 5*) actually selects `claude-opus-4-7`, "Sonnet" selects
+> `claude-sonnet-4-6` (verified against Claude Code 2.1.259). The proxy
+> counters by advertising `claude-opus-5-gw` / `claude-sonnet-5-gw` rows —
+> shown as *Claude Opus 5* / *Claude Sonnet 5* in the picker — whose `-gw`
+> suffix survives the client's dedup; the suffix is stripped again before the
+> request goes upstream, so the wire model is the real `claude-opus-5`.
+> Selecting those rows is the reliable way to use Opus 5 / Sonnet 5 through
+> the proxy. Alternatively `ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-5` on the
+> client repins the built-in "Opus" row itself.
+
 Open a second `claude` in another terminal — it will be assigned a different
 credential. Watch what's happening live:
 

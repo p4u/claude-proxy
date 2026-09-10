@@ -58,7 +58,11 @@ func rewriteModel(body []byte) ([]byte, string, bool) {
 	if model == "" {
 		return body, "", false
 	}
-	wire := provider.WireModel(model)
+	// Two aliases can apply: a provider prefix (claude-glm-* → glm-*) or the
+	// "-gw" picker suffix this proxy adds for models Claude Code's gateway
+	// picker hides (see gatewayPickerHidden in models1m.go). Never both — the
+	// suffix only ever decorates native Anthropic IDs.
+	wire := stripPickerAlias(provider.WireModel(model))
 	if wire == model {
 		return body, model, false
 	}

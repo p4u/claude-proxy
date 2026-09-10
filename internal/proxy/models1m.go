@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"maps"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,6 +37,39 @@ var oneMillionModels = []string{
 	"claude-sonnet-4-6",
 }
 
+// gatewayPickerHidden lists Anthropic models Claude Code's /model picker
+// cannot reach through a gateway, even though this proxy advertises them.
+//
+// The client filters gateway-discovered models twice (verified against the
+// Claude Code 2.1.259 binary): entries whose ID its bundled model catalog
+// recognises by EXACT match are dropped, on the assumption that a built-in
+// picker row already covers them — only unrecognised IDs (Fable, "[1m]"
+// variants, this proxy's prefixed aliases) survive. But in gateway mode the
+// built-in rows resolve through the catalog's per-provider alias table, and
+// that table pins gateway users to OLDER models:
+//
+//	aliases.opus:   { default: "claude-opus-5",   per_provider: { gateway: "claude-opus-4-7" } }
+//	aliases.sonnet: { default: "claude-sonnet-5", per_provider: { gateway: "claude-sonnet-4-6" } }
+//
+// So the picker's "Opus" row — labelled "Opus 5" — silently selects
+// claude-opus-4-7, and the real claude-opus-5 is unreachable: its gateway row
+// is deduplicated away and no built-in row resolves to it. For these IDs the
+// proxy therefore advertises an extra "<id>-gw" row: the suffix defeats the
+// exact-match dedup so the row reaches the picker, and rewriteModel strips it
+// again before the request goes upstream (stripPickerAlias). Models reachable
+// through an honest built-in row (Haiku, the legacy Opus 4.x rows) are not
+// listed — an alias row would only duplicate them.
+var gatewayPickerHidden = []string{
+	"claude-opus-5",
+	"claude-sonnet-5",
+}
+
+// gatewayPickerSuffix marks a picker-alias row. Chosen to be meaningless to
+// every upstream so it can never collide with a real model ID the proxy would
+// then mangle; stripPickerAlias additionally requires the remaining stem to be
+// in gatewayPickerHidden before stripping.
+const gatewayPickerSuffix = "-gw"
+
 const modelsCacheTTL = 5 * time.Minute
 
 func has1MVariant(id string) bool {
@@ -45,6 +79,60 @@ func has1MVariant(id string) bool {
 		}
 	}
 	return false
+}
+
+// pickerHidden reports whether id may carry a "-gw" alias; dated snapshots
+// (e.g. "claude-opus-5-20260825") match their base entry so stripPickerAlias
+// can undo one wherever a client learned it. Only exact matches actually NEED
+// the alias — the client's dedup is exact, so dated IDs already reach the
+// picker — which is why addPickerAliases uses pickerHiddenExact instead.
+func pickerHidden(id string) bool {
+	for _, m := range gatewayPickerHidden {
+		if id == m || strings.HasPrefix(id, m+"-2") {
+			return true
+		}
+	}
+	return false
+}
+
+func pickerHiddenExact(id string) bool {
+	return slices.Contains(gatewayPickerHidden, id)
+}
+
+// stripPickerAlias undoes the "-gw" picker alias before a model name goes
+// upstream. Only IDs this proxy itself advertises are stripped — the stem must
+// be a pickerHidden model — so a genuine upstream model whose name happens to
+// end in "-gw" can never be mangled.
+func stripPickerAlias(model string) string {
+	base, found := strings.CutSuffix(model, gatewayPickerSuffix)
+	if !found || !pickerHidden(base) {
+		return model
+	}
+	return base
+}
+
+// addPickerAliases inserts a "<id>-gw" row after each hidden model so the
+// /model picker can reach it (see gatewayPickerHidden). The display name is
+// kept as-is: the alias row is the only one of the pair the client shows, and
+// it delivers exactly the model the name claims.
+func addPickerAliases(entries []map[string]any) []map[string]any {
+	existing := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		if id, ok := e["id"].(string); ok {
+			existing[id] = true
+		}
+	}
+	out := make([]map[string]any, 0, len(entries)+len(gatewayPickerHidden))
+	for _, e := range entries {
+		out = append(out, e)
+		id, ok := e["id"].(string)
+		if ok && pickerHiddenExact(id) && !existing[id+gatewayPickerSuffix] {
+			alias := maps.Clone(e)
+			alias["id"] = id + gatewayPickerSuffix
+			out = append(out, alias)
+		}
+	}
+	return out
 }
 
 // parseModelEntries extracts the "data" array from a /v1/models response.
@@ -342,6 +430,9 @@ func (h *Handler) serveModels(w http.ResponseWriter, r *http.Request, start time
 		}
 		if p.Augment1M {
 			entries = augment1M(entries)
+		}
+		if p.ID == provider.Anthropic {
+			entries = addPickerAliases(entries)
 		}
 		entries = advertise(entries, p)
 		merged = append(merged, entries...)
