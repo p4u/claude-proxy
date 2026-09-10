@@ -193,8 +193,48 @@ client-side, so keep `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL` exports
 > suffix survives the client's dedup; the suffix is stripped again before the
 > request goes upstream, so the wire model is the real `claude-opus-5`.
 > Selecting those rows is the reliable way to use Opus 5 / Sonnet 5 through
-> the proxy. Alternatively `ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-5` on the
-> client repins the built-in "Opus" row itself.
+> the proxy — they need no client configuration.
+
+Client-side alternatives (all verified against the Claude Code 2.1.259
+binary) for machines you control:
+
+```bash
+# Repin the built-in "Opus"/"Sonnet" rows — these are consulted BEFORE the
+# catalog's gateway alias table, so the rows then mean what their labels say.
+export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-5
+export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-5
+
+# Or set the session's default model outright, bypassing the picker.
+export ANTHROPIC_MODEL=claude-opus-5
+
+# Or add one custom picker row with your own label.
+export ANTHROPIC_CUSTOM_MODEL_OPTION=claude-opus-5
+export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="Opus 5"
+```
+
+The most thorough client-side fix is the `modelPicker` setting in
+`~/.claude/settings.json` (honored from user, managed, or `--settings`
+sources; project settings are ignored). It curates the picker independently
+of the built-in lineup, and with `replaceBuiltInOptions` the mispinned
+built-in rows disappear entirely:
+
+```json
+{
+  "modelPicker": {
+    "options": [
+      { "model": "claude-opus-5",      "label": "Opus 5" },
+      { "model": "claude-sonnet-5",    "label": "Sonnet 5" },
+      { "model": "claude-fable-5[1m]", "label": "Fable 5 (1M)" }
+    ],
+    "replaceBuiltInOptions": true
+  }
+}
+```
+
+`CLAUDE_CODE_MODEL_CATALOG` / `CLAUDE_CODE_MODEL_CATALOG_URL` do **not**
+help: they only control the downloaded catalog, a path that is already
+disabled for gateway clients — the pinned alias table is compiled into the
+binary.
 
 Open a second `claude` in another terminal — it will be assigned a different
 credential. Watch what's happening live:
