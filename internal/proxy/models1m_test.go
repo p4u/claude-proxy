@@ -48,6 +48,13 @@ func TestAugmentModels(t *testing.T) {
 	if _, ok := ids["claude-sonnet-4-6-20260101[1m]"]; !ok {
 		t.Error("dated snapshot of 1M-capable model not augmented")
 	}
+	// Natively-1M models still need the suffix row in gateway mode; a bare
+	// ID is believed to be 200K by the client (see oneMillionModels).
+	for _, id := range []string{"claude-fable-5-1", "claude-opus-5"} {
+		if !has1MVariant(id) {
+			t.Errorf("%s must get a [1m] variant", id)
+		}
+	}
 	for id := range ids {
 		if strings.HasPrefix(id, "claude-haiku") && strings.HasSuffix(id, "[1m]") {
 			t.Errorf("haiku (200K) must not get a [1m] variant: %s", id)

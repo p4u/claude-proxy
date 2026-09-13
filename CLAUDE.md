@@ -211,6 +211,15 @@ ending in `-gw` cannot be mangled.
 Verified end-to-end: the discovered entries land in `~/.claude.json` under
 `additionalModelOptionsCache`, which is what the picker renders.
 
+**Natively-1M models still need a `[1m]` row** (`oneMillionModels` in the same
+file). In gateway mode Claude Code trusts a bare ID's 1M catalog window only
+when the catalog marks the model native-1M on all three third-party clouds;
+otherwise it "believes" 200K and auto-compacts there, whatever the upstream
+actually allows. Fable 5.1 and Opus 5 are not so marked, so a plain
+`claude-fable-5-1` pick gives a 200K session while `claude-fable-5-1[1m]`
+gives 1M. New 1M models must therefore be added to the list, not just left
+to pass through.
+
 **Neither needs a translation layer.** Both surfaces were verified live against
 `/v1/messages`, SSE streaming, tool use, `cache_control` and Claude Code's
 `anthropic-beta` headers (GLM additionally serves `/v1/models` and

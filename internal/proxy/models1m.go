@@ -27,9 +27,19 @@ import (
 // oneMillionModels are the model IDs (aliases) with a 1M-token context window
 // for which Claude Code understands the "[1m]" suffix. Dated snapshot IDs are
 // matched by prefix (e.g. "claude-sonnet-4-6-20260101").
+//
+// The suffix matters even for models that are natively 1M upstream. In gateway
+// mode Claude Code (verified on 2.1.259) trusts a bare model ID's 1M catalog
+// window only when the catalog marks it native-1M on every third-party cloud;
+// otherwise it "believes" 200K and auto-compacts there. Fable 5.1 and Opus 5
+// are not so marked, so without a "[1m]" row a gateway user of either gets a
+// 200K session. The "[1m]" suffix short-circuits that check.
 var oneMillionModels = []string{
+	"claude-fable-5-1",
 	"claude-fable-5",
+	"claude-mythos-5-1",
 	"claude-mythos-5",
+	"claude-opus-5",
 	"claude-opus-4-8",
 	"claude-opus-4-7",
 	"claude-opus-4-6",
