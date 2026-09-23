@@ -24,16 +24,27 @@ import (
 // entries for 1M-capable models, making them selectable in the /model picker
 // without per-client env overrides.
 
-// oneMillionModels are the model IDs (aliases) with a 1M-token context window
-// for which Claude Code understands the "[1m]" suffix. Dated snapshot IDs are
-// matched by prefix (e.g. "claude-sonnet-4-6-20260101").
+// The "[1m]" suffix matters even for models that are natively 1M upstream. In
+// gateway mode Claude Code (verified on 2.1.259 and 2.1.280) trusts a bare
+// model ID's 1M catalog window only when its baked-in catalog marks the model
+// native-1M on every third-party cloud; otherwise it "believes" 200K and
+// auto-compacts there. Fable 5.1, Opus 5 and Opus 5.5 are not so marked, so
+// without a "[1m]" row a gateway user of any of them gets a 200K session. The
+// suffix short-circuits that check — and it does so for model IDs the client
+// has never heard of, which is what makes discovery of a brand-new model work
+// on a client that predates it.
 //
-// The suffix matters even for models that are natively 1M upstream. In gateway
-// mode Claude Code (verified on 2.1.259) trusts a bare model ID's 1M catalog
-// window only when the catalog marks it native-1M on every third-party cloud;
-// otherwise it "believes" 200K and auto-compacts there. Fable 5.1 and Opus 5
-// are not so marked, so without a "[1m]" row a gateway user of either gets a
-// 200K session. The "[1m]" suffix short-circuits that check.
+// Which models qualify is read from the upstream catalogue itself:
+// Anthropic's /v1/models publishes max_input_tokens per entry (1000000 for
+// every 1M-capable model, 200000 otherwise), so a model released tomorrow
+// gets its "[1m]" row without a proxy release. See entry1M.
+const oneMillionInputTokens = 1_000_000
+
+// oneMillionModels is the fallback list used only for entries whose upstream
+// does not publish max_input_tokens — older Anthropic deployments and custom
+// Anthropic hosts. Dated snapshot IDs are matched by prefix (e.g.
+// "claude-sonnet-4-6-20260101"). It is a safety net, not the source of truth;
+// new models do not need to be added here.
 var oneMillionModels = []string{
 	"claude-fable-5-1",
 	"claude-fable-5",
@@ -69,8 +80,17 @@ var oneMillionModels = []string{
 // again before the request goes upstream (stripPickerAlias). Models reachable
 // through an honest built-in row (Haiku, the legacy Opus 4.x rows) are not
 // listed — an alias row would only duplicate them.
+//
+// Unlike the "[1m]" rows, this list cannot be derived from the upstream
+// catalogue: whether a bare ID is deduplicated depends on the CLIENT's baked-in
+// model list, which /v1/models says nothing about. It only needs an entry for a
+// model whose family alias the client pins to an older ID (as of 2.1.280,
+// opus -> claude-opus-4-7 and sonnet -> claude-sonnet-4-6); a 1M model is in any
+// case already reachable through its "[1m]" row, so a missing entry here costs
+// the 200K variant, never the model.
 var gatewayPickerHidden = []string{
 	"claude-opus-5",
+	"claude-opus-5-5",
 	"claude-sonnet-5",
 }
 
@@ -89,6 +109,44 @@ func has1MVariant(id string) bool {
 		}
 	}
 	return false
+}
+
+// entry1M reports whether a /v1/models entry deserves a "[1m]" row.
+//
+// The upstream's own max_input_tokens is authoritative when present, so no
+// hand-maintained list has to be updated when Anthropic ships a model. A
+// declared window of 1M means either a natively-1M model or one that reaches
+// 1M through the context-1m beta (Sonnet 4.5 reports 1000000 for that reason);
+// both are served correctly by the "[1m]" row, which is the only way a gateway
+// client is willing to believe a window above 200K. Entries without the field
+// fall back to oneMillionModels.
+func entry1M(e map[string]any) bool {
+	id, _ := e["id"].(string)
+	if id == "" {
+		return false
+	}
+	if n, ok := maxInputTokens(e); ok {
+		return n >= oneMillionInputTokens
+	}
+	return has1MVariant(id)
+}
+
+// maxInputTokens reads the entry's declared input window. JSON numbers decode
+// as float64 through map[string]any, but a json.Number or an integer-typed
+// value can arrive from other call paths, so all three are accepted.
+func maxInputTokens(e map[string]any) (int64, bool) {
+	switch v := e["max_input_tokens"].(type) {
+	case float64:
+		return int64(v), true
+	case int:
+		return int64(v), true
+	case int64:
+		return v, true
+	case json.Number:
+		n, err := v.Int64()
+		return n, err == nil
+	}
+	return 0, false
 }
 
 // pickerHidden reports whether id may carry a "-gw" alias; dated snapshots
@@ -181,7 +239,7 @@ func augment1M(entries []map[string]any) []map[string]any {
 	out := make([]map[string]any, 0, len(entries)*2)
 	for _, e := range entries {
 		id, ok := e["id"].(string)
-		if ok && has1MVariant(id) && !existing[id+"[1m]"] {
+		if ok && entry1M(e) && !existing[id+"[1m]"] {
 			variant := maps.Clone(e)
 			variant["id"] = id + "[1m]"
 			if dn, ok := e["display_name"].(string); ok {

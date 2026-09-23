@@ -136,3 +136,58 @@ func TestServeModelsAugmentsAndCaches(t *testing.T) {
 		t.Errorf("augmentation ran while disabled: %s", rw.Body.String())
 	}
 }
+
+// A model this proxy has never heard of must still get its [1m] row purely
+// from the window the upstream publishes — that is what makes a model released
+// after this binary reachable at 1M, instead of silently capped at 200K by the
+// client's gateway-mode belief.
+func TestAugmentModelsUsesPublishedWindow(t *testing.T) {
+	raw := []byte(`{"data":[` +
+		`{"id":"claude-opus-9","display_name":"Claude Opus 9","type":"model","max_input_tokens":1000000},` +
+		`{"id":"claude-tiny-9","display_name":"Claude Tiny 9","type":"model","max_input_tokens":200000},` +
+		`{"id":"claude-opus-4-8","display_name":"Claude Opus 4.8","type":"model"}` +
+		`],"has_more":false}`)
+
+	out := augmentModels(raw)
+	if out == nil {
+		t.Fatal("augmentModels returned nil for valid input")
+	}
+	var env struct {
+		Data []struct {
+			ID          string `json:"id"`
+			DisplayName string `json:"display_name"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(out, &env); err != nil {
+		t.Fatalf("unmarshal augmented: %v", err)
+	}
+	ids := map[string]string{}
+	for _, m := range env.Data {
+		ids[m.ID] = m.DisplayName
+	}
+	if dn := ids["claude-opus-9[1m]"]; dn != "Claude Opus 9 (1M context)" {
+		t.Errorf("unknown 1M model not augmented from max_input_tokens: %q", dn)
+	}
+	if _, ok := ids["claude-tiny-9[1m]"]; ok {
+		t.Error("200K model must not get a [1m] variant")
+	}
+	// No max_input_tokens: the static list is the fallback.
+	if _, ok := ids["claude-opus-4-8[1m]"]; !ok {
+		t.Error("entry without max_input_tokens must fall back to oneMillionModels")
+	}
+}
+
+func TestEntry1MRejectsBelowThreshold(t *testing.T) {
+	// An ID on the static list whose upstream says 200K is believed: the
+	// published window wins, so a model that loses 1M support stops being
+	// advertised as 1M without a code change.
+	if entry1M(map[string]any{"id": "claude-opus-5", "max_input_tokens": float64(200000)}) {
+		t.Error("published 200K window must override the fallback list")
+	}
+	if !entry1M(map[string]any{"id": "claude-opus-5"}) {
+		t.Error("fallback list must apply when the window is unpublished")
+	}
+	if entry1M(map[string]any{"max_input_tokens": float64(1000000)}) {
+		t.Error("entry without an id must not be augmented")
+	}
+}

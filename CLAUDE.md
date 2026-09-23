@@ -211,14 +211,25 @@ ending in `-gw` cannot be mangled.
 Verified end-to-end: the discovered entries land in `~/.claude.json` under
 `additionalModelOptionsCache`, which is what the picker renders.
 
-**Natively-1M models still need a `[1m]` row** (`oneMillionModels` in the same
-file). In gateway mode Claude Code trusts a bare ID's 1M catalog window only
-when the catalog marks the model native-1M on all three third-party clouds;
+**Natively-1M models still need a `[1m]` row** (`entry1M` in the same file).
+In gateway mode Claude Code trusts a bare ID's 1M catalog window only when its
+baked-in catalog marks the model native-1M on all three third-party clouds;
 otherwise it "believes" 200K and auto-compacts there, whatever the upstream
-actually allows. Fable 5.1 and Opus 5 are not so marked, so a plain
+actually allows. Fable 5.1, Opus 5 and Opus 5.5 are not so marked, so a plain
 `claude-fable-5-1` pick gives a 200K session while `claude-fable-5-1[1m]`
-gives 1M. New 1M models must therefore be added to the list, not just left
-to pass through.
+gives 1M.
+
+**New 1M models are discovered, not listed.** Anthropic's `/v1/models` publishes
+`max_input_tokens` per entry (1000000 for every 1M-capable model — natively or
+through the context-1m beta, which is why Sonnet 4.5 reports it — and 200000
+otherwise), so `entry1M` reads the window from the catalogue and a model shipped
+after this binary gets its `[1m]` row with no release. `oneMillionModels`
+remains only as the fallback for upstreams that omit the field (older Anthropic
+deployments, custom Anthropic hosts). The `[1m]` suffix also works on IDs the
+*client* has never heard of, so a new model is reachable at 1M from a Claude
+Code that predates it. The `-gw` list cannot be derived the same way: whether a
+bare ID is deduplicated depends on the client's baked-in catalog, which
+`/v1/models` says nothing about.
 
 **Neither needs a translation layer.** Both surfaces were verified live against
 `/v1/messages`, SSE streaming, tool use, `cache_control` and Claude Code's
