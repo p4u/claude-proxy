@@ -137,4 +137,11 @@ CREATE TABLE IF NOT EXISTS codex_account_weight (
   name    TEXT PRIMARY KEY,
   weight  INTEGER NOT NULL DEFAULT 1
 );
+
+-- Random secrets generated once and kept across restarts (e.g. the web UI
+-- session-signing secret). Never exposed through any API.
+CREATE TABLE IF NOT EXISTS app_secret (
+  name   TEXT PRIMARY KEY,
+  value  BLOB NOT NULL
+);
 `

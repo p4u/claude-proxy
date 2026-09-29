@@ -90,6 +90,13 @@ func Open(path string) (*DB, error) {
 		// Current pin age, not conversation age. Legacy rows use created_at
 		// until their first rebind, avoiding an unbounded startup backfill.
 		`ALTER TABLE conversations ADD COLUMN bound_at INTEGER NOT NULL DEFAULT 0`,
+		// Model-scoped weekly limit from the usage API's limits[] array
+		// ("weekly_scoped", e.g. Fable). NULL = none published; the old
+		// seven_day_sonnet_* columns are no longer written (the API returns
+		// seven_day_sonnet: null).
+		`ALTER TABLE usage_history ADD COLUMN seven_day_scoped_pct REAL`,
+		`ALTER TABLE usage_history ADD COLUMN seven_day_scoped_resets_at INTEGER`,
+		`ALTER TABLE usage_history ADD COLUMN seven_day_scoped_label TEXT`,
 	} {
 		if _, err := sdb.Exec(alter); err != nil && !isDuplicateColumn(err) {
 			_ = sdb.Close()

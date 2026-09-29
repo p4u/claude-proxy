@@ -10,9 +10,14 @@ vendored chart library, committed to the repo under `internal/webui/static/`.
   (root serves nothing; pre-UI behavior).
 - `POST /api/login` `{"password":"..."}` → constant-time compare → on success sets
   `HttpOnly; SameSite=Strict; Path=/` session cookie (`cpui_session`), HMAC-SHA256-signed
-  value `expiry|nonce|mac`, key derived at startup: `HMAC(SHA256(password), random-boot-salt)`.
-  Sessions last 24h. 429 after 5 failed attempts per IP per minute.
-- `POST /api/logout` clears the cookie. `GET /api/session` → `{"authenticated":bool}`.
+  value `expiry|nonce|mac`, key derived at startup: `HMAC(SHA256(password), secret)`, where
+  `secret` is 32 random bytes generated once and persisted in the `app_secret` table. Sessions
+  therefore survive restarts and deploys, and changing the password ends all of them.
+  Sessions last 30 days. 429 after 5 failed attempts per IP per minute.
+- `POST /api/logout` clears the cookie. `GET /api/session` → `{"authenticated":bool}`; a
+  valid session past half its lifetime is re-issued there (sliding expiry), so the page-load
+  check keeps a regularly used dashboard logged in. The token stays in an `HttpOnly` cookie —
+  not `localStorage` — so page scripts can never read it.
 - All other `/api/*` require a valid cookie → 401 otherwise.
 - **Routing:** the UI is served at the root `/`. Reserved prefixes `/v1/`, `/admin/`, `/health`, `/api/` route to their handlers; every other path serves the SPA (deep-link fallback to index.html). `/ui` and `/ui/*` permanently redirect to `/`. `proxy.AuthMiddleware` passes non-`/v1/` non-`/admin/` paths through untouched when the UI is enabled (webui does its own cookie auth); with the UI disabled, unknown paths keep the pre-UI 401/404 behavior;
   same-origin only, no CORS headers needed.
@@ -64,8 +69,12 @@ the selected window into equal intervals.
 - `GET /api/usage/current` → per credential, latest snapshot + live counters:
   `[{credential_id,label,subscription_type,provider,has_usage_api,status,weight,
      five_hour:{pct,resets_at},seven_day:{pct,resets_at},
-     seven_day_sonnet:{pct,resets_at},captured_at,selection:{...}}]`
+     seven_day_scoped?:{pct,resets_at,label},captured_at,selection:{...}}]`
   (from `usage_history` latest row per cred; include resets_at).
+  `seven_day_scoped` is the model-scoped weekly cap Anthropic publishes as a
+  `weekly_scoped` entry in the usage API's `limits[]` — `label` names the model
+  (`"Fable"` today). It is omitted when the plan has none. It replaces
+  `seven_day_sonnet`, which the usage API now always returns as `null`.
   Credentials with `has_usage_api: false` never have a snapshot, so their
   percentages are 0 and `captured_at` is null. They instead carry
   `metered:{five_hour,seven_day}` — each `{requests,input_tokens,output_tokens,
@@ -75,14 +84,17 @@ the selected window into equal intervals.
   the figure counts only traffic through this proxy. Credentials with a real
   usage API omit `metered`. Codex rows (`provider: "codex"`) carry OpenAI's
   plan name in `subscription_type` (`team`, `prolite`, …) and only the windows
-  OpenAI enforces: `seven_day_sonnet` is always empty, and a plan without a
-  5-hour limit (`prolite`) leaves `five_hour.resets_at` null, which the UI
-  reads as "do not draw this meter". `selection.share_pct` is totalled
-  **per provider**, matching the pool's provider-scoped candidate set: a lone
+  OpenAI enforces: `seven_day_scoped` is never present, and a plan without a
+  5-hour limit (`prolite`) sets `five_hour.absent: true`, which the UI reads
+  as "do not draw this meter". A window whose last known reset has already
+  passed is rolled over — `pct: 0`, `resets_at: null` — because the sidecar
+  only refreshes signals when the account serves a request, and an idle
+  account's old reading describes an allowance that has since reset.
+  `selection.share_pct` is totalled **per provider**, matching the pool's provider-scoped candidate set: a lone
   GLM key takes 100% of GLM traffic, not a few percent of the global total.
 - `GET /api/usage/history?period&credential_id?` → time series of pct values per
   credential for charts: `{series:[{credential_id,label,points:[{ts,five_hour_pct,
-  seven_day_pct,seven_day_sonnet_pct}]}]}`.
+  seven_day_pct,seven_day_scoped_pct}]}]}`.
 
 ### Credential management (wraps `internal/creds`, `internal/ingest`)
 - `GET /api/credentials` → extended `credView` (reuse fields from `internal/admin`),
@@ -186,7 +198,7 @@ queries must use the indexes on `request_log(ts)` / `usage_history(credential_id
 - **Dashboard**: header stat tiles (requests, tokens in/out, error rate, avg latency,
   active convs) + requests-over-time chart (stack by user) + tokens chart + latency chart.
   Global period selector (1h/6h/24h/7d/30d) drives every chart; per-chart group-by toggle.
-- **Subscriptions**: per-credential cards with 5h/7d/sonnet utilization meters +
+- **Subscriptions**: per-credential cards with 5h/7d/model-scoped utilization meters +
   resets-at countdowns, and the utilization history multi-line chart.
 > **Add credential is one modal for every kind** (`addCredentialModal`). A type
 > selector switches between Anthropic subscription (paste `credentials.json`),
@@ -248,7 +260,8 @@ queries must use the indexes on `request_log(ts)` / `usage_history(credential_id
     totals:[{credential_id,label,picks,share_pct}]}`.
 - **`GET /api/usage/history`** response is now an aligned grid (fixes the broken
   multi-credential chart): `{buckets:[ts...], series:[{credential_id,label,
-  five_hour_pct:[...], seven_day_pct:[...], seven_day_sonnet_pct:[...]}]}` — one value
+  five_hour_pct:[...], seven_day_pct:[...], seven_day_scoped_pct:[...],
+  seven_day_scoped_label?}]}` — one value
   per bucket per series, `null` where a credential has no snapshot in that bucket;
   buckets downsampled to ≤200.
 - **Prompt logging**: new table `prompt_log(id, user_token_id→SET NULL, conv_id, ts,

@@ -24,21 +24,105 @@ type Bucket struct {
 	ResetsAt    *string  `json:"resets_at"`
 }
 
-// Response is the full payload from GET /api/oauth/usage.
+// Response is the part of GET /api/oauth/usage this proxy reads.
+//
+// five_hour and seven_day are the two plan-wide ceilings. Model-specific
+// weekly caps are no longer published as per-model buckets —
+// seven_day_sonnet and seven_day_opus are always null as of 2026-09 — but as
+// "weekly_scoped" entries in Limits, whose scope names the model (today
+// "Fable"). See ScopedWeekly.
 type Response struct {
-	FiveHour       Bucket  `json:"five_hour"`
-	SevenDay       Bucket  `json:"seven_day"`
-	SevenDayOpus   *Bucket `json:"seven_day_opus"`
-	SevenDaySonnet *Bucket `json:"seven_day_sonnet"`
+	FiveHour Bucket  `json:"five_hour"`
+	SevenDay Bucket  `json:"seven_day"`
+	Limits   []Limit `json:"limits"`
 }
 
-// Snapshot is one stored measurement for a credential.
+// Limit is one entry of the usage API's limits[] array. Observed kinds:
+// "session" (mirrors five_hour), "weekly_all" (mirrors seven_day) and
+// "weekly_scoped" (a weekly cap on one model).
+type Limit struct {
+	Kind     string      `json:"kind"`
+	Group    string      `json:"group"`
+	Percent  *float64    `json:"percent"`
+	Severity string      `json:"severity"`
+	ResetsAt *string     `json:"resets_at"`
+	Scope    *LimitScope `json:"scope"`
+	IsActive bool        `json:"is_active"`
+}
+
+// LimitScope names what a scoped limit applies to. Only a model scope has
+// been observed; surface is kept raw because its shape is not yet known.
+type LimitScope struct {
+	Model *struct {
+		ID          *string `json:"id"`
+		DisplayName string  `json:"display_name"`
+	} `json:"model"`
+	Surface json.RawMessage `json:"surface"`
+}
+
+// Label is the human name of the scope ("Fable"), or "" when it names none.
+func (s *LimitScope) Label() string {
+	if s == nil {
+		return ""
+	}
+	if s.Model != nil {
+		if s.Model.DisplayName != "" {
+			return s.Model.DisplayName
+		}
+		if s.Model.ID != nil {
+			return *s.Model.ID
+		}
+	}
+	var surface struct {
+		DisplayName string `json:"display_name"`
+	}
+	if json.Unmarshal(s.Surface, &surface) == nil && surface.DisplayName != "" {
+		return surface.DisplayName
+	}
+	var name string
+	if json.Unmarshal(s.Surface, &name) == nil {
+		return name
+	}
+	return ""
+}
+
+// ScopedLimit is the model-scoped weekly cap stored per snapshot.
+type ScopedLimit struct {
+	Label    string
+	Pct      float64
+	ResetsAt *string
+}
+
+// ScopedWeekly returns the binding model-scoped weekly limit, or nil when the
+// plan publishes none. With several scoped limits the fullest one is kept:
+// it is the one closest to blocking requests, and one column per snapshot is
+// all the dashboard needs.
+func (r *Response) ScopedWeekly() *ScopedLimit {
+	var best *ScopedLimit
+	for _, l := range r.Limits {
+		if l.Kind != "weekly_scoped" || l.Percent == nil {
+			continue
+		}
+		label := l.Scope.Label()
+		if label == "" {
+			label = "scoped"
+		}
+		if best == nil || *l.Percent > best.Pct {
+			best = &ScopedLimit{Label: label, Pct: *l.Percent, ResetsAt: l.ResetsAt}
+		}
+	}
+	return best
+}
+
+// Snapshot is one stored measurement for a credential. SevenDayScopedPct is
+// nil when the snapshot carries no model-scoped weekly limit.
 type Snapshot struct {
-	CredentialID      string
-	CapturedAt        time.Time
-	FiveHourPct       float64
-	SevenDayPct       float64
-	SevenDaySonnetPct float64
+	CredentialID        string
+	CapturedAt          time.Time
+	FiveHourPct         float64
+	SevenDayPct         float64
+	SevenDayScopedPct   *float64
+	SevenDayScopedLabel string
 }
 
 // Fetch calls GET https://api.anthropic.com/api/oauth/usage for one access token.
@@ -76,26 +160,25 @@ func Fetch(ctx context.Context, client *http.Client, accessToken string) (*Respo
 func Save(ctx context.Context, db *store.DB, credID string, r *Response) error {
 	fhPct := bucketPct(&r.FiveHour)
 	sdPct := bucketPct(&r.SevenDay)
-	sdsPct := 0.0
-	if r.SevenDaySonnet != nil {
-		sdsPct = bucketPct(r.SevenDaySonnet)
+	var (
+		scPct   *float64
+		scReset *int64
+		scLabel *string
+	)
+	if sc := r.ScopedWeekly(); sc != nil {
+		scPct, scReset, scLabel = &sc.Pct, parseResetsAt(sc.ResetsAt), &sc.Label
 	}
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO usage_history
 		  (credential_id, captured_at,
 		   five_hour_pct,    five_hour_resets_at,
 		   seven_day_pct,    seven_day_resets_at,
-		   seven_day_sonnet_pct, seven_day_sonnet_resets_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		   seven_day_scoped_pct, seven_day_scoped_resets_at, seven_day_scoped_label)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		credID, time.Now().Unix(),
 		fhPct, parseResetsAt(r.FiveHour.ResetsAt),
 		sdPct, parseResetsAt(r.SevenDay.ResetsAt),
-		sdsPct, func() *int64 {
-			if r.SevenDaySonnet != nil {
-				return parseResetsAt(r.SevenDaySonnet.ResetsAt)
-			}
-			return nil
-		}())
+		scPct, scReset, scLabel)
 	return err
 }
 
@@ -104,7 +187,8 @@ func Save(ctx context.Context, db *store.DB, credID string, r *Response) error {
 func History(ctx context.Context, db *store.DB, credID string, since time.Time) ([]Snapshot, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT credential_id, captured_at,
-		       five_hour_pct, seven_day_pct, seven_day_sonnet_pct
+		       five_hour_pct, seven_day_pct,
+		       seven_day_scoped_pct, COALESCE(seven_day_scoped_label, '')
 		FROM usage_history
 		WHERE credential_id = ? AND captured_at >= ?
 		ORDER BY captured_at ASC`,
@@ -118,7 +202,7 @@ func History(ctx context.Context, db *store.DB, credID string, since time.Time) 
 		var s Snapshot
 		var ts int64
 		if err := rows.Scan(&s.CredentialID, &ts,
-			&s.FiveHourPct, &s.SevenDayPct, &s.SevenDaySonnetPct); err != nil {
+			&s.FiveHourPct, &s.SevenDayPct, &s.SevenDayScopedPct, &s.SevenDayScopedLabel); err != nil {
 			return nil, err
 		}
 		s.CapturedAt = time.Unix(ts, 0)
@@ -131,7 +215,8 @@ func History(ctx context.Context, db *store.DB, credID string, since time.Time) 
 func HistoryAll(ctx context.Context, db *store.DB, since time.Time) (map[string][]Snapshot, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT credential_id, captured_at,
-		       five_hour_pct, seven_day_pct, seven_day_sonnet_pct
+		       five_hour_pct, seven_day_pct,
+		       seven_day_scoped_pct, COALESCE(seven_day_scoped_label, '')
 		FROM usage_history
 		WHERE captured_at >= ?
 		ORDER BY credential_id, captured_at ASC`,
@@ -145,7 +230,7 @@ func HistoryAll(ctx context.Context, db *store.DB, since time.Time) (map[string]
 		var s Snapshot
 		var ts int64
 		if err := rows.Scan(&s.CredentialID, &ts,
-			&s.FiveHourPct, &s.SevenDayPct, &s.SevenDaySonnetPct); err != nil {
+			&s.FiveHourPct, &s.SevenDayPct, &s.SevenDayScopedPct, &s.SevenDayScopedLabel); err != nil {
 			return nil, err
 		}
 		s.CapturedAt = time.Unix(ts, 0)
@@ -158,14 +243,15 @@ func HistoryAll(ctx context.Context, db *store.DB, since time.Time) (map[string]
 func LastSnapshot(ctx context.Context, db *store.DB, credID string) (*Snapshot, error) {
 	row := db.QueryRowContext(ctx, `
 		SELECT credential_id, captured_at,
-		       five_hour_pct, seven_day_pct, seven_day_sonnet_pct
+		       five_hour_pct, seven_day_pct,
+		       seven_day_scoped_pct, COALESCE(seven_day_scoped_label, '')
 		FROM usage_history
 		WHERE credential_id = ?
 		ORDER BY captured_at DESC LIMIT 1`, credID)
 	var s Snapshot
 	var ts int64
 	if err := row.Scan(&s.CredentialID, &ts,
-		&s.FiveHourPct, &s.SevenDayPct, &s.SevenDaySonnetPct); err != nil {
+		&s.FiveHourPct, &s.SevenDayPct, &s.SevenDayScopedPct, &s.SevenDayScopedLabel); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
@@ -200,24 +286,42 @@ func Chart(snapshots []Snapshot, label, period string) string {
 	}
 
 	const maxPts = 120
-	fh := extractSeries(snapshots, func(s Snapshot) float64 { return s.FiveHourPct })
-	sd := extractSeries(snapshots, func(s Snapshot) float64 { return s.SevenDayPct })
-	sds := extractSeries(snapshots, func(s Snapshot) float64 { return s.SevenDaySonnetPct })
+	fh := downsample(extractSeries(snapshots, func(s Snapshot) float64 { return s.FiveHourPct }), maxPts)
+	sd := downsample(extractSeries(snapshots, func(s Snapshot) float64 { return s.SevenDayPct }), maxPts)
+	series := [][]float64{fh, sd}
+	colors := []asciigraph.AnsiColor{asciigraph.Red, asciigraph.Blue}
+	legends := []string{"5h", "7d"}
 
-	fh = downsample(fh, maxPts)
-	sd = downsample(sd, maxPts)
-	sds = downsample(sds, maxPts)
+	// The scoped series is drawn only when the window has one; snapshots
+	// taken before it was recorded count as 0%, like any unknown reading.
+	scopedLabel := ""
+	for _, s := range snapshots {
+		if s.SevenDayScopedPct != nil {
+			scopedLabel = s.SevenDayScopedLabel
+		}
+	}
+	if scopedLabel != "" {
+		sc := downsample(extractSeries(snapshots, func(s Snapshot) float64 {
+			if s.SevenDayScopedPct == nil {
+				return 0
+			}
+			return *s.SevenDayScopedPct
+		}), maxPts)
+		series = append(series, sc)
+		colors = append(colors, asciigraph.Green)
+		legends = append(legends, "7d-"+strings.ToLower(scopedLabel))
+	}
 
 	from := snapshots[0].CapturedAt.UTC().Format("2006-01-02 15:04 UTC")
 	to := snapshots[len(snapshots)-1].CapturedAt.UTC().Format("2006-01-02 15:04 UTC")
 
 	graph := asciigraph.PlotMany(
-		[][]float64{fh, sd, sds},
+		series,
 		asciigraph.Height(10),
 		asciigraph.LowerBound(0),
 		asciigraph.UpperBound(100),
-		asciigraph.SeriesColors(asciigraph.Red, asciigraph.Blue, asciigraph.Green),
-		asciigraph.SeriesLegends("5h", "7d", "7d-sonnet"),
+		asciigraph.SeriesColors(colors...),
+		asciigraph.SeriesLegends(legends...),
 		asciigraph.Caption(fmt.Sprintf("%s — %s → %s  (%d samples)", label, from, to, len(snapshots))),
 	)
 

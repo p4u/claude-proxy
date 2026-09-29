@@ -136,8 +136,13 @@ type CodexQuota struct {
 	SevenDayPct    float64 `json:"seven_day_pct"`
 	SevenDayResets int64   `json:"seven_day_resets_at,omitempty"`
 	PlanType       string  `json:"plan_type,omitempty"`
-	ObservedAtUnix int64   `json:"observed_at,omitempty"`
-	HasSignals     bool    `json:"has_signals"`
+	// HasFiveHour / HasSevenDay record which windows the plan publishes at
+	// all ("prolite" has no 5-hour limit), independently of whether the
+	// current reading is still live — see Current.
+	HasFiveHour    bool  `json:"five_hour_window,omitempty"`
+	HasSevenDay    bool  `json:"seven_day_window,omitempty"`
+	ObservedAtUnix int64 `json:"observed_at,omitempty"`
+	HasSignals     bool  `json:"has_signals"`
 }
 
 type rawAccount struct {
@@ -192,7 +197,7 @@ func (c *Client) Accounts(ctx context.Context) ([]Account, error) {
 			continue
 		}
 		acc := file.Account
-		acc.Quota = parseCodexQuota(latestQuota(file))
+		acc.Quota = parseCodexQuota(latestQuota(file)).Current(now)
 		acc.Blocked = acc.BlockedAt(now)
 		accounts = append(accounts, acc)
 	}

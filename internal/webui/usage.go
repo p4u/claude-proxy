@@ -16,6 +16,17 @@ import (
 type usageWindow struct {
 	Pct      float64 `json:"pct"`
 	ResetsAt *string `json:"resets_at"`
+	// Absent marks a window the plan does not enforce at all (Codex
+	// "prolite" has no 5-hour limit), as opposed to a null ResetsAt, which
+	// only means the next reset is not known yet.
+	Absent bool `json:"absent,omitempty"`
+}
+
+// scopedWindow is a model-scoped weekly limit ("weekly_scoped" in the usage
+// API's limits[]; today the Fable cap). Label names the model it applies to.
+type scopedWindow struct {
+	usageWindow
+	Label string `json:"label"`
 }
 
 // selectionView mirrors the pool's usage-aware selection scoring for one
@@ -53,18 +64,20 @@ type meteredUsage struct {
 }
 
 type usageCurrent struct {
-	CredentialID     string        `json:"credential_id"`
-	Label            string        `json:"label"`
-	SubscriptionType string        `json:"subscription_type"`
-	Provider         string        `json:"provider"`
-	HasUsageAPI      bool          `json:"has_usage_api"`
-	Status           string        `json:"status"`
-	Weight           int           `json:"weight"`
-	FiveHour         usageWindow   `json:"five_hour"`
-	SevenDay         usageWindow   `json:"seven_day"`
-	SevenDaySonnet   usageWindow   `json:"seven_day_sonnet"`
-	CapturedAt       *string       `json:"captured_at"`
-	Selection        selectionView `json:"selection"`
+	CredentialID     string      `json:"credential_id"`
+	Label            string      `json:"label"`
+	SubscriptionType string      `json:"subscription_type"`
+	Provider         string      `json:"provider"`
+	HasUsageAPI      bool        `json:"has_usage_api"`
+	Status           string      `json:"status"`
+	Weight           int         `json:"weight"`
+	FiveHour         usageWindow `json:"five_hour"`
+	SevenDay         usageWindow `json:"seven_day"`
+	// SevenDayScoped is nil when the plan publishes no model-scoped weekly
+	// limit (and for providers other than Anthropic).
+	SevenDayScoped *scopedWindow `json:"seven_day_scoped,omitempty"`
+	CapturedAt     *string       `json:"captured_at"`
+	Selection      selectionView `json:"selection"`
 	// Metered is populated only for providers with no usage API, where it is
 	// the only usage figure available.
 	Metered *meteredUsage `json:"metered,omitempty"`
@@ -142,25 +155,32 @@ func (s *Server) handleUsageCurrent(w http.ResponseWriter, r *http.Request) {
 			Weight:           c.Weight,
 		}
 		var capturedAt int64
-		var fhReset, sdReset, sdsReset sql.NullInt64
+		var fhReset, sdReset, scReset sql.NullInt64
+		var scPct sql.NullFloat64
+		var scLabel sql.NullString
 		var capValid bool
 		row := s.db.QueryRowContext(ctx, `
 			SELECT captured_at,
 			       five_hour_pct, five_hour_resets_at,
 			       seven_day_pct, seven_day_resets_at,
-			       seven_day_sonnet_pct, seven_day_sonnet_resets_at
+			       seven_day_scoped_pct, seven_day_scoped_resets_at, seven_day_scoped_label
 			FROM usage_history WHERE credential_id = ?
 			ORDER BY captured_at DESC LIMIT 1`, c.ID)
 		if err := row.Scan(&capturedAt,
 			&uc.FiveHour.Pct, &fhReset,
 			&uc.SevenDay.Pct, &sdReset,
-			&uc.SevenDaySonnet.Pct, &sdsReset); err == nil {
+			&scPct, &scReset, &scLabel); err == nil {
 			capValid = true
 		}
 		if capValid {
 			uc.FiveHour.ResetsAt = rfc3339Ptr(fhReset)
 			uc.SevenDay.ResetsAt = rfc3339Ptr(sdReset)
-			uc.SevenDaySonnet.ResetsAt = rfc3339Ptr(sdsReset)
+			if scPct.Valid {
+				uc.SevenDayScoped = &scopedWindow{
+					usageWindow: usageWindow{Pct: scPct.Float64, ResetsAt: rfc3339Ptr(scReset)},
+					Label:       scLabel.String,
+				}
+			}
 			ca := time.Unix(capturedAt, 0).UTC().Format(time.RFC3339)
 			uc.CapturedAt = &ca
 		}
@@ -233,6 +253,8 @@ func (s *Server) handleUsageCurrent(w http.ResponseWriter, r *http.Request) {
 					Weight:      int(bw),
 				}
 				if a.Quota.HasSignals {
+					uc.FiveHour.Absent = !a.Quota.HasFiveHour
+					uc.SevenDay.Absent = !a.Quota.HasSevenDay
 					uc.FiveHour.Pct = a.Quota.FiveHourPct
 					uc.SevenDay.Pct = a.Quota.SevenDayPct
 					if a.Quota.FiveHourResets > 0 {
@@ -283,10 +305,11 @@ func (s *Server) handleUsageCurrent(w http.ResponseWriter, r *http.Request) {
 
 // usagePoint is one raw snapshot row for a single credential.
 type usagePoint struct {
-	TS                int64
-	FiveHourPct       float64
-	SevenDayPct       float64
-	SevenDaySonnetPct float64
+	TS                  int64
+	FiveHourPct         float64
+	SevenDayPct         float64
+	SevenDayScopedPct   *float64
+	SevenDayScopedLabel string
 }
 
 // usageGridSeries is one credential's values aligned to the shared bucket grid.
@@ -296,7 +319,10 @@ type usageGridSeries struct {
 	Label             string     `json:"label"`
 	FiveHourPct       []*float64 `json:"five_hour_pct"`
 	SevenDayPct       []*float64 `json:"seven_day_pct"`
-	SevenDaySonnetPct []*float64 `json:"seven_day_sonnet_pct"`
+	SevenDayScopedPct []*float64 `json:"seven_day_scoped_pct"`
+	// ScopedLabel names the model of the latest scoped reading ("Fable"),
+	// empty when the credential never had one in the window.
+	ScopedLabel string `json:"seven_day_scoped_label,omitempty"`
 }
 
 // handleUsageHistory returns an aligned grid: a single `buckets` axis (the union
@@ -371,17 +397,21 @@ func (s *Server) handleUsageHistory(w http.ResponseWriter, r *http.Request) {
 			Label:             labels[cid],
 			FiveHourPct:       make([]*float64, len(buckets)),
 			SevenDayPct:       make([]*float64, len(buckets)),
-			SevenDaySonnetPct: make([]*float64, len(buckets)),
+			SevenDayScopedPct: make([]*float64, len(buckets)),
 		}
 		for _, p := range perCred[cid] {
 			i, ok := idx[p.TS]
 			if !ok {
 				continue // dropped by downsampling
 			}
-			fh, sd, ss := p.FiveHourPct, p.SevenDayPct, p.SevenDaySonnetPct
+			fh, sd := p.FiveHourPct, p.SevenDayPct
 			g.FiveHourPct[i] = &fh
 			g.SevenDayPct[i] = &sd
-			g.SevenDaySonnetPct[i] = &ss
+			if p.SevenDayScopedPct != nil {
+				sc := *p.SevenDayScopedPct
+				g.SevenDayScopedPct[i] = &sc
+				g.ScopedLabel = p.SevenDayScopedLabel
+			}
 		}
 		// Forward-fill gaps: utilization is stateful, so the last observed
 		// value is the correct estimate until the next snapshot. Leading
@@ -389,7 +419,7 @@ func (s *Server) handleUsageHistory(w http.ResponseWriter, r *http.Request) {
 		// credential must not appear to have existed retroactively.
 		forwardFill(g.FiveHourPct)
 		forwardFill(g.SevenDayPct)
-		forwardFill(g.SevenDaySonnetPct)
+		forwardFill(g.SevenDayScopedPct)
 		out = append(out, g)
 	}
 	writeJSON(w, map[string]any{"buckets": buckets, "series": out})
@@ -427,7 +457,8 @@ func downsample(ts []int64, maxN int) []int64 {
 
 func (s *Server) usageHistoryPoints(ctx context.Context, credID string, since, until time.Time) ([]usagePoint, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT captured_at, five_hour_pct, seven_day_pct, seven_day_sonnet_pct
+		SELECT captured_at, five_hour_pct, seven_day_pct,
+		       seven_day_scoped_pct, COALESCE(seven_day_scoped_label, '')
 		FROM usage_history
 		WHERE credential_id = ? AND captured_at >= ? AND captured_at < ?
 		ORDER BY captured_at ASC`, credID, since.Unix(), until.Unix())
@@ -438,7 +469,7 @@ func (s *Server) usageHistoryPoints(ctx context.Context, credID string, since, u
 	out := []usagePoint{}
 	for rows.Next() {
 		var p usagePoint
-		if err := rows.Scan(&p.TS, &p.FiveHourPct, &p.SevenDayPct, &p.SevenDaySonnetPct); err != nil {
+		if err := rows.Scan(&p.TS, &p.FiveHourPct, &p.SevenDayPct, &p.SevenDayScopedPct, &p.SevenDayScopedLabel); err != nil {
 			return nil, err
 		}
 		out = append(out, p)

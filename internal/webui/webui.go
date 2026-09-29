@@ -38,8 +38,8 @@ type Server struct {
 }
 
 // New builds the web UI HTTP handler. It authenticates itself via a signed
-// session cookie derived from password + a random boot salt, so restarting the
-// process invalidates all sessions.
+// session cookie keyed by the password and a secret persisted in the database,
+// so sessions survive restarts and end when the password changes.
 func New(db *store.DB, refresher *creds.Refresher, password string, secureCookies bool) http.Handler {
 	return NewWithCodex(db, refresher, password, secureCookies, nil)
 }
@@ -58,7 +58,7 @@ func NewWithCodex(db *store.DB, refresher *creds.Refresher, password string, sec
 		refresher:     refresher,
 		password:      password,
 		secureCookies: secureCookies,
-		hmacKey:       deriveKey(password),
+		hmacKey:       deriveKey(password, sessionSecret(db)),
 		static:        sub,
 		limiter:       newLoginLimiter(),
 		codex:         codex,
@@ -100,7 +100,7 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, rest string) {
 		s.handleLogout(w, r)
 		return
 	case "/session":
-		writeJSON(w, map[string]any{"authenticated": s.authenticated(r)})
+		s.handleSession(w, r)
 		return
 	}
 

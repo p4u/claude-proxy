@@ -38,10 +38,28 @@ func parseCodexQuota(raw rawQuotaBlob) CodexQuota {
 		reset := parseIntSignal(raw.Signals, "X-Codex-"+slot+"-Reset-At")
 		switch {
 		case win <= 360:
-			q.FiveHourPct, q.FiveHourResets = pct, reset
+			q.FiveHourPct, q.FiveHourResets, q.HasFiveHour = pct, reset, true
 		case win >= 6*24*60:
-			q.SevenDayPct, q.SevenDayResets = pct, reset
+			q.SevenDayPct, q.SevenDayResets, q.HasSevenDay = pct, reset, true
 		}
+	}
+	return q
+}
+
+// Current rolls the snapshot forward to now. Signals are only refreshed when
+// an account serves a request, so an idle account keeps the reading from its
+// last use indefinitely; a window whose reset instant has passed has since
+// rolled over, and its old percentage describes an allowance that no longer
+// exists. Such a window reads 0% with the reset unknown — the next request
+// through the account reports the new one. Without this an account idle past
+// its weekly reset keeps being penalised for spend that was already forgiven,
+// and the UI counts down to an instant in the past.
+func (q CodexQuota) Current(now time.Time) CodexQuota {
+	if q.FiveHourResets > 0 && q.FiveHourResets <= now.Unix() {
+		q.FiveHourPct, q.FiveHourResets = 0, 0
+	}
+	if q.SevenDayResets > 0 && q.SevenDayResets <= now.Unix() {
+		q.SevenDayPct, q.SevenDayResets = 0, 0
 	}
 	return q
 }
@@ -58,6 +76,7 @@ func parseFloatSignal(m map[string]string, k string) float64 {
 // AccountScore is the effective selection score for one Codex account, using
 // the same math the Anthropic pool uses per pick.
 func AccountScore(baseWeight int, q CodexQuota, now time.Time) float64 {
+	q = q.Current(now)
 	return pool.EffectiveScore(baseWeight, q.FiveHourPct, q.SevenDayPct, q.SevenDayResets, now)
 }
 

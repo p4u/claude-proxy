@@ -814,8 +814,10 @@ func credsUsage(ctx context.Context, args []string) {
 		}
 		printUsageBucket("  5h     ", &u.FiveHour)
 		printUsageBucket("  7d     ", &u.SevenDay)
-		printUsageBucket("  7d opus", u.SevenDayOpus)
-		printUsageBucket("  7d snnt", u.SevenDaySonnet)
+		if sc := u.ScopedWeekly(); sc != nil {
+			printUsageBucket(fmt.Sprintf("  7d %-4.4s", strings.ToLower(sc.Label)),
+				&usage.Bucket{Utilization: &sc.Pct, ResetsAt: sc.ResetsAt})
+		}
 		fmt.Println()
 	}
 }

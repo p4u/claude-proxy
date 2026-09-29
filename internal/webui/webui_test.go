@@ -557,14 +557,27 @@ func TestUsageCurrentSelection(t *testing.T) {
 		VALUES (?, ?, 5, NULL, 100, NULL, 0, NULL)`, cb.ID, now); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := db.ExecContext(ctx, `UPDATE usage_history
+		SET seven_day_scoped_pct = 30, seven_day_scoped_resets_at = ?, seven_day_scoped_label = 'Fable'
+		WHERE credential_id = ?`, now+86400, ca.ID); err != nil {
+		t.Fatal(err)
+	}
 	cookie := loginCookie(t, h)
 	w := do(t, h, http.MethodGet, "/api/usage/current", "", cookie)
 	if w.Code != http.StatusOK {
 		t.Fatalf("usage/current = %d: %s", w.Code, w.Body.String())
 	}
+	if strings.Contains(w.Body.String(), "seven_day_sonnet") {
+		t.Fatalf("the retired seven_day_sonnet field must not be emitted: %s", w.Body.String())
+	}
 	var rows []struct {
 		CredentialID string `json:"credential_id"`
-		Selection    struct {
+		Scoped       *struct {
+			Pct      float64 `json:"pct"`
+			ResetsAt *string `json:"resets_at"`
+			Label    string  `json:"label"`
+		} `json:"seven_day_scoped"`
+		Selection struct {
 			Room5h    float64 `json:"room_5h"`
 			Room7d    float64 `json:"room_7d"`
 			Score     float64 `json:"score"`
@@ -586,6 +599,18 @@ func TestUsageCurrentSelection(t *testing.T) {
 			share     float64
 			score     float64
 		}{r.Selection.Saturated, r.Selection.SharePct, r.Selection.Score}
+	}
+	for _, r := range rows {
+		switch r.CredentialID {
+		case ca.ID:
+			if r.Scoped == nil || r.Scoped.Pct != 30 || r.Scoped.Label != "Fable" || r.Scoped.ResetsAt == nil {
+				t.Fatalf("A scoped limit = %+v, want Fable 30%% with a reset", r.Scoped)
+			}
+		case cb.ID:
+			if r.Scoped != nil {
+				t.Fatalf("B has no scoped limit recorded; got %+v", r.Scoped)
+			}
+		}
 	}
 	if !sel[cb.ID].saturated {
 		t.Fatal("B should be saturated (7d=100)")

@@ -49,6 +49,13 @@ func TestParseCodexQuotaMapsByWindowMinutes(t *testing.T) {
 		t.Fatalf("secondary 10080min should map to 7d; got pct=%v resets=%v", q2.SevenDayPct, q2.SevenDayResets)
 	}
 
+	if q.HasFiveHour || !q.HasSevenDay {
+		t.Fatalf("prolite publishes only the weekly window; got 5h=%v 7d=%v", q.HasFiveHour, q.HasSevenDay)
+	}
+	if !q2.HasFiveHour || !q2.HasSevenDay {
+		t.Fatalf("team publishes both windows; got 5h=%v 7d=%v", q2.HasFiveHour, q2.HasSevenDay)
+	}
+
 	if empty := parseCodexQuota(rawQuotaBlob{}); empty.HasSignals {
 		t.Fatal("empty signals must be marked HasSignals=false")
 	}
@@ -170,5 +177,34 @@ func TestEffectiveWeightsIncludesAccountsPastCooldown(t *testing.T) {
 	}
 	if _, ok := got["cooling"]; ok {
 		t.Error("account still in cooldown must be omitted")
+	}
+}
+
+// Signals only refresh when an account serves a request. Production case: the
+// team accounts last ran on 2026-09-26, so on 2026-09-29 their 5h reset was
+// days in the past (the UI showed "resetting…") and elboletaire still carried
+// 71% of a weekly window that had reset on 2026-09-26, depressing its weight.
+func TestQuotaCurrentRollsOverElapsedWindows(t *testing.T) {
+	now := time.Date(2026, 9, 29, 13, 0, 0, 0, time.UTC)
+	stale := CodexQuota{
+		HasSignals: true, HasFiveHour: true, HasSevenDay: true, PlanType: "team",
+		FiveHourPct: 40, FiveHourResets: 1790394751, // 2026-09-26
+		SevenDayPct: 71, SevenDayResets: 1790420920, // 2026-09-26
+	}
+	got := stale.Current(now)
+	if got.FiveHourPct != 0 || got.FiveHourResets != 0 || got.SevenDayPct != 0 || got.SevenDayResets != 0 {
+		t.Fatalf("elapsed windows must roll over to 0%% / unknown reset; got %+v", got)
+	}
+	if !got.HasFiveHour || !got.HasSevenDay || !got.HasSignals || got.PlanType != "team" {
+		t.Fatalf("rollover must keep which windows the plan has; got %+v", got)
+	}
+
+	live := CodexQuota{FiveHourPct: 40, FiveHourResets: now.Add(time.Hour).Unix(), SevenDayPct: 71, SevenDayResets: now.Add(48 * time.Hour).Unix()}
+	if live.Current(now) != live {
+		t.Fatal("windows that have not reset yet must be left untouched")
+	}
+
+	if AccountScore(1, stale, now) != AccountScore(1, CodexQuota{}, now) {
+		t.Error("score must not penalise usage from a window that has already reset")
 	}
 }

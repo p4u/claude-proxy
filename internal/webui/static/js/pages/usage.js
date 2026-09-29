@@ -17,8 +17,12 @@ export async function render(root) {
   const chartsWrap = el("div", { class: "usage-charts" });
   root.append(head, cards, chartsWrap);
 
+  // Name of the model-scoped weekly limit ("Fable"), taken from the data so
+  // the chart follows whatever model Anthropic scopes next.
+  let scopedLabel = "";
   try {
     const rows = await api.usageCurrent();
+    scopedLabel = (rows || []).find((r) => r.seven_day_scoped?.label)?.seven_day_scoped.label || "";
     clear(cards);
     if (!rows || !rows.length) {
       cards.append(emptyState("No subscriptions yet", "Import a credential to start multiplexing. The usage poller records a snapshot every 10 minutes."));
@@ -29,11 +33,11 @@ export async function render(root) {
     clear(cards).append(errorState(e.message, () => render(root)));
   }
 
-  renderCharts(chartsWrap);
+  renderCharts(chartsWrap, scopedLabel);
 }
 
 // Charts section: a scoped period picker driving the History + Selection charts.
-function renderCharts(wrap) {
+function renderCharts(wrap, scopedLabel) {
   clear(wrap);
   const win = getWindow();
   const picker = el("div", { class: "usage-charts__head" }, [
@@ -44,12 +48,12 @@ function renderCharts(wrap) {
     periodControl(win, (sel) => {
       if (sel.mode === "custom") setWindowCustom(sel.from, sel.to);
       else setWindowPeriod(sel.period);
-      renderCharts(wrap);
+      renderCharts(wrap, scopedLabel);
     }),
   ]);
   const grid = el("div", { class: "grid grid--charts" });
   wrap.append(picker, grid);
-  historyChart(grid, win);
+  historyChart(grid, win, scopedLabel);
   selectionChart(grid, win);
 }
 
@@ -79,7 +83,7 @@ function meteredRows(m) {
 function subCard(r) {
   const five = r.five_hour || {};
   const seven = r.seven_day || {};
-  const sonnet = r.seven_day_sonnet || {};
+  const scoped = r.seven_day_scoped || null;
   const sel = r.selection || null;
   const noUsageAPI = r.has_usage_api === false;
   return el("div", { class: "card sub-card" }, [
@@ -101,7 +105,7 @@ function subCard(r) {
     // against, and inventing one would read as authoritative when it is not.
     noUsageAPI
       ? meteredRows(r.metered)
-      : el("div", { class: "sub-card__meters" }, quotaMeters(r, five, seven, sonnet)),
+      : el("div", { class: "sub-card__meters" }, quotaMeters(r, five, seven, scoped)),
     sel ? selectionRow(sel) : null,
     el("div", { class: "sub-card__foot", text: noUsageAPI
       ? "metered by this proxy — no quota API upstream"
@@ -110,24 +114,29 @@ function subCard(r) {
 }
 
 // quotaMeters lists the utilization windows the upstream actually enforces.
-// Anthropic publishes 5h, 7d and a Sonnet-only 7d. OpenAI Codex publishes a
-// 5-hour and a weekly limit — and not every plan has both: "prolite" reports
-// only the weekly one (its 5h window has zero length), so a window with no
-// reset instant is not drawn rather than shown as a permanent 0%. Before the
-// first request there are no signals at all; then both are drawn empty so the
-// card has the same shape it will have once traffic arrives.
-function quotaMeters(r, five, seven, sonnet) {
+// Anthropic publishes 5h, 7d and, on plans that have one, a weekly cap scoped
+// to one model (`seven_day_scoped`, labelled by the API — "Fable" today; the
+// per-model seven_day_sonnet bucket it replaced is always null now). OpenAI
+// Codex publishes a 5-hour and a weekly limit — and not every plan has both:
+// "prolite" has no 5-hour limit, which the server marks `absent`, so that
+// meter is not drawn.
+// A Codex window with a null reset is a different case: the account has been
+// idle since its last reset, the server has rolled the reading over to 0%,
+// and the next reset is only learned from the next request through it.
+// Before the first request there are no signals at all; then both are drawn
+// empty so the card has the same shape it will have once traffic arrives.
+function quotaMeters(r, five, seven, scoped) {
   if (r.provider !== "codex") {
     return [
       meter({ label: "5-hour window", value: five.pct, resets: countdown(five.resets_at) }),
       meter({ label: "7-day window", value: seven.pct, resets: countdown(seven.resets_at) }),
-      meter({ label: "7-day Sonnet", value: sonnet.pct, resets: countdown(sonnet.resets_at) }),
-    ];
+      scoped ? meter({ label: `7-day ${scoped.label || "model"}`, value: scoped.pct, resets: countdown(scoped.resets_at) }) : null,
+    ].filter(Boolean);
   }
-  const noSignals = !five.resets_at && !seven.resets_at;
+  const resets = (w) => w.resets_at ? countdown(w.resets_at) : (r.captured_at ? "reset, unused since" : "—");
   const out = [];
-  if (noSignals || five.resets_at) out.push(meter({ label: "5-hour limit", value: five.pct, resets: countdown(five.resets_at) }));
-  if (noSignals || seven.resets_at) out.push(meter({ label: "Weekly limit", value: seven.pct, resets: countdown(seven.resets_at) }));
+  if (!five.absent) out.push(meter({ label: "5-hour limit", value: five.pct, resets: resets(five) }));
+  if (!seven.absent) out.push(meter({ label: "Weekly limit", value: seven.pct, resets: resets(seven) }));
   return out;
 }
 
@@ -161,13 +170,13 @@ function tsOf(v) {
 // {buckets:[ts...], series:[{credential_id,label,five_hour_pct:[...], ...}]}.
 // One value per bucket per series, null where a credential has no snapshot;
 // uPlot renders the gaps natively.
-async function historyChart(wrap, win) {
+async function historyChart(wrap, win, scopedLabel) {
   let metric = "five_hour_pct";
   const metricOpts = [
     { value: "five_hour_pct", label: "5-hour" },
     { value: "seven_day_pct", label: "7-day" },
-    { value: "seven_day_sonnet_pct", label: "Sonnet" },
   ];
+  if (scopedLabel) metricOpts.push({ value: "seven_day_scoped_pct", label: `7-day ${scopedLabel}` });
   const frame = chartFrame({
     eyebrow: "history",
     title: "Utilization history",
