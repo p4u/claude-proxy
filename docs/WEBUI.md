@@ -141,9 +141,15 @@ internal keys are configured. The browser never receives the management key or
 OAuth tokens; list responses are rebuilt from an allowlist of safe fields.
 
 - `GET /api/codex/accounts` → `{configured,accounts:[{name,auth_index,email,label,
-  status,status_message,account_type,account,disabled,unavailable,success,failed,
-  last_refresh,weight}]}`. Non-Codex sidecar auth files and token/JWT fields are
-  dropped; a missing weight is displayed as the sidecar default of 1.
+  status,status_message,account_type,account,disabled,unavailable,next_retry_after,
+  blocked,success,failed,last_refresh,weight}]}`. Non-Codex sidecar auth files and
+  token/JWT fields are dropped; a missing weight is displayed as the sidecar
+  default of 1. `blocked` is the field to render as errored: the sidecar leaves
+  `status:"error"` and `unavailable:true` in place after its cooldown
+  (`next_retry_after`) has passed, until the account next serves a request, while
+  it is already selectable again. `blocked` applies the sidecar's own rule
+  (disabled, or unavailable with a retry time still in the future or none at
+  all).
 - `POST /api/codex/oauth/start` → `{url,state,callback_uri,callback_uris,
   callback_mode}`. Starts
   CLIProxyAPI's PKCE flow and is globally rate-limited to one start per 3 seconds.

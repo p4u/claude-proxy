@@ -81,9 +81,18 @@ type Account struct {
 	Account       string `json:"account,omitempty"`
 	Disabled      bool   `json:"disabled"`
 	Unavailable   bool   `json:"unavailable"`
-	Success       int64  `json:"success"`
-	Failed        int64  `json:"failed"`
-	LastRefresh   string `json:"last_refresh,omitempty"`
+	// NextRetryAfter ends the sidecar's cooldown for an Unavailable account.
+	// The sidecar never clears Unavailable/Status by itself once it passes —
+	// only a later successful request through the account does — so the raw
+	// flags stay "error" indefinitely for an account nothing routes to.
+	NextRetryAfter string `json:"next_retry_after,omitempty"`
+	// Blocked is whether the sidecar will currently refuse to select the
+	// account (see BlockedAt). This, not Unavailable, is what callers must
+	// treat as "errored".
+	Blocked     bool   `json:"blocked"`
+	Success     int64  `json:"success"`
+	Failed      int64  `json:"failed"`
+	LastRefresh string `json:"last_refresh,omitempty"`
 	// Weight is the effective selection weight held by the sidecar. The
 	// operator's base weight lives in claude-proxy's DB; RebalanceLoop is
 	// the only writer to this field.
@@ -99,6 +108,28 @@ type Account struct {
 // CodexQuota is derived from a sidecar quota.signals block (OpenAI response
 // headers). Fields are zero-valued when the account has never handled a
 // request under the current session.
+// BlockedAt mirrors CLIProxyAPI's own selection rule (availabilityBlock in
+// sdk/cliproxy/auth/selector.go, v7.2.149): an Unavailable account is skipped
+// only while its NextRetryAfter lies in the future, or indefinitely when it
+// has no retry time at all. Once the cooldown has passed the sidecar selects
+// it again, so treating the stale flag as authoritative would exclude a
+// healthy account forever — the rebalance loop would never give it weight,
+// it would never serve the request that clears the flag, and the UI would
+// show it errored.
+func (a Account) BlockedAt(now time.Time) bool {
+	if a.Disabled {
+		return true
+	}
+	if !a.Unavailable {
+		return false
+	}
+	retry, err := time.Parse(time.RFC3339Nano, a.NextRetryAfter)
+	if err != nil || retry.IsZero() {
+		return true
+	}
+	return retry.After(now)
+}
+
 type CodexQuota struct {
 	FiveHourPct    float64 `json:"five_hour_pct"`
 	FiveHourResets int64   `json:"five_hour_resets_at,omitempty"`
@@ -154,6 +185,7 @@ func (c *Client) Accounts(ctx context.Context) ([]Account, error) {
 	if err := c.do(ctx, http.MethodGet, "/v0/management/auth-files", nil, &response, true); err != nil {
 		return nil, err
 	}
+	now := time.Now()
 	accounts := make([]Account, 0, len(response.Files))
 	for _, file := range response.Files {
 		if !strings.EqualFold(file.Type, "codex") && !strings.EqualFold(file.Provider, "codex") {
@@ -161,6 +193,7 @@ func (c *Client) Accounts(ctx context.Context) ([]Account, error) {
 		}
 		acc := file.Account
 		acc.Quota = parseCodexQuota(latestQuota(file))
+		acc.Blocked = acc.BlockedAt(now)
 		accounts = append(accounts, acc)
 	}
 	return accounts, nil

@@ -119,7 +119,7 @@ func EffectiveWeights(accounts []Account, base map[string]int64, now time.Time) 
 	scores := make(map[string]float64, len(accounts))
 	var maxScore float64
 	for _, a := range accounts {
-		if a.Disabled || a.Unavailable {
+		if a.BlockedAt(now) {
 			continue
 		}
 		w := base[a.Name]

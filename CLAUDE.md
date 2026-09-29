@@ -396,6 +396,16 @@ afterwards failed before reaching the sidecar. Re-adding accounts in the web UI
 could not help, since they live in the sidecar; only `ReconcileCredential` at
 startup resets the row to `active`.
 
+**The sidecar's `unavailable`/`status:"error"` flags go stale.** After an
+error CLIProxyAPI sets them with a `next_retry_after`, but it only clears them
+when the account next serves a successful request; its selector already treats
+the account as available once the retry time passes. `Account.BlockedAt`
+mirrors that rule (`availabilityBlock` in the sidecar's `selector.go`), and the
+rebalance loop, `/api/usage/current` and the Credentials table all use it (the
+API exposes it as `blocked`). Keying off the raw `unavailable` flag froze three
+healthy accounts after the 2026-09-26 incident: the loop never pushed them a
+weight, so nothing routed the request that would have cleared the flag.
+
 The web UI starts a fresh sidecar-owned OAuth flow; it must not upload
 `~/.codex/auth.json`. The OAuth callback listener is bound to host loopback on
 `127.0.0.1:1455` because OpenAI's registered redirect is fixed to localhost.

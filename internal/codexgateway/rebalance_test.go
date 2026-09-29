@@ -130,3 +130,45 @@ func TestEffectiveWeightsUsesBaseWeightInScore(t *testing.T) {
 		t.Fatalf("small should be ~1/5 of big; got small=%d big=%d", got["small"], got["big"])
 	}
 }
+
+// The sidecar leaves Unavailable set after its cooldown ends, until the
+// account next serves a request. Production case: three accounts hit one
+// transient 401 on 2026-09-26 with a 30-minute retry window; three days later
+// they were still Unavailable, the loop never pushed them a weight, and so
+// nothing ever routed the request that would have cleared the flag.
+func TestBlockedAtFollowsSidecarCooldown(t *testing.T) {
+	now := time.Date(2026, 9, 29, 13, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		acc  Account
+		want bool
+	}{
+		{"healthy", Account{}, false},
+		{"disabled", Account{Disabled: true}, true},
+		{"cooldown pending", Account{Unavailable: true, NextRetryAfter: "2026-09-29T21:30:00+08:00"}, true},
+		{"cooldown elapsed", Account{Unavailable: true, NextRetryAfter: "2026-09-26T07:22:37.312949958+08:00"}, false},
+		{"unavailable without retry time", Account{Unavailable: true}, true},
+		{"unparseable retry time", Account{Unavailable: true, NextRetryAfter: "soon"}, true},
+	}
+	for _, c := range cases {
+		if got := c.acc.BlockedAt(now); got != c.want {
+			t.Errorf("%s: BlockedAt = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestEffectiveWeightsIncludesAccountsPastCooldown(t *testing.T) {
+	now := time.Date(2026, 9, 29, 13, 0, 0, 0, time.UTC)
+	accounts := []Account{
+		{Name: "fresh"},
+		{Name: "stale", Unavailable: true, NextRetryAfter: "2026-09-26T07:22:37+08:00"},
+		{Name: "cooling", Unavailable: true, NextRetryAfter: "2026-09-29T22:00:00+08:00"},
+	}
+	got := EffectiveWeights(accounts, map[string]int64{"fresh": 1, "stale": 1, "cooling": 1}, now)
+	if got["stale"] != effectiveWeightMax {
+		t.Errorf("account past its cooldown must be weighted like a healthy one; got %d", got["stale"])
+	}
+	if _, ok := got["cooling"]; ok {
+		t.Error("account still in cooldown must be omitted")
+	}
+}

@@ -194,7 +194,10 @@ func (s *Server) handleUsageCurrent(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case a.Disabled:
 					status = "disabled"
-				case a.Unavailable:
+				case a.BlockedAt(now):
+					// Not a.Unavailable: the sidecar leaves that set after
+					// its cooldown ends, so it would pin a healthy account
+					// as errored.
 					status = "errored"
 				}
 				bw := base[a.Name]

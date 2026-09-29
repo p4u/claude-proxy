@@ -20,14 +20,14 @@ const CREDS = [
 
 const CODEX_ACCOUNTS = [
   { name: "codex-owner-pro-91c7.json", auth_index: "mock-codex-owner", email: "owner@example.com",
-    account_type: "pro", status: "active", disabled: false, unavailable: false,
+    account_type: "pro", status: "active", disabled: false, unavailable: false, blocked: false,
     success: 418, failed: 3, weight: 733, base_weight: 5, effective_weight: 733,
     quota: { five_hour_pct: 12, seven_day_pct: 3, plan_type: "pro", has_signals: true },
     last_refresh: new Date(Date.now() - 42 * 60 * 1000).toISOString() },
   // A "prolite" plan publishes only a weekly limit (its 5-hour window has zero
   // length), so the card must draw a single meter for it.
   { name: "codex-lite-2f0a.json", auth_index: "mock-codex-lite", email: "lite@example.com",
-    account_type: "oauth", status: "active", disabled: false, unavailable: false,
+    account_type: "oauth", status: "active", disabled: false, unavailable: false, blocked: false,
     success: 61, failed: 0, weight: 50, base_weight: 1, effective_weight: 50,
     quota: { five_hour_pct: 0, seven_day_pct: 7, plan_type: "prolite", has_signals: true, weekly_only: true },
     last_refresh: new Date(Date.now() - 9 * 60 * 1000).toISOString() },
@@ -270,7 +270,7 @@ const DB = {
         credential_id: "codex:" + a.name, label: a.email || a.label || a.name,
         subscription_type: a.quota?.plan_type || a.account_type || "subscription", provider: "codex",
         has_usage_api: true,
-        status: a.disabled ? "disabled" : (a.unavailable ? "errored" : "active"),
+        status: a.disabled ? "disabled" : (a.blocked ? "errored" : "active"),
         weight: bw,
         five_hour: { pct: five, resets_at: a.quota?.has_signals && !a.quota?.weekly_only ? now + 4 * 3600 : null },
         seven_day: { pct: seven, resets_at: a.quota?.has_signals ? now + 6 * 86400 : null },

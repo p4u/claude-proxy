@@ -97,7 +97,10 @@ function codexCredentialRows(data) {
     label: account.email || account.label || account.account || account.name,
     provider: "codex",
     subscription_type: account.account_type || "subscription",
-    status: account.disabled ? "disabled" : (account.unavailable ? "errored" : (account.status || "active")),
+    // `blocked`, not `unavailable`/`status`: the sidecar keeps those at
+    // "error" after its cooldown ends, until the account next serves a
+    // request, so they would pin a healthy account as errored.
+    status: account.disabled ? "disabled" : (account.blocked ? "errored" : "active"),
     weight: account.base_weight ?? 1,
     effective_weight: account.effective_weight ?? null,
     request_count: (account.success || 0) + (account.failed || 0),
