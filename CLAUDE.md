@@ -86,7 +86,8 @@ Claude Code (ANTHROPIC_BASE_URL → proxy)
         reinjects it only for Anthropic, because the Codex sidecar's translated
         catalogue becomes obfuscated when that header is forwarded
       → on 401: OAuth credential → refresher triggers token refresh → retry;
-        API key → marked revoked immediately (nothing to refresh)
+        API key → marked revoked immediately (nothing to refresh);
+        delegated-auth gateway (Codex sidecar) → relayed, status untouched
       → on 429: mark credential "limited", synthesize Retry-After if missing → pass 429 to client
       → on 200: heal "limited" → "active" immediately
   → SSE response streamed back verbatim
@@ -383,6 +384,17 @@ decorated with `base_weight` (from DB) and `effective_weight` (what the loop
 will push next), so the browser view matches the sidecar's next state. `internal/codexgateway` exposes only the typed, sanitized management
 operations used by the web UI (start/poll/cancel OAuth, callback submission,
 list/disable/weight/delete accounts).
+
+**A sidecar 401 never revokes `gateway_codex`** (`provider.DelegatedAuth`). The
+sidecar refreshes and retries every account itself before answering 401, so the
+error describes the accounts behind it (or an OpenAI-side auth hiccup), not the
+local credential. Revoking it once took Codex offline for days: one request on
+2026-09-25 hit a transient OpenAI rejection (`Incorrect API key provided:
+sk-svcac…`, the same key for all four accounts, even though CLIProxyAPI had sent
+fresh OAuth JWTs), the proxy marked the gateway revoked, and every Codex request
+afterwards failed before reaching the sidecar. Re-adding accounts in the web UI
+could not help, since they live in the sidecar; only `ReconcileCredential` at
+startup resets the row to `active`.
 
 The web UI starts a fresh sidecar-owned OAuth flow; it must not upload
 `~/.codex/auth.json`. The OAuth callback listener is bound to host loopback on

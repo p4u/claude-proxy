@@ -72,3 +72,41 @@ func TestCodexModelsAreAdvertisedForClaudeCode(t *testing.T) {
 		t.Fatalf("bare GPT model would be hidden by Claude Code: %s", w.Body.String())
 	}
 }
+
+// A 401 from the Codex sidecar is relayed but must not revoke the gateway
+// credential. It happened in production: a transient OpenAI-side auth failure
+// made the sidecar answer one request with 401, the proxy revoked
+// gateway_codex, and every later Codex request got 503 — while all four
+// accounts behind the sidecar were healthy — until the container restarted.
+func TestCodex401DoesNotRevokeGateway(t *testing.T) {
+	hits := 0
+	h := codexProxySetup(t, func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		if hits == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, `{"type":"error","error":{"type":"authentication_error","message":"Incorrect API key provided"}}`)
+			return
+		}
+		fmt.Fprint(w, `{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"gpt-6-astra","usage":{"input_tokens":1,"output_tokens":1}}`)
+	})
+
+	w := postMessages(t, h, "claude-gpt-6-astra")
+	if w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), "Incorrect API key") {
+		t.Fatalf("sidecar 401 not relayed as-is: %d %s", w.Code, w.Body.String())
+	}
+	list, err := creds.List(context.Background(), h.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if list[0].Status != creds.StatusActive {
+		t.Fatalf("gateway credential status = %q after a sidecar 401, want active", list[0].Status)
+	}
+
+	if w := postMessages(t, h, "claude-gpt-6-astra"); w.Code != http.StatusOK {
+		t.Fatalf("follow-up request = %d %s, want 200 (provider must stay reachable)", w.Code, w.Body.String())
+	}
+	if hits != 2 {
+		t.Fatalf("sidecar hit %d times, want 2 (no refresh-and-retry on 401)", hits)
+	}
+}

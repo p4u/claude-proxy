@@ -97,6 +97,16 @@ type Provider struct {
 	// nothing to refresh, and a 401 means the key is bad, not stale.
 	Refreshable bool
 
+	// DelegatedAuth is true when the local credential only authenticates this
+	// proxy to a gateway that holds the real upstream credentials itself (the
+	// CLIProxyAPI sidecar for Codex). A 401 from such a gateway describes an
+	// account behind it — or an upstream auth hiccup — not the local
+	// credential, so it is passed through without touching credential status.
+	// Marking it revoked would take the whole provider offline, and nothing
+	// but a proxy restart would bring it back: the gateway's accounts can be
+	// re-added, refreshed or healthy again without this proxy ever noticing.
+	DelegatedAuth bool
+
 	// PollsUsage is true when the upstream exposes a utilization API
 	// (Anthropic's /api/oauth/usage) for the usage-aware selection score.
 	//
@@ -221,6 +231,7 @@ var registry = []Provider{
 		BaseURL:         "", // supplied by the internal gateway credential
 		ModelPrefixes:   []string{"gpt-"},
 		Refreshable:     false, // CLIProxyAPI refreshes the OAuth credentials
+		DelegatedAuth:   true,
 		PollsUsage:      false,
 		Augment1M:       false,
 		AdvertisePrefix: "claude-",

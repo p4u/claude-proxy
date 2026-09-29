@@ -409,7 +409,15 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 		"rl_requests_remaining", resp.Header.Get("Anthropic-Ratelimit-Requests-Remaining"),
 	)
 
-	if resp.StatusCode == http.StatusUnauthorized && allowRetry && !up.Refreshable {
+	if resp.StatusCode == http.StatusUnauthorized && up.DelegatedAuth {
+		// The gateway already refreshed and retried every account behind it
+		// before answering 401; there is nothing to refresh here, and the
+		// local credential is not what was rejected. Relay the error as-is.
+		h.log.Warn("upstream 401 from delegated-auth gateway; credential status unchanged",
+			"cred", cred.ID, "label", cred.Label, "provider", string(up.ID))
+	}
+
+	if resp.StatusCode == http.StatusUnauthorized && allowRetry && !up.Refreshable && !up.DelegatedAuth {
 		// Static API key: a 401 means the key is wrong or revoked, not stale.
 		// Retrying after a "refresh" would be a no-op that burns a second
 		// request and reports a misleading OAuth failure, so fail immediately
@@ -425,7 +433,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 		return 401, 0, tokenUsage{}, ""
 	}
 
-	if resp.StatusCode == http.StatusUnauthorized && allowRetry {
+	if resp.StatusCode == http.StatusUnauthorized && allowRetry && !up.DelegatedAuth {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		_ = resp.Body.Close()
 		h.log.Warn("upstream 401; attempting refresh",
