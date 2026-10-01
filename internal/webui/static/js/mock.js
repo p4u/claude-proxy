@@ -32,7 +32,17 @@ const CODEX_ACCOUNTS = [
     quota: { five_hour_pct: 0, seven_day_pct: 7, plan_type: "prolite", has_signals: true, weekly_only: true },
     last_refresh: new Date(Date.now() - 9 * 60 * 1000).toISOString() },
 ];
-let codexOAuthPolls = 0;
+// Google Gemini (Antigravity) accounts: one quota bucket per account, carried
+// in the five_hour slot; plan_type is Google's tier.
+const GEMINI_ACCOUNTS = [
+  { name: "antigravity-owner@gmail.com.json", auth_index: "mock-gemini-owner", email: "owner@gmail.com",
+    account_type: "oauth", status: "active", disabled: false, unavailable: false, blocked: false,
+    success: 37, failed: 0, weight: 1000, base_weight: 1, effective_weight: 1000,
+    quota: { five_hour_pct: 18, plan_type: "free", has_signals: true, five_hour_window: true },
+    last_refresh: new Date(Date.now() - 20 * 60 * 1000).toISOString() },
+];
+const SIDECAR_ACCOUNTS = { codex: CODEX_ACCOUNTS, gemini: GEMINI_ACCOUNTS };
+const sidecarOAuthPolls = { codex: 0, gemini: 0 };
 
 // Mirrors internal/provider: only Anthropic publishes a utilization API.
 const providerOf = (c) => c.provider || "anthropic";
@@ -279,7 +289,25 @@ const DB = {
         selection: { room_5h: room5, room_7d: room7, urgency: 0, score, share_pct: score > 0 ? 100 : 0, saturated },
       };
     });
-    return [...anthropicLike, ...codexRows];
+    const geminiRows = GEMINI_ACCOUNTS.map((a) => {
+      const bw = a.base_weight ?? 1;
+      const five = a.quota?.five_hour_pct ?? 0;
+      const room5 = Math.max(0, 1 - five / 100);
+      const saturated = five >= 100;
+      const score = a.disabled || saturated ? 0 : bw * room5;
+      return {
+        credential_id: "gemini:" + a.name, label: a.email || a.label || a.name,
+        subscription_type: a.quota?.plan_type || a.account_type || "subscription", provider: "gemini",
+        has_usage_api: true,
+        status: a.disabled ? "disabled" : (a.blocked ? "errored" : "active"),
+        weight: bw,
+        five_hour: { pct: five, resets_at: a.quota?.has_signals ? now + 2.5 * 3600 : null },
+        seven_day: { pct: 0, resets_at: null, absent: true },
+        captured_at: a.quota?.has_signals ? now - 45 : null,
+        selection: { room_5h: room5, room_7d: 1, urgency: 0, score, share_pct: score > 0 ? 100 : 0, saturated },
+      };
+    });
+    return [...anthropicLike, ...codexRows, ...geminiRows];
   },
   "/usage/history": (q) => {
     // Aligned grid: shared buckets, one value per bucket per series, null gaps.
@@ -332,7 +360,9 @@ const DB = {
     })),
   "/credentials/endpoints": () => MOCK_ENDPOINTS,
   "/codex/accounts": () => ({ configured: true, accounts: CODEX_ACCOUNTS }),
-  "/codex/oauth/status": () => ({ status: ++codexOAuthPolls > 2 ? "ok" : "wait" }),
+  "/codex/oauth/status": () => ({ status: ++sidecarOAuthPolls.codex > 2 ? "ok" : "wait" }),
+  "/gemini/accounts": () => ({ configured: true, accounts: GEMINI_ACCOUNTS }),
+  "/gemini/oauth/status": () => ({ status: ++sidecarOAuthPolls.gemini > 2 ? "ok" : "wait" }),
   "/users": () =>
     USERS.map((u, i) => ({
       id: u.id, name: u.name, status: u.status, full_capture: u.full_capture,
@@ -483,22 +513,26 @@ window.fetch = async (input, init = {}) => {
 
   // Mutations: acknowledge.
   if (method !== "GET") {
-    if (path === "/codex/oauth/start") {
-      codexOAuthPolls = 0;
-      return json({ url: "about:blank#mock-openai-login", state: "mock_codex_state", callback_mode: "localhost_or_manual" });
+    // Sidecar channels share one handler set: /codex/* and /gemini/*.
+    const sc = path.match(/^\/(codex|gemini)(\/.*)$/);
+    const scAccounts = sc ? SIDECAR_ACCOUNTS[sc[1]] : null;
+    const scPath = sc ? sc[2] : "";
+    if (scPath === "/oauth/start") {
+      sidecarOAuthPolls[sc[1]] = 0;
+      return json({ url: `about:blank#mock-${sc[1]}-login`, state: `mock_${sc[1]}_state`, callback_mode: "localhost_or_manual" });
     }
-    if (path === "/codex/oauth/callback") return json({ ok: true });
-    if (path === "/codex/oauth/cancel") return json({ ok: true });
-    if (path === "/codex/accounts/status") {
+    if (scPath === "/oauth/callback") return json({ ok: true });
+    if (scPath === "/oauth/cancel") return json({ ok: true });
+    if (scPath === "/accounts/status") {
       const b = JSON.parse(init.body || "{}");
-      const a = CODEX_ACCOUNTS.find((x) => x.name === b.name);
+      const a = scAccounts.find((x) => x.name === b.name);
       if (!a) return json({ error: "account not found" }, 404);
       a.disabled = !!b.disabled;
       return json({ ok: true });
     }
-    if (path === "/codex/accounts/weight") {
+    if (scPath === "/accounts/weight") {
       const b = JSON.parse(init.body || "{}");
-      const a = CODEX_ACCOUNTS.find((x) => x.name === b.name);
+      const a = scAccounts.find((x) => x.name === b.name);
       if (!a) return json({ error: "account not found" }, 404);
       if (!Number.isInteger(b.weight) || b.weight < 1 || b.weight > 1_000_000) {
         return json({ error: "weight must be between 1 and 1000000" }, 400);
@@ -506,11 +540,11 @@ window.fetch = async (input, init = {}) => {
       a.base_weight = b.weight;
       return json({ ok: true, weight: a.base_weight });
     }
-    if (path === "/codex/accounts/delete") {
+    if (scPath === "/accounts/delete") {
       const b = JSON.parse(init.body || "{}");
-      const i = CODEX_ACCOUNTS.findIndex((x) => x.name === b.name);
+      const i = scAccounts.findIndex((x) => x.name === b.name);
       if (i < 0) return json({ error: "account not found" }, 404);
-      CODEX_ACCOUNTS.splice(i, 1);
+      scAccounts.splice(i, 1);
       return json({ ok: true });
     }
     if (path === "/users" && method === "POST") return json({ id: "utok_new", name: JSON.parse(init.body || "{}").name || "new", token: "cpu_" + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2) });

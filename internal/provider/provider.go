@@ -31,6 +31,11 @@ const (
 	// CLIProxyAPI sidecar. The sidecar owns OAuth refresh and account selection;
 	// this proxy sees one internal gateway credential.
 	Codex ID = "codex"
+	// Gemini is a Google account subscription (free, AI Pro or Ultra tier)
+	// signed in through Antigravity's OAuth and served by the same CLIProxyAPI
+	// sidecar as Codex. Not an API key: usage counts against the account's
+	// tier quota, never against Gemini API billing.
+	Gemini ID = "gemini"
 	// Custom is any self-hosted or third-party Anthropic-compatible endpoint.
 	// Unlike the others it has no fixed base URL and no fixed model list: both
 	// live on the credential, because each custom host is its own upstream.
@@ -145,6 +150,29 @@ type Provider struct {
 	// the alias never escapes this proxy, and the native "glm-4.7" keeps
 	// working for clients that address it directly.
 	AdvertisePrefix string
+
+	// CatalogOwner restricts the models this provider advertises to the
+	// upstream entries whose owned_by matches, on top of ModelPrefixes.
+	//
+	// Codex and Gemini share one CLIProxyAPI sidecar, whose GET /v1/models
+	// lists every model of every signed-in account. Antigravity's catalogue
+	// alone includes claude-* and gpt-oss-* models (owned_by "antigravity"):
+	// unfiltered, they would surface under the Codex rows, and gpt-oss would
+	// even match Codex's "gpt-" route while being served by a Google account.
+	// Empty means no filtering.
+	CatalogOwner string
+
+	// CatalogExclude drops advertised models whose ID contains any of these
+	// substrings — models the catalogue lists that Claude Code cannot use as a
+	// chat model (Gemini's image-generation model).
+	CatalogExclude []string
+
+	// DefaultMaxInputTokens is assumed for catalogue entries that publish no
+	// max_input_tokens. The sidecar's OpenAI-shaped /v1/models carries no
+	// context size, while every Gemini chat model served through Antigravity
+	// has a 1,048,576-token window (fetchAvailableModels reports maxTokens
+	// 1048576); with Augment1M this is what earns them their "[1m]" rows.
+	DefaultMaxInputTokens int64
 }
 
 var registry = []Provider{
@@ -236,6 +264,24 @@ var registry = []Provider{
 		Augment1M:       false,
 		AdvertisePrefix: "claude-",
 		HasModelsAPI:    true,
+		CatalogOwner:    "openai",
+	},
+	{
+		ID:              Gemini,
+		Name:            "Google Gemini",
+		BaseURL:         "", // supplied by the internal gateway credential
+		ModelPrefixes:   []string{"gemini-"},
+		Refreshable:     false, // CLIProxyAPI refreshes the OAuth credentials
+		DelegatedAuth:   true,
+		PollsUsage:      false,
+		Augment1M:       true,
+		AdvertisePrefix: "claude-",
+		HasModelsAPI:    true,
+		CatalogOwner:    "antigravity",
+		CatalogExclude:  []string{"-image"},
+		// Every Gemini chat model behind Antigravity reports maxTokens
+		// 1048576 in fetchAvailableModels.
+		DefaultMaxInputTokens: 1_048_576,
 	},
 }
 

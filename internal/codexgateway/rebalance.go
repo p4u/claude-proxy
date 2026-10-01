@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math"
 	"strconv"
@@ -168,15 +169,30 @@ func EffectiveWeights(accounts []Account, base map[string]int64, now time.Time) 
 	return out
 }
 
+// RebalanceOnce pushes fresh effective weights for every sidecar channel.
+// Channels are normalised separately: a Codex and a Gemini account never serve
+// the same model, so their weights never compete inside the sidecar, and
+// normalising them together would let one channel's best account squash the
+// other channel's whole range. One channel failing does not stop the others.
 func RebalanceOnce(ctx context.Context, db *store.DB, c *Client, log *slog.Logger, now time.Time) error {
 	if c == nil {
 		return nil
 	}
-	accounts, err := c.Accounts(ctx)
+	base, err := BaseWeightsMap(ctx, db)
 	if err != nil {
 		return err
 	}
-	base, err := BaseWeightsMap(ctx, db)
+	var firstErr error
+	for _, ch := range Channels {
+		if err := rebalanceChannel(ctx, c, ch, base, log, now); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("%s: %w", ch.Name, err)
+		}
+	}
+	return firstErr
+}
+
+func rebalanceChannel(ctx context.Context, c *Client, ch Channel, base map[string]int64, log *slog.Logger, now time.Time) error {
+	accounts, err := c.Accounts(ctx, ch)
 	if err != nil {
 		return err
 	}
@@ -195,12 +211,12 @@ func RebalanceOnce(ctx context.Context, db *store.DB, c *Client, log *slog.Logge
 		}
 		if err := c.SetWeight(ctx, a.Name, want); err != nil {
 			if log != nil {
-				log.Warn("codex rebalance set weight failed", "account", a.Name, "want", want, "err", err)
+				log.Warn("sidecar rebalance set weight failed", "channel", ch.Key, "account", a.Name, "want", want, "err", err)
 			}
 			continue
 		}
 		if log != nil {
-			log.Debug("codex rebalance", "account", a.Name, "from", have, "to", want,
+			log.Debug("sidecar rebalance", "channel", ch.Key, "account", a.Name, "from", have, "to", want,
 				"fh_pct", a.Quota.FiveHourPct, "sd_pct", a.Quota.SevenDayPct,
 				"base_weight", base[a.Name])
 		}

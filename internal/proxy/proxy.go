@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/p4u/claude-proxy/internal/codexgateway"
 	"github.com/p4u/claude-proxy/internal/creds"
 	"github.com/p4u/claude-proxy/internal/pool"
 	"github.com/p4u/claude-proxy/internal/provider"
@@ -46,6 +47,11 @@ type Handler struct {
 	// RebalanceSessions enables announced, conservative migration of long-lived
 	// Anthropic pins. Emergency failover is independent of this setting.
 	RebalanceSessions bool
+
+	// Sidecar, when set, supplies display names and context sizes for the
+	// CLIProxyAPI-backed providers' GET /v1/models rows (see
+	// enrichFromSidecar). Optional: without it those rows are named by ID.
+	Sidecar *codexgateway.Client
 }
 
 func New(db *store.DB, p *pool.Pool, r *creds.Refresher, log *slog.Logger) *Handler {
@@ -136,6 +142,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	} else if rewritten, wire, ok := rewriteModel(body); ok {
 		body = rewritten
 		h.log.Debug("model alias resolved", "wire_model", wire, "provider", string(prov))
+	}
+	if stripped, ok := stripSystemText(body, strippedSystemPhrases); ok {
+		body = stripped
+		h.log.Debug("system prompt phrase removed", "provider", string(prov))
 	}
 
 	var (

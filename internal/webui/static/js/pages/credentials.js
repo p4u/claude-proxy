@@ -66,11 +66,15 @@ export async function render(root) {
   root.append(head, body);
 
   try {
-    const [rows, , codex] = await Promise.all([
-      api.credentials(), loadEndpoints(), api.codexAccounts().catch((error) => ({ configured: true, error })),
+    const [rows, , ...sidecars] = await Promise.all([
+      api.credentials(), loadEndpoints(),
+      ...SIDECAR_CHANNELS.map((ch) => api.sidecar(ch).accounts().catch((error) => ({ configured: true, error }))),
     ]);
     clear(body);
-    const credentials = [...(rows || []), ...codexCredentialRows(codex)];
+    const credentials = [
+      ...(rows || []),
+      ...SIDECAR_CHANNELS.flatMap((ch, i) => sidecarCredentialRows(sidecars[i], ch)),
+    ];
     if (!credentials.length) {
       body.append(emptyState(
         "No credentials yet",
@@ -79,24 +83,48 @@ export async function render(root) {
     } else {
       body.append(buildTable(credentials, root));
     }
-    if (codex?.error) {
+    SIDECAR_CHANNELS.forEach((ch, i) => {
+      if (!sidecars[i]?.error) return;
       body.append(el("p", {
         class: "table-card__note table-card__note--error",
-        text: `OpenAI Codex accounts could not be loaded: ${codex.error.message}`,
+        text: `${SIDECAR[ch].name} accounts could not be loaded: ${sidecars[i].error.message}`,
       }));
-    }
+    });
   } catch (e) {
     clear(body).append(errorState(e.message, () => render(root)));
   }
 }
 
-function codexCredentialRows(data) {
+// Subscriptions whose OAuth accounts live in the CLIProxyAPI sidecar. One
+// entry per channel served under /api/<channel>/; the copy differs, the
+// mechanics do not.
+const SIDECAR = {
+  codex: {
+    name: "OpenAI Codex", vendor: "OpenAI",
+    connect: "Connect with OpenAI",
+    intro: "Connect the owner's ChatGPT/Codex subscription. OAuth tokens remain in the private sidecar and refresh automatically.",
+    registered: "localhost:1455",
+    forwarded: "127.0.0.1:8317/codex/callback",
+  },
+  gemini: {
+    name: "Google Gemini", vendor: "Google",
+    connect: "Connect with Google",
+    intro: "Connect a Google account's Gemini subscription (free, AI Pro or Ultra tier) through Antigravity's sign-in. OAuth tokens remain in the private sidecar and refresh automatically. On the free tier Google may use prompts and code to improve its models.",
+    registered: "localhost:51121",
+    forwarded: "127.0.0.1:8317/antigravity/callback",
+  },
+};
+const SIDECAR_CHANNELS = Object.keys(SIDECAR);
+
+function sidecarCredentialRows(data, ch) {
   if (!data?.configured || data.error) return [];
   return (data.accounts || []).map((account) => ({
-    id: `codex:${account.name}`,
+    id: `${ch}:${account.name}`,
     label: account.email || account.label || account.account || account.name,
-    provider: "codex",
-    subscription_type: account.account_type || "subscription",
+    provider: ch,
+    // Google's tier ("free", a paid tier) when known; the sidecar's own
+    // account_type is just "oauth".
+    subscription_type: account.quota?.plan_type || account.account_type || "subscription",
     // `blocked`, not `unavailable`/`status`: the sidecar keeps those at
     // "error" after its cooldown ends, until the account next serves a
     // request, so they would pin a healthy account as errored.
@@ -104,7 +132,8 @@ function codexCredentialRows(data) {
     weight: account.base_weight ?? 1,
     effective_weight: account.effective_weight ?? null,
     request_count: (account.success || 0) + (account.failed || 0),
-    codex_account: account,
+    sidecar_account: account,
+    sidecar_channel: ch,
   }));
 }
 
@@ -146,7 +175,7 @@ async function loadEndpoints() {
 // the raw id so a new one stays legible before this map is updated.
 const PROVIDER_LABELS = {
   anthropic: "Anthropic", glm: "GLM", mimo: "MiMo", custom: "Custom Anthropic",
-  custom_openai: "Custom OpenAI", codex: "OpenAI Codex",
+  custom_openai: "Custom OpenAI", codex: "OpenAI Codex", gemini: "Google Gemini",
 };
 function providerLabel(id) {
   return PROVIDER_LABELS[id] || id || "Anthropic";
@@ -164,7 +193,12 @@ const KINDS = {
   codex: {
     label: "OpenAI Codex subscription",
     blurb: "Authorize a personal ChatGPT/Codex subscription with OAuth. Tokens stay in the private sidecar.",
-    managedOAuth: true,
+    managedOAuth: "codex",
+  },
+  gemini: {
+    label: "Google Gemini subscription",
+    blurb: "Authorize a Google account's Gemini subscription through Antigravity's OAuth. Tokens stay in the private sidecar.",
+    managedOAuth: "gemini",
   },
   glm: {
     label: "Z.AI GLM",
@@ -366,13 +400,16 @@ function addCredentialModal(root) {
     ]),
   ]);
 
-  const codexFlow = codexOAuthControls(root, () => {
+  // One sign-in flow per sidecar channel; sync() shows the selected one.
+  const flows = Object.fromEntries(SIDECAR_CHANNELS.map((ch) => [ch, sidecarOAuthControls(ch, () => {
     m.close();
     render(root);
-  });
+  })]));
+  const cancelFlows = () => Object.values(flows).forEach((f) => f.cancel());
 
   const body = el("div", { class: "form" }, [
-    kindRow, endpointRow, keyRow, jsonRow, modelsRow, advanced, probe.root, codexFlow.root, err,
+    kindRow, endpointRow, keyRow, jsonRow, modelsRow, advanced, probe.root,
+    ...Object.values(flows).map((f) => f.root), err,
   ]);
 
   const busy = async (btn, verb, fn) => {
@@ -456,9 +493,11 @@ function addCredentialModal(root) {
     planRow.hidden = !cfg.plan;
     testBtn.hidden = !!cfg.needsJSON || !!cfg.managedOAuth;
     advanced.hidden = !!cfg.managedOAuth;
-    codexFlow.root.hidden = !cfg.managedOAuth;
+    for (const [ch, flow] of Object.entries(flows)) {
+      flow.root.hidden = cfg.managedOAuth !== ch;
+      if (cfg.managedOAuth !== ch) flow.cancel();
+    }
     submit.hidden = !!cfg.managedOAuth;
-    if (!cfg.managedOAuth) codexFlow.cancel();
     setHelp(endpointRow, cfg.endpointHelp);
     setHelp(keyRow, cfg.keyHelp);
     keyRow.querySelector(".field-label").textContent = cfg.openAIProtocol ? "Bearer token" : "API key";
@@ -475,40 +514,39 @@ function addCredentialModal(root) {
     subtitle: "Subscription logins, provider API keys, and custom Anthropic or OpenAI API hosts.",
     wide: true,
     body,
-    actions: [button("Cancel", { onClick: () => { codexFlow.cancel(); m.close(); } }), testBtn, submit],
+    actions: [button("Cancel", { onClick: () => { cancelFlows(); m.close(); } }), testBtn, submit],
   });
   sync();
   return m;
 }
 
 // ---------------------------------------------------------------------------
-// OpenAI Codex OAuth (managed by CLIProxyAPI)
+// Sidecar OAuth (OpenAI Codex, Google Gemini — managed by CLIProxyAPI)
 // ---------------------------------------------------------------------------
 
-function codexOAuthControls(root, onConnected) {
-  const status = el("p", {
-    class: "field-help",
-    text: "Connect the owner's ChatGPT/Codex subscription. OAuth tokens remain in the private sidecar and refresh automatically.",
-  });
+function sidecarOAuthControls(ch, onConnected) {
+  const cfg = SIDECAR[ch];
+  const sc = api.sidecar(ch);
+  const status = el("p", { class: "field-help", text: cfg.intro });
   const manual = el("textarea", {
     class: "input input--code", rows: "4", spellcheck: "false",
-    placeholder: "http://127.0.0.1:8317/codex/callback?code=…&state=…",
+    placeholder: `http://${cfg.forwarded}?code=…&state=…`,
   });
   const manualRow = field(
     "Callback URL",
     manual,
-    "If the final loopback page cannot open, paste its complete localhost:1455 or 127.0.0.1:8317 URL here. The authorization code is accepted once and is never stored.",
+    `If the final loopback page cannot open, paste its complete ${cfg.registered} or 127.0.0.1:8317 URL here. The authorization code is accepted once and is never stored.`,
   );
   manualRow.hidden = true;
   const err = el("p", { class: "form-err", role: "alert" });
   const submitCallback = button("Submit callback URL", {
     onClick: async (ev) => {
       err.textContent = "";
-      if (!state) { err.textContent = "Start OpenAI sign-in first."; return; }
+      if (!state) { err.textContent = `Start ${cfg.vendor} sign-in first.`; return; }
       if (!manual.value.trim()) { err.textContent = "Paste the complete callback URL first."; return; }
       ev.currentTarget.disabled = true;
       try {
-        await api.submitCodexCallback(state, manual.value.trim());
+        await sc.submitCallback(state, manual.value.trim());
         status.textContent = "Callback accepted. Finishing authorization…";
       } catch (e) {
         err.textContent = e.message || "Could not submit the callback.";
@@ -518,11 +556,11 @@ function codexOAuthControls(root, onConnected) {
     },
   });
   submitCallback.hidden = true;
-  const start = button("Connect with OpenAI", { kind: "primary", onClick: () => begin() });
+  const start = button(cfg.connect, { kind: "primary", onClick: () => begin() });
   const controls = el("div", { class: "codex-oauth__actions" }, [start, submitCallback]);
   const flowRoot = el("div", { class: "codex-oauth" }, [
     status,
-    el("p", { class: "field-help", text: "OpenAI first returns to localhost:1455. CLIProxyAPI may then redirect the browser to 127.0.0.1:8317/codex/callback; either complete URL is accepted below." }),
+    el("p", { class: "field-help", text: `${cfg.vendor} first returns to ${cfg.registered}. CLIProxyAPI may then redirect the browser to ${cfg.forwarded}; either complete URL is accepted below.` }),
     controls,
     manualRow,
     err,
@@ -535,27 +573,27 @@ function codexOAuthControls(root, onConnected) {
     const previousState = state;
     const thisRun = ++run;
     state = "";
-    if (previousState) api.cancelCodexOAuth(previousState).catch(() => {});
+    if (previousState) sc.cancelOAuth(previousState).catch(() => {});
     if (popup && !popup.closed) popup.close();
     // Open synchronously so popup blockers recognize the user gesture.
-    popup = window.open("about:blank", "codex-oauth", "popup,width=720,height=800");
+    popup = window.open("about:blank", `${ch}-oauth`, "popup,width=720,height=800");
     err.textContent = "";
     manual.value = "";
     manualRow.hidden = true;
     submitCallback.hidden = true;
     start.disabled = true;
     start.textContent = "Starting…";
-    status.textContent = "Starting a secure OpenAI authorization…";
+    status.textContent = `Starting a secure ${cfg.vendor} authorization…`;
     try {
-      const started = await api.startCodexOAuth();
+      const started = await sc.startOAuth();
       if (run !== thisRun || !flowRoot.isConnected) {
-        await api.cancelCodexOAuth(started.state).catch(() => {});
+        await sc.cancelOAuth(started.state).catch(() => {});
         return;
       }
       state = started.state;
       manualRow.hidden = false;
       submitCallback.hidden = false;
-      status.textContent = "Complete sign-in in the OpenAI window. This page will detect completion automatically.";
+      status.textContent = `Complete sign-in in the ${cfg.vendor} window. This page will detect completion automatically.`;
       if (popup) popup.location.href = started.url;
       else throw new Error("The sign-in window was blocked. Allow popups and try again.");
       start.disabled = false;
@@ -565,30 +603,30 @@ function codexOAuthControls(root, onConnected) {
       while (flowRoot.isConnected && run === thisRun && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 1000));
         if (!flowRoot.isConnected || run !== thisRun) return;
-        const current = await api.codexOAuthStatus(state);
+        const current = await sc.oauthStatus(state);
         if (current.status === "wait") continue;
         if (current.status === "ok") {
           if (popup && !popup.closed) popup.close();
           state = "";
-          toast("OpenAI Codex account connected", "good");
+          toast(`${cfg.name} account connected`, "good");
           onConnected();
           return;
         }
-        throw new Error(current.error || "OpenAI authorization failed.");
+        throw new Error(current.error || `${cfg.vendor} authorization failed.`);
       }
       if (!flowRoot.isConnected && run === thisRun) {
         cancel();
         return;
       }
       if (flowRoot.isConnected && run === thisRun) {
-        await api.cancelCodexOAuth(state).catch(() => {});
+        await sc.cancelOAuth(state).catch(() => {});
         state = "";
         err.textContent = "Authorization timed out. Start sign-in again.";
       }
     } catch (e) {
       if (popup && !popup.closed) popup.close();
       state = "";
-      err.textContent = e.message || "Could not start OpenAI authorization.";
+      err.textContent = e.message || `Could not start ${cfg.vendor} authorization.`;
       status.textContent = "Authorization was not completed.";
       start.disabled = false;
       start.textContent = "Try again";
@@ -599,22 +637,23 @@ function codexOAuthControls(root, onConnected) {
     run++;
     const pending = state;
     state = "";
-    if (pending) api.cancelCodexOAuth(pending).catch(() => {});
+    if (pending) sc.cancelOAuth(pending).catch(() => {});
     if (popup && !popup.closed) popup.close();
   }
 
   return { root: flowRoot, cancel };
 }
 
-function codexOAuthModal(root) {
+function sidecarOAuthModal(ch, root) {
+  const cfg = SIDECAR[ch];
   let m;
-  const flow = codexOAuthControls(root, () => {
+  const flow = sidecarOAuthControls(ch, () => {
     m.close();
     render(root);
   });
   m = modal({
-    title: "Refresh OpenAI Codex login",
-    subtitle: "Run OAuth again for the owner's ChatGPT account.",
+    title: `Refresh ${cfg.name} login`,
+    subtitle: `Run OAuth again for the owner's ${cfg.vendor} account.`,
     wide: true,
     body: flow.root,
     actions: [button("Close", { onClick: () => { flow.cancel(); m.close(); } })],
@@ -684,7 +723,7 @@ function endpointModal(c, root) {
 }
 
 function credRow(c, root) {
-  if (c.codex_account) return codexCredRow(c, root);
+  if (c.sidecar_account) return sidecarCredRow(c, root);
 
   const id = c.id || c.credential_id;
   const disabled = (c.status || "").toLowerCase() === "disabled";
@@ -731,36 +770,39 @@ function credRow(c, root) {
   ]);
 }
 
-function codexCredRow(c, root) {
-  const a = c.codex_account;
+function sidecarCredRow(c, root) {
+  const a = c.sidecar_account;
+  const ch = c.sidecar_channel;
+  const cfg = SIDECAR[ch];
+  const sc = api.sidecar(ch);
   const disabled = c.status === "disabled";
   const label = c.label || a.name;
   const actions = el("div", { class: "row-actions" }, [
     button("Weight", {
       onClick: () => weightModal(c.id, c.weight, root, {
-        save: (weight) => api.setCodexAccountWeight(a.name, weight),
+        save: (weight) => sc.setWeight(a.name, weight),
         help: "Operator bias — one input to the same usage/reset-aware selection formula used for Anthropic. The sidecar's effective weight is computed automatically from base × current quota and refreshed every 90s.",
       }),
     }),
     button(disabled ? "Enable" : "Disable", {
       onClick: () => act(
-        () => api.setCodexAccountDisabled(a.name, a.auth_index, !disabled),
-        disabled ? "OpenAI account enabled" : "OpenAI account disabled", root,
+        () => sc.setDisabled(a.name, a.auth_index, !disabled),
+        disabled ? `${cfg.vendor} account enabled` : `${cfg.vendor} account disabled`, root,
       ),
     }),
     button("Refresh login", {
-      title: "Run OpenAI OAuth again. Normal access-token refreshes happen automatically.",
-      onClick: () => codexOAuthModal(root),
+      title: `Run ${cfg.vendor} OAuth again. Normal access-token refreshes happen automatically.`,
+      onClick: () => sidecarOAuthModal(ch, root),
     }),
     button("Delete", {
       kind: "danger-ghost",
       onClick: async () => {
         const ok = await confirmDialog({
-          title: "Delete OpenAI credential?",
+          title: `Delete ${cfg.vendor} credential?`,
           message: `"${label}" and its OAuth tokens will be removed from the sidecar. This can't be undone.`,
           confirmLabel: "Delete",
         });
-        if (ok) act(() => api.deleteCodexAccount(a.name), "OpenAI account deleted", root);
+        if (ok) act(() => sc.remove(a.name), `${cfg.vendor} account deleted`, root);
       },
     }),
   ]);

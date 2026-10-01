@@ -30,3 +30,9 @@ routing:
   session-affinity: true
   session-affinity-ttl: "1h"
   session-affinity-subagents: true
+
+# Google Gemini (Antigravity): when an account's subscription quota runs out,
+# never fall back to paid Google AI credits — requests should fail with a
+# quota 429 rather than silently spend money.
+quota-exceeded:
+  antigravity-credits: false

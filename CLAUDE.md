@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 It serves `/v1/*` as a transparent pass-through for Anthropic-compatible upstreams, swapping in a managed credential's `Authorization` header. Custom OpenAI-compatible hosts are translated at the boundary while clients still speak the Anthropic Messages API. This is what Claude Code clients connect to.
 
-Six provider modes are supported (`internal/provider`): **Anthropic** OAuth subscriptions, **Z.AI GLM** coding plans, **Xiaomi MiMo** token plans, **OpenAI Codex** subscriptions through a private CLIProxyAPI sidecar, and dynamic **custom Anthropic** or **custom OpenAI-compatible** hosts. The provider that serves a request is decided by the model the client asked for, so a user picks a GLM, GPT, or custom-host model in Claude Code's `/model` picker and it just works. See [Providers](#providers-multi-upstream).
+Seven provider modes are supported (`internal/provider`): **Anthropic** OAuth subscriptions, **Z.AI GLM** coding plans, **Xiaomi MiMo** token plans, **OpenAI Codex** and **Google Gemini** subscriptions through a private CLIProxyAPI sidecar, and dynamic **custom Anthropic** or **custom OpenAI-compatible** hosts. The provider that serves a request is decided by the model the client asked for, so a user picks a GLM, GPT, Gemini, or custom-host model in Claude Code's `/model` picker and it just works. See [Providers](#providers-multi-upstream).
 
 ## Build & Test Commands
 
@@ -117,6 +117,7 @@ The provider registry also contains these non-default modes:
 | Mode | Base URL / model source | Boundary behavior | Picker alias |
 |---|---|---|---|
 | OpenAI Codex | private CLIProxyAPI sidecar; accounts live there | sidecar translates the Anthropic request to OpenAI | `gpt-*` → `claude-gpt-*` |
+| Google Gemini | same sidecar, Antigravity OAuth accounts | sidecar translates the Anthropic request to Gemini | `gemini-*` → `claude-gemini-*` (+ `[1m]`) |
 | Custom Anthropic | per-credential URL and model catalogue | Anthropic Messages pass-through | native ID → `claude-<id>` |
 | Custom OpenAI | per-credential URL and model catalogue | `internal/proxy/openai.go` translates Chat Completions | native ID → `claude-openai-<id>` |
 
@@ -412,6 +413,80 @@ The web UI starts a fresh sidecar-owned OAuth flow; it must not upload
 For a remote browser, forward that port over SSH or use the UI's manual
 loopback-callback handoff. `CLIPROXY_MANAGEMENT_KEY` is server-side only, and
 port 8317 is kept off the host network.
+
+### Google Gemini subscriptions (same sidecar, `codexgateway.GeminiChannel`)
+
+A Google account's Gemini subscription (free, AI Pro or Ultra tier — usage
+counts against the account's tier, never against Gemini API billing) signs in
+through **Antigravity's** OAuth client and is served by the same CLIProxyAPI
+process as Codex. Gemini CLI's OAuth is not an option: v7 of the sidecar
+dropped that provider. The sidecar already carries the Antigravity OAuth flow,
+token refresh and the Anthropic⇄Gemini translator (tool use, streaming and
+signed thinking blocks verified end to end on 2026-10-01), so this proxy adds
+no translation layer — only routing, catalogue filtering, quota and the UI.
+
+**One sidecar, several channels.** `codexgateway.Channel` describes each
+sidecar-backed provider: the sidecar's provider key (`codex`, `antigravity`),
+its login route, its two accepted callback shapes, and its own synthetic
+gateway credential (`gateway_codex`, `gateway_gemini`) — so routing, sticky
+bindings and `DelegatedAuth` 401 handling stay independent per provider. The
+client's `Accounts`/`StartOAuth`/`SubmitCallback` take a channel; the rebalance
+loop normalises weights per channel (a Codex and a Gemini account never serve
+the same model); the web UI serves `/api/codex/*` and `/api/gemini/*` from one
+handler and refuses mutations on an account that belongs to another channel,
+since the sidecar's endpoints accept any file name.
+
+**The shared catalogue must be split** (`Provider.CatalogOwner`). The sidecar's
+`/v1/models` is the union of every signed-in account, and Antigravity's own
+catalogue includes `claude-*` and `gpt-oss-*` models (`owned_by:"antigravity"`)
+— unfiltered they would collide with the Anthropic route and Codex's `gpt-`
+prefix. `filterCatalog` keeps only entries whose `owned_by` matches *and* whose
+ID has the provider's prefix (a missing `owned_by` falls back to the prefix),
+drops `CatalogExclude` matches (Gemini's image model), and `enrichFromSidecar`
+fills display names and context sizes from the management
+`model-definitions/<channel>` route — the OpenAI-shaped list has neither, and
+the Anthropic-shaped one rewrites IDs into opaque aliases. Every Gemini chat
+model is 1,048,576 tokens, so `Augment1M` gives each a `[1m]` row; without it
+Claude Code would assume 200K for an ID it does not know.
+
+**Quota comes from Google, not response headers.** Antigravity sends nothing
+like `X-Codex-*`. `fetchAvailableModels` reports per-model
+`quotaInfo{remainingFraction,resetTime}`; every `gemini-*` model shares one
+bucket (they move together), so `parseGeminiQuota` keeps the scarcest and maps
+it onto the `five_hour` slot (the card labels it "Gemini quota" — Google does
+not name the window). `loadCodeAssist` gives the tier (`free-tier` → "free").
+Both calls go through the sidecar's management `api-call` tool with `$TOKEN$`
+substitution, so **this proxy never holds a Google token**. Google answers 403
+without an Antigravity `User-Agent` (any version works). Protobuf JSON omits
+zero values: an exhausted bucket arrives without `remainingFraction` and must
+read as 0% remaining. Readings are cached a minute (tier an hour); a failed
+fetch serves the last good reading rather than a zero, which would attract
+traffic to a spent account.
+
+**`antigravity-credits: false`** in `config/cliproxy.yaml.tmpl`: when the
+subscription quota runs out the sidecar must not silently fall back to paid
+Google AI credits. Antigravity's registered redirect is `localhost:51121`,
+published on host loopback next to Codex's 1455; the forwarder hop is
+`127.0.0.1:8317/antigravity/callback`.
+
+**Known upstream behaviours** (observed on a free-tier account, 2026-10-01):
+
+- Google rejects any request whose system prompt contains Claude Agent SDK's
+  identity line (`You are a Claude agent, built on Anthropic's Claude Agent
+  SDK.`) with `429 RESOURCE_EXHAUSTED`, regardless of quota. Interactive Claude
+  Code sends `You are Claude Code, Anthropic's official CLI for Claude.`, which
+  passes; headless `claude -p` and Agent SDK apps send the SDK line. The proxy
+  therefore **removes that sentence from every request, for every provider**
+  (`strippedSystemPhrases` in `internal/proxy/systemstrip.go`), so `claude -p`
+  works on Gemini like interactive use (verified on Flash and 3.1 Pro).
+  Anthropic subscriptions accept requests with and without it. Requests that
+  do not contain it — every interactive one — pass through byte for byte.
+- Free tier rate-limits Gemini 3.1 Pro (`gemini-pro-agent`) per minute, apart
+  from the shared bucket; Flash models take large Claude Code requests fine.
+  A Google 429 also puts the account in the sidecar's own cooldown, so a client
+  retrying quickly can keep extending it.
+- On the free tier Google's notice says prompts and code may be used to
+  improve its models and read by human reviewers.
 
 ### Conversation Key Derivation (4-priority, `internal/router/`)
 

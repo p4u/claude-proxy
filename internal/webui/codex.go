@@ -3,6 +3,7 @@ package webui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -13,19 +14,23 @@ import (
 
 const codexOAuthStartInterval = 3 * time.Second
 
-func (s *Server) handleCodex(w http.ResponseWriter, r *http.Request, rest string) {
+// handleSidecar serves one sidecar channel's account panel: /api/codex/* for
+// OpenAI Codex and /api/gemini/* for Google Gemini (Antigravity). Both are the
+// same CLIProxyAPI process; the channel decides which accounts are visible,
+// which login route is started, and which callback URLs are accepted.
+func (s *Server) handleSidecar(w http.ResponseWriter, r *http.Request, ch codexgateway.Channel, rest string) {
 	if s.codex == nil {
 		if rest == "/accounts" && r.Method == http.MethodGet {
 			writeJSON(w, map[string]any{"configured": false, "accounts": []any{}})
 			return
 		}
-		writeErr(w, http.StatusServiceUnavailable, "OpenAI Codex support is not configured")
+		writeErr(w, http.StatusServiceUnavailable, ch.Name+" support is not configured")
 		return
 	}
 
 	switch {
 	case rest == "/accounts" && r.Method == http.MethodGet:
-		accounts, err := s.codex.Accounts(r.Context())
+		accounts, err := s.codex.Accounts(r.Context(), ch)
 		if err != nil {
 			writeErr(w, http.StatusBadGateway, err.Error())
 			return
@@ -33,7 +38,7 @@ func (s *Server) handleCodex(w http.ResponseWriter, r *http.Request, rest string
 		s.decorateCodexAccounts(r.Context(), accounts)
 		writeJSON(w, map[string]any{"configured": true, "accounts": accounts})
 	case rest == "/oauth/start" && r.Method == http.MethodPost:
-		s.startCodexOAuth(w, r)
+		s.startSidecarOAuth(w, r, ch)
 	case rest == "/oauth/status" && r.Method == http.MethodGet:
 		state := strings.TrimSpace(r.URL.Query().Get("state"))
 		if err := validateOAuthState(state); err != nil {
@@ -47,7 +52,7 @@ func (s *Server) handleCodex(w http.ResponseWriter, r *http.Request, rest string
 		}
 		writeJSON(w, status)
 	case rest == "/oauth/callback" && r.Method == http.MethodPost:
-		s.submitCodexCallback(w, r)
+		s.submitSidecarCallback(w, r, ch)
 	case rest == "/oauth/cancel" && r.Method == http.MethodPost:
 		var body struct {
 			State string `json:"state"`
@@ -67,17 +72,48 @@ func (s *Server) handleCodex(w http.ResponseWriter, r *http.Request, rest string
 		}
 		writeJSON(w, map[string]any{"ok": true})
 	case rest == "/accounts/status" && r.Method == http.MethodPost:
-		s.setCodexAccountStatus(w, r)
+		s.setSidecarAccountStatus(w, r, ch)
 	case rest == "/accounts/weight" && r.Method == http.MethodPost:
-		s.setCodexAccountWeight(w, r)
+		s.setSidecarAccountWeight(w, r, ch)
 	case rest == "/accounts/delete" && r.Method == http.MethodPost:
-		s.deleteCodexAccount(w, r)
+		s.deleteSidecarAccount(w, r, ch)
 	default:
 		writeErr(w, http.StatusNotFound, "not found")
 	}
 }
 
-func (s *Server) setCodexAccountWeight(w http.ResponseWriter, r *http.Request) {
+// ownsAccount reports whether name is one of the channel's accounts. The
+// sidecar's mutation endpoints take a bare file name for any provider, so
+// without this check /api/gemini/accounts/delete could remove a Codex account.
+func (s *Server) ownsAccount(ctx context.Context, ch codexgateway.Channel, name string) (bool, error) {
+	accounts, err := s.codex.Accounts(ctx, ch)
+	if err != nil {
+		return false, err
+	}
+	for _, a := range accounts {
+		if a.Name == name {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// requireOwnedAccount writes the error response and returns false when name
+// is not one of ch's accounts.
+func (s *Server) requireOwnedAccount(w http.ResponseWriter, r *http.Request, ch codexgateway.Channel, name string) bool {
+	owned, err := s.ownsAccount(r.Context(), ch, name)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return false
+	}
+	if !owned {
+		writeErr(w, http.StatusNotFound, "no such "+ch.Name+" account")
+		return false
+	}
+	return true
+}
+
+func (s *Server) setSidecarAccountWeight(w http.ResponseWriter, r *http.Request, ch codexgateway.Channel) {
 	var body struct {
 		Name   string `json:"name"`
 		Weight *int64 `json:"weight"`
@@ -91,6 +127,9 @@ func (s *Server) setCodexAccountWeight(w http.ResponseWriter, r *http.Request) {
 			err = errors.New("weight is required")
 		}
 		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !s.requireOwnedAccount(w, r, ch, strings.TrimSpace(body.Name)) {
 		return
 	}
 	// Store the operator's base weight in our DB; the rebalance loop is the
@@ -133,33 +172,35 @@ func (s *Server) decorateCodexAccounts(ctx context.Context, accounts []codexgate
 	}
 }
 
-func (s *Server) startCodexOAuth(w http.ResponseWriter, r *http.Request) {
+// startSidecarOAuth is rate-limited across channels: every login starts a
+// callback listener in the one sidecar process.
+func (s *Server) startSidecarOAuth(w http.ResponseWriter, r *http.Request, ch codexgateway.Channel) {
 	s.codexOAuthMu.Lock()
 	if wait := codexOAuthStartInterval - time.Since(s.codexOAuthLast); wait > 0 {
 		s.codexOAuthMu.Unlock()
-		writeErr(w, http.StatusTooManyRequests, "wait a few seconds before starting another OpenAI login")
+		writeErr(w, http.StatusTooManyRequests, "wait a few seconds before starting another login")
 		return
 	}
 	s.codexOAuthLast = time.Now()
 	s.codexOAuthMu.Unlock()
 
-	started, err := s.codex.StartOAuth(r.Context())
+	started, err := s.codex.StartOAuth(r.Context(), ch)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	writeJSON(w, map[string]any{
 		"url": started.URL, "state": started.State,
-		"callback_uri": "http://localhost:1455/auth/callback",
+		"callback_uri": ch.RegisteredCallback.URL(),
 		"callback_uris": []string{
-			"http://localhost:1455/auth/callback",
-			"http://127.0.0.1:8317/codex/callback",
+			ch.RegisteredCallback.URL(),
+			ch.ForwardedCallback.URL(),
 		},
 		"callback_mode": "localhost_or_manual",
 	})
 }
 
-func (s *Server) submitCodexCallback(w http.ResponseWriter, r *http.Request) {
+func (s *Server) submitSidecarCallback(w http.ResponseWriter, r *http.Request, ch codexgateway.Channel) {
 	var body struct {
 		State       string `json:"state"`
 		RedirectURL string `json:"redirect_url"`
@@ -174,18 +215,18 @@ func (s *Server) submitCodexCallback(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := validateCodexRedirect(body.RedirectURL, body.State); err != nil {
+	if err := validateSidecarRedirect(ch, body.RedirectURL, body.State); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.codex.SubmitCallback(r.Context(), body.State, body.RedirectURL); err != nil {
+	if err := s.codex.SubmitCallback(r.Context(), ch, body.State, body.RedirectURL); err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true})
 }
 
-func (s *Server) setCodexAccountStatus(w http.ResponseWriter, r *http.Request) {
+func (s *Server) setSidecarAccountStatus(w http.ResponseWriter, r *http.Request, ch codexgateway.Channel) {
 	var body struct {
 		Name      string `json:"name"`
 		AuthIndex string `json:"auth_index"`
@@ -202,6 +243,9 @@ func (s *Server) setCodexAccountStatus(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if !s.requireOwnedAccount(w, r, ch, strings.TrimSpace(body.Name)) {
+		return
+	}
 	if err := s.codex.SetDisabled(r.Context(), strings.TrimSpace(body.Name), strings.TrimSpace(body.AuthIndex), *body.Disabled); err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
@@ -209,7 +253,7 @@ func (s *Server) setCodexAccountStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"ok": true})
 }
 
-func (s *Server) deleteCodexAccount(w http.ResponseWriter, r *http.Request) {
+func (s *Server) deleteSidecarAccount(w http.ResponseWriter, r *http.Request, ch codexgateway.Channel) {
 	var body struct {
 		Name string `json:"name"`
 	}
@@ -219,6 +263,9 @@ func (s *Server) deleteCodexAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := validateAccountRef(body.Name, ""); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !s.requireOwnedAccount(w, r, ch, strings.TrimSpace(body.Name)) {
 		return
 	}
 	if err := s.codex.DeleteAccount(r.Context(), strings.TrimSpace(body.Name)); err != nil {
@@ -241,19 +288,23 @@ func validateOAuthState(state string) error {
 	return nil
 }
 
-func validateCodexRedirect(raw, wantState string) error {
+// validateSidecarRedirect accepts only the channel's two loopback callback
+// shapes — the redirect registered with the upstream OAuth client, and the
+// sidecar's forwarder hop on 127.0.0.1:8317 — carrying this login's state.
+func validateSidecarRedirect(ch codexgateway.Channel, raw, wantState string) error {
 	if raw == "" || len(raw) > 8192 {
-		return errors.New("paste the complete OpenAI callback URL")
+		return errors.New("paste the complete callback URL")
 	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme != "http" || u.User != nil || u.Fragment != "" {
 		return errors.New("callback must be a CLIProxyAPI loopback callback URL")
 	}
 	host := strings.ToLower(u.Hostname())
-	registeredCallback := host == "localhost" && u.Port() == "1455" && u.Path == "/auth/callback"
-	forwardedCallback := host == "127.0.0.1" && u.Port() == "8317" && u.Path == "/codex/callback"
-	if !registeredCallback && !forwardedCallback {
-		return errors.New("callback must be the localhost:1455 or 127.0.0.1:8317 Codex callback URL")
+	reg, fwd := ch.RegisteredCallback, ch.ForwardedCallback
+	registered := host == reg.Host && u.Port() == reg.Port && u.Path == reg.Path
+	forwarded := host == fwd.Host && u.Port() == fwd.Port && u.Path == fwd.Path
+	if !registered && !forwarded {
+		return fmt.Errorf("callback must be the %s or %s URL", ch.RegisteredCallback.URL(), ch.ForwardedCallback.URL())
 	}
 	q := u.Query()
 	if q.Get("state") != wantState {
@@ -268,7 +319,7 @@ func validateCodexRedirect(raw, wantState string) error {
 func validateAccountRef(name, authIndex string) error {
 	name, authIndex = strings.TrimSpace(name), strings.TrimSpace(authIndex)
 	if name == "" || len(name) > 512 || len(authIndex) > 256 || strings.ContainsAny(name, "\r\n") || strings.ContainsAny(authIndex, "\r\n") {
-		return errors.New("invalid Codex account reference")
+		return errors.New("invalid account reference")
 	}
 	return nil
 }

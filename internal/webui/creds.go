@@ -74,8 +74,8 @@ func (s *Server) handleCredentials(w http.ResponseWriter, r *http.Request, rest 
 }
 
 func (s *Server) credAction(w http.ResponseWriter, r *http.Request, id, action string) {
-	if id == codexgateway.GatewayCredentialID {
-		writeErr(w, http.StatusConflict, "the OpenAI Codex gateway is managed through the Codex accounts panel")
+	if codexgateway.IsGatewayCredential(id) {
+		writeErr(w, http.StatusConflict, "sidecar gateways (OpenAI Codex, Google Gemini) are managed through their accounts panels")
 		return
 	}
 	ctx := r.Context()
@@ -167,11 +167,11 @@ func (s *Server) listCreds(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]credView, 0, len(list))
 	for _, c := range list {
-		// The Codex gateway credential is an internal hop to CLIProxyAPI, not an
-		// owner's subscription. Exposing it here makes it look like an account
+		// The sidecar gateway credentials (Codex, Gemini) are internal hops to
+		// CLIProxyAPI, not an owner's subscription. Exposing it here makes it look like an account
 		// whose tokens can be edited or deleted. Real Codex accounts are listed
 		// by /api/codex/accounts and managed through their OAuth controls.
-		if c.ID == codexgateway.GatewayCredentialID {
+		if codexgateway.IsGatewayCredential(c.ID) {
 			continue
 		}
 		v := credView{

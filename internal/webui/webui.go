@@ -135,7 +135,9 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, rest string) {
 	case rest == "/credentials" || strings.HasPrefix(rest, "/credentials/"):
 		s.handleCredentials(w, r, strings.TrimPrefix(rest, "/credentials"))
 	case rest == "/codex" || strings.HasPrefix(rest, "/codex/"):
-		s.handleCodex(w, r, strings.TrimPrefix(rest, "/codex"))
+		s.handleSidecar(w, r, codexgateway.CodexChannel, strings.TrimPrefix(rest, "/codex"))
+	case rest == "/gemini" || strings.HasPrefix(rest, "/gemini/"):
+		s.handleSidecar(w, r, codexgateway.GeminiChannel, strings.TrimPrefix(rest, "/gemini"))
 	case rest == "/users" || strings.HasPrefix(rest, "/users/"):
 		s.handleUsers(w, r, strings.TrimPrefix(rest, "/users"))
 	default:

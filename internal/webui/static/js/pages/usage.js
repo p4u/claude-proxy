@@ -126,6 +126,13 @@ function subCard(r) {
 // Before the first request there are no signals at all; then both are drawn
 // empty so the card has the same shape it will have once traffic arrives.
 function quotaMeters(r, five, seven, scoped) {
+  // Google Gemini (Antigravity) has one quota bucket shared by every Gemini
+  // model, read from Google's fetchAvailableModels; the server carries it in
+  // the five_hour slot. Google does not name the window, so neither do we.
+  if (r.provider === "gemini") {
+    const resets = five.resets_at ? countdown(five.resets_at) : (r.captured_at ? "full, no reset pending" : "—");
+    return [meter({ label: "Gemini quota", value: five.pct, resets })];
+  }
   if (r.provider !== "codex") {
     return [
       meter({ label: "5-hour window", value: five.pct, resets: countdown(five.resets_at) }),

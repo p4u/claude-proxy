@@ -221,7 +221,7 @@ func runServe(args []string) {
 		os.Exit(1)
 	}
 	if codexClient != nil {
-		logger.Info("OpenAI Codex gateway enabled", "base_url", codexClient.BaseURL())
+		logger.Info("CLIProxyAPI sidecar enabled (OpenAI Codex, Google Gemini)", "base_url", codexClient.BaseURL())
 		go codexgateway.RebalanceLoop(ctx, db, codexClient, logger, 90*time.Second)
 	}
 
@@ -243,6 +243,7 @@ func runServe(args []string) {
 		proxyH.Augment1M = isTruthy(v)
 	}
 	proxyH.PromptRetentionDays = *promptRetentionDays
+	proxyH.Sidecar = codexClient
 	if *promptRetentionDays > 0 {
 		go proxy.PromptJanitor(ctx, db, *promptRetentionDays, logger)
 		logger.Info("prompt logging enabled", "retention_days", *promptRetentionDays)

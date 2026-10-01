@@ -142,7 +142,7 @@ func (s *Server) handleUsageCurrent(w http.ResponseWriter, r *http.Request) {
 		// The synthetic gateway_codex row represents N Codex accounts, not
 		// a subscription — real Codex rows are appended below with per-
 		// account quota surfaced by the sidecar.
-		if c.ID == codexgateway.GatewayCredentialID {
+		if codexgateway.IsGatewayCredential(c.ID) {
 			continue
 		}
 		uc := usageCurrent{
@@ -203,12 +203,19 @@ func (s *Server) handleUsageCurrent(w http.ResponseWriter, r *http.Request) {
 		out = append(out, uc)
 	}
 
-	// Codex accounts live in the sidecar, not usage_history. One row per
-	// account, with quota lifted from the sidecar's X-Codex-* signals and
-	// score computed through the same formula RebalanceLoop uses.
+	// Sidecar accounts (Codex, Gemini) live in CLIProxyAPI, not
+	// usage_history. One row per account, with quota from the sidecar's
+	// X-Codex-* signals (Codex) or Google's fetchAvailableModels (Gemini),
+	// and score computed through the same formula RebalanceLoop uses.
+	var base map[string]int64
 	if s.codex != nil {
-		if accounts, err := s.codex.Accounts(ctx); err == nil {
-			base, _ := codexgateway.BaseWeightsMap(ctx, s.db)
+		base, _ = codexgateway.BaseWeightsMap(ctx, s.db)
+	}
+	for _, ch := range codexgateway.Channels {
+		if s.codex == nil {
+			break
+		}
+		if accounts, err := s.codex.Accounts(ctx, ch); err == nil {
 			for _, a := range accounts {
 				status := "active"
 				switch {
@@ -231,21 +238,20 @@ func (s *Server) handleUsageCurrent(w http.ResponseWriter, r *http.Request) {
 				if label == "" {
 					label = a.Name
 				}
-				// OpenAI's plan name ("team", "prolite", …) is what the
-				// operator recognises; the sidecar's account_type is just
-				// "oauth".
+				// The plan name — OpenAI's "team"/"prolite", Google's
+				// "free"/paid tier — is what the operator recognises; the
+				// sidecar's account_type is just "oauth".
 				plan := a.Quota.PlanType
 				if plan == "" {
 					plan = a.AccountType
 				}
 				uc := usageCurrent{
-					CredentialID:     "codex:" + a.Name,
+					CredentialID:     string(ch.Provider) + ":" + a.Name,
 					Label:            label,
 					SubscriptionType: plan,
-					Provider:         string(provider.Codex),
-					// Codex accounts do publish utilization (the sidecar
-					// records OpenAI's X-Codex-* headers), so they render
-					// as meters like Anthropic. Before the first request
+					Provider:         string(ch.Provider),
+					// Sidecar accounts do publish utilization, so they
+					// render as meters like Anthropic. Before the first request
 					// there is simply no snapshot yet — same as a freshly
 					// imported Anthropic credential — not "no usage API".
 					HasUsageAPI: true,

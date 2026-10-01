@@ -90,11 +90,13 @@ services:
       - |
         sed "s|__CLIPROXY_API_KEY__|$${CLIPROXY_API_KEY}|g" /config/cliproxy.yaml.tmpl > /tmp/config.yaml
         exec /CLIProxyAPI/CLIProxyAPI -config /tmp/config.yaml
-    # OpenAI's registered Codex redirect is fixed to localhost:1455. Publishing
-    # it on loopback supports browsers on this host and SSH port forwarding,
-    # without exposing the callback listener to the LAN.
+    # OpenAI's registered Codex redirect is fixed to localhost:1455, and
+    # Antigravity's (Google Gemini) to localhost:51121. Publishing them on
+    # loopback supports browsers on this host and SSH port forwarding, without
+    # exposing the callback listeners to the LAN.
     ports:
       - "127.0.0.1:1455:1455"
+      - "127.0.0.1:51121:51121"
     volumes:
       - ./config/cliproxy.yaml.tmpl:/config/cliproxy.yaml.tmpl:ro
       - ./data/cliproxy-auth:/auth

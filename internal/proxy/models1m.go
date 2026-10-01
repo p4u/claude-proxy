@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"maps"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/p4u/claude-proxy/internal/codexgateway"
 	"github.com/p4u/claude-proxy/internal/creds"
 	"github.com/p4u/claude-proxy/internal/pool"
 	"github.com/p4u/claude-proxy/internal/provider"
@@ -250,6 +252,112 @@ func augment1M(entries []map[string]any) []map[string]any {
 		out = append(out, e)
 	}
 	return out
+}
+
+// enrichFromSidecar fills display names and context sizes into a sidecar
+// provider's catalogue entries from the sidecar's model definitions. Entries
+// that already carry a value keep it; a failed lookup changes nothing.
+func (h *Handler) enrichFromSidecar(ctx context.Context, p provider.Provider, entries []map[string]any) []map[string]any {
+	if h.Sidecar == nil {
+		return entries
+	}
+	ch, ok := codexgateway.ChannelFor(p.ID)
+	if !ok {
+		return entries
+	}
+	defs, err := h.Sidecar.ModelDefinitions(ctx, ch)
+	if err != nil || len(defs) == 0 {
+		return entries
+	}
+	out := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		id, _ := e["id"].(string)
+		def, found := defs[id]
+		if !found {
+			out = append(out, e)
+			continue
+		}
+		e = maps.Clone(e)
+		if name, _ := e["display_name"].(string); name == "" && def.DisplayName != "" {
+			e["display_name"] = def.DisplayName
+		}
+		if _, has := maxInputTokens(e); !has && def.ContextLength > 0 {
+			e["max_input_tokens"] = def.ContextLength
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// filterCatalog keeps only the entries this provider can actually serve, and
+// fills in its default context window where the upstream publishes none.
+//
+// It matters for the providers that share the CLIProxyAPI sidecar: its model
+// list is the union of every signed-in account, so without CatalogOwner the
+// Codex rows would include Antigravity's catalogue and vice versa — including
+// Antigravity's claude-* and gpt-oss-* models, which would collide with the
+// Anthropic and Codex routes. Providers without a CatalogOwner pass through
+// untouched. Entries are cloned before the context default is written, since
+// the caller may reuse the upstream slice.
+func filterCatalog(entries []map[string]any, p provider.Provider) []map[string]any {
+	if p.CatalogOwner == "" && len(p.CatalogExclude) == 0 && p.DefaultMaxInputTokens == 0 {
+		return entries
+	}
+	out := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		id, _ := e["id"].(string)
+		if id == "" {
+			continue
+		}
+		if p.CatalogOwner != "" {
+			// A missing owned_by falls back to the prefix test alone, so a
+			// sidecar build that stops sending it degrades to the old
+			// behaviour instead of emptying the provider's catalogue.
+			if owner, ok := e["owned_by"].(string); ok && owner != p.CatalogOwner {
+				continue
+			}
+			if !hasAnyPrefix(id, p.ModelPrefixes) {
+				continue
+			}
+		}
+		if containsAny(id, p.CatalogExclude) {
+			continue
+		}
+		_, hasWindow := maxInputTokens(e)
+		name, _ := e["display_name"].(string)
+		if (p.DefaultMaxInputTokens > 0 && !hasWindow) || name == "" {
+			e = maps.Clone(e)
+			if p.DefaultMaxInputTokens > 0 && !hasWindow {
+				e["max_input_tokens"] = p.DefaultMaxInputTokens
+			}
+			// The sidecar's OpenAI-shaped list has no display names. Naming
+			// the entry after its ID lets augment1M label the "[1m]" twin
+			// "(1M context)" instead of showing the raw suffix.
+			if name == "" {
+				e["display_name"] = id
+			}
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+func hasAnyPrefix(s string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAny(s string, subs []string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // advertise rewrites entry IDs into the form clients are offered.
@@ -496,6 +604,7 @@ func (h *Handler) serveModels(w http.ResponseWriter, r *http.Request, start time
 				"provider", string(p.ID), "bytes", rec.body.Len())
 			continue
 		}
+		entries = filterCatalog(h.enrichFromSidecar(r.Context(), p, entries), p)
 		if p.Augment1M {
 			entries = augment1M(entries)
 		}

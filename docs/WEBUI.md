@@ -179,6 +179,31 @@ OpenAI's registered Codex redirect URI is loopback-only and cannot be changed
 to `TLS_DOMAIN`. The UI supports a validated manual callback-URL handoff for
 remote browsers and for the sidecar's final private-port redirect.
 
+### Google Gemini account management
+
+The same routes under **`/api/gemini/*`** manage Google accounts signed in
+through Antigravity's OAuth, served by the same sidecar
+(`codexgateway.GeminiChannel`):
+
+- `GET /api/gemini/accounts` lists only `antigravity` auth files. Each
+  account's `quota` is read from Google (`fetchAvailableModels`, through the
+  sidecar's `api-call`, cached 1 min): one shared bucket carried as
+  `five_hour_pct`/`five_hour_resets_at` with `five_hour_window: true`, and
+  `plan_type` from `loadCodeAssist` (`"free"` for the free tier).
+- `POST /api/gemini/oauth/start` returns `callback_uri:
+  "http://localhost:51121/oauth-callback"` and accepts that URL or
+  `http://127.0.0.1:8317/antigravity/callback?...` in `/oauth/callback`; a
+  Codex callback is rejected here, and vice versa.
+- `POST /api/gemini/accounts/{status,weight,delete}` answer `404` for an
+  account name that is not a Gemini account — the sidecar itself would accept
+  any file name, so without this check one channel's panel could delete
+  another's account.
+
+`/api/usage/current` adds one row per Gemini account with `provider:"gemini"`,
+`credential_id:"gemini:<file>"`, the bucket in `five_hour` and
+`seven_day.absent: true`; the Subscriptions card draws a single "Gemini quota"
+meter.
+
 ### Proxy user management (wraps `internal/usertoken`)
 - `GET /api/users` → list incl. status, created_at, last_used_at.
 - `POST /api/users` `{name}` → `{id,name,token}` (token shown once).

@@ -26,7 +26,7 @@ func TestAccountsAreSanitizedAndCodexOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	accounts, err := c.Accounts(context.Background())
+	accounts, err := c.Accounts(context.Background(), CodexChannel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,6 +58,16 @@ func TestReconcileCredential(t *testing.T) {
 	}
 	if got.Provider != provider.Codex || got.AccessToken != "internal-key" || got.BaseURL != "http://sidecar:8317" {
 		t.Fatalf("gateway credential = %#v", got)
+	}
+	gem, err := creds.Get(context.Background(), db, GeminiChannel.CredentialID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gem.Provider != provider.Gemini || gem.AccessToken != "internal-key" || gem.BaseURL != "http://sidecar:8317" {
+		t.Fatalf("gemini gateway credential = %#v", gem)
+	}
+	if !IsGatewayCredential(GeminiChannel.CredentialID) || !IsGatewayCredential(GatewayCredentialID) || IsGatewayCredential("cred_x") {
+		t.Fatal("IsGatewayCredential misclassifies")
 	}
 }
 

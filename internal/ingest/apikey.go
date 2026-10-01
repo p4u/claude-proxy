@@ -90,8 +90,8 @@ func ImportKey(ctx context.Context, db *store.DB, p provider.ID, label, plan, ap
 		return nil, fmt.Errorf("%s requires a base URL and model catalogue — use the custom-host flow instead",
 			provider.Get(p).Name)
 	}
-	if p == provider.Codex {
-		return nil, fmt.Errorf("OpenAI Codex subscriptions are managed through OAuth")
+	if p == provider.Codex || p == provider.Gemini {
+		return nil, fmt.Errorf("%s subscriptions are managed through OAuth", provider.Get(p).Name)
 	}
 
 	dup, err := creds.HasAccessToken(ctx, db, apiKey)

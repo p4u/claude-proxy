@@ -13,25 +13,55 @@ import (
 	"github.com/p4u/claude-proxy/internal/store"
 )
 
-func TestValidateCodexRedirect(t *testing.T) {
-	for _, good := range []string{
-		"http://localhost:1455/auth/callback?code=abc&state=state_1",
-		"http://127.0.0.1:8317/codex/callback?code=abc&scope=openid+offline_access&state=state_1",
-	} {
-		if err := validateCodexRedirect(good, "state_1"); err != nil {
-			t.Errorf("valid redirect %q: %v", good, err)
-		}
+func TestValidateSidecarRedirect(t *testing.T) {
+	cases := []struct {
+		ch   codexgateway.Channel
+		good []string
+		bad  []string
+	}{
+		{
+			ch: codexgateway.CodexChannel,
+			good: []string{
+				"http://localhost:1455/auth/callback?code=abc&state=state_1",
+				"http://127.0.0.1:8317/codex/callback?code=abc&scope=openid+offline_access&state=state_1",
+			},
+			bad: []string{
+				"https://proxy.example/auth/callback?code=abc&state=state_1",
+				"http://localhost:1455/auth/callback?code=abc&state=wrong",
+				"http://localhost:1455/other?code=abc&state=state_1",
+				"http://localhost:1455/auth/callback?state=state_1",
+				"http://127.0.0.1:8317/anthropic/callback?code=abc&state=state_1",
+				"http://localhost:8317/codex/callback?code=abc&state=state_1",
+				// Another channel's callback must not complete a Codex login.
+				"http://127.0.0.1:8317/antigravity/callback?code=abc&state=state_1",
+			},
+		},
+		{
+			ch: codexgateway.GeminiChannel,
+			good: []string{
+				"http://localhost:51121/oauth-callback?code=4/0Ab&state=state_1",
+				// The exact shape a browser lands on after the sidecar's
+				// forwarder hop (observed during the 2026-10-01 trial).
+				"http://127.0.0.1:8317/antigravity/callback?state=state_1&iss=https://accounts.google.com&code=4/0Ab&scope=email%20profile&authuser=1&prompt=consent",
+			},
+			bad: []string{
+				"http://localhost:1455/auth/callback?code=abc&state=state_1",
+				"http://127.0.0.1:8317/codex/callback?code=abc&state=state_1",
+				"http://localhost:51121/oauth-callback?code=abc&state=wrong",
+				"http://localhost:51121/oauth-callback?state=state_1",
+			},
+		},
 	}
-	for _, raw := range []string{
-		"https://proxy.example/auth/callback?code=abc&state=state_1",
-		"http://localhost:1455/auth/callback?code=abc&state=wrong",
-		"http://localhost:1455/other?code=abc&state=state_1",
-		"http://localhost:1455/auth/callback?state=state_1",
-		"http://127.0.0.1:8317/anthropic/callback?code=abc&state=state_1",
-		"http://localhost:8317/codex/callback?code=abc&state=state_1",
-	} {
-		if err := validateCodexRedirect(raw, "state_1"); err == nil {
-			t.Errorf("validateCodexRedirect(%q) succeeded", raw)
+	for _, c := range cases {
+		for _, good := range c.good {
+			if err := validateSidecarRedirect(c.ch, good, "state_1"); err != nil {
+				t.Errorf("%s: valid redirect %q: %v", c.ch.Key, good, err)
+			}
+		}
+		for _, raw := range c.bad {
+			if err := validateSidecarRedirect(c.ch, raw, "state_1"); err == nil {
+				t.Errorf("%s: validateSidecarRedirect(%q) succeeded", c.ch.Key, raw)
+			}
 		}
 	}
 }
@@ -151,5 +181,74 @@ func TestCodexManagementAPI(t *testing.T) {
 	cancel := do(t, h, http.MethodPost, "/api/codex/oauth/cancel", `{"state":"state_1"}`, cookie)
 	if cancel.Code != http.StatusOK {
 		t.Fatalf("cancel = %d %s", cancel.Code, cancel.Body.String())
+	}
+}
+
+// The sidecar's mutation endpoints take a bare file name for any provider, so
+// each channel's panel must refuse accounts that belong to another channel.
+func TestGeminiPanelIsScopedToGeminiAccounts(t *testing.T) {
+	var deleted, started []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v0/management/auth-files":
+			if r.Method == http.MethodDelete {
+				deleted = append(deleted, r.URL.Query().Get("name"))
+				_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{
+				{"name": "codex-owner.json", "type": "codex", "email": "owner@example.com"},
+				{"name": "antigravity-g@example.com.json", "type": "antigravity", "email": "g@example.com", "access_token": "must-not-leak"},
+			}})
+		case "/v0/management/antigravity-auth-url", "/v0/management/codex-auth-url":
+			started = append(started, r.URL.Path)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "url": "https://accounts.google.com/o/oauth2/v2/auth", "state": "state_g"})
+		case "/v0/management/api-call":
+			_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 403, "body": "{}"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	client, err := codexgateway.New(codexgateway.Config{BaseURL: upstream.URL, APIKey: "api-key", ManagementKey: "management-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(filepath.Join(t.TempDir(), "gemini.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := codexgateway.ReconcileCredential(t.Context(), db, client); err != nil {
+		t.Fatal(err)
+	}
+	h := NewWithCodex(db, nil, testPassword, false, client)
+	cookie := loginCookie(t, h)
+
+	credentials := do(t, h, http.MethodGet, "/api/credentials", "", cookie)
+	if strings.Contains(credentials.Body.String(), codexgateway.GeminiChannel.CredentialID) {
+		t.Fatalf("gemini gateway leaked into credentials: %s", credentials.Body.String())
+	}
+
+	accounts := do(t, h, http.MethodGet, "/api/gemini/accounts", "", cookie)
+	body := accounts.Body.String()
+	if accounts.Code != http.StatusOK || !strings.Contains(body, "g@example.com") || strings.Contains(body, "owner@example.com") || strings.Contains(body, "must-not-leak") {
+		t.Fatalf("gemini accounts = %d %s", accounts.Code, body)
+	}
+
+	cross := do(t, h, http.MethodPost, "/api/gemini/accounts/delete", `{"name":"codex-owner.json"}`, cookie)
+	if cross.Code != http.StatusNotFound || len(deleted) != 0 {
+		t.Fatalf("deleting a Codex account via the Gemini panel = %d (deleted %v)", cross.Code, deleted)
+	}
+	own := do(t, h, http.MethodPost, "/api/gemini/accounts/delete", `{"name":"antigravity-g@example.com.json"}`, cookie)
+	if own.Code != http.StatusOK || len(deleted) != 1 {
+		t.Fatalf("deleting own account = %d %s (deleted %v)", own.Code, own.Body.String(), deleted)
+	}
+
+	start := do(t, h, http.MethodPost, "/api/gemini/oauth/start", "", cookie)
+	if start.Code != http.StatusOK || !strings.Contains(start.Body.String(), "localhost:51121/oauth-callback") ||
+		!strings.Contains(start.Body.String(), "127.0.0.1:8317/antigravity/callback") ||
+		len(started) != 1 || started[0] != "/v0/management/antigravity-auth-url" {
+		t.Fatalf("gemini oauth start = %d %s (upstream %v)", start.Code, start.Body.String(), started)
 	}
 }

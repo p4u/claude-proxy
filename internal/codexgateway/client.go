@@ -1,6 +1,8 @@
 // Package codexgateway connects claude-proxy to a private CLIProxyAPI sidecar.
-// The sidecar owns OpenAI OAuth credentials; this package deliberately exposes
-// only the small, sanitized management surface needed by the web UI.
+// The sidecar owns the OAuth credentials of every channel it serves (OpenAI
+// Codex, Google Gemini via Antigravity — see Channel); this package
+// deliberately exposes only the small, sanitized management surface needed by
+// the web UI. The package name predates Gemini support.
 package codexgateway
 
 import (
@@ -13,13 +15,11 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/p4u/claude-proxy/internal/provider"
 	"github.com/p4u/claude-proxy/internal/store"
 )
-
-const GatewayCredentialID = "gateway_codex"
 
 const maxResponseBytes = 1 << 20
 
@@ -38,6 +38,12 @@ type Client struct {
 	apiKey        string
 	managementKey string
 	http          *http.Client
+
+	// quotaMu guards quotaCache: per-account quota read from the upstream for
+	// channels whose quota is not carried by response headers (Gemini).
+	quotaMu    sync.Mutex
+	quotaCache map[string]cachedQuota
+	defsCache  map[string]cachedDefinitions
 }
 
 func New(cfg Config) (*Client, error) {
@@ -46,13 +52,15 @@ func New(cfg Config) (*Client, error) {
 	}
 	u, err := url.Parse(strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/"))
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
-		return nil, errors.New("invalid Codex gateway base URL")
+		return nil, errors.New("invalid CLIProxyAPI sidecar base URL")
 	}
 	return &Client{
 		baseURL:       u.String(),
 		apiKey:        strings.TrimSpace(cfg.APIKey),
 		managementKey: strings.TrimSpace(cfg.ManagementKey),
 		http:          &http.Client{Timeout: 20 * time.Second},
+		quotaCache:    map[string]cachedQuota{},
+		defsCache:     map[string]cachedDefinitions{},
 	}, nil
 }
 
@@ -147,9 +155,10 @@ type CodexQuota struct {
 
 type rawAccount struct {
 	Account
-	Type     string       `json:"type"`
-	Provider string       `json:"provider"`
-	RawQuota rawQuotaBlob `json:"quota"`
+	Type      string       `json:"type"`
+	Provider  string       `json:"provider"`
+	ProjectID string       `json:"project_id"`
+	RawQuota  rawQuotaBlob `json:"quota"`
 	// ModelQuotas is where CLIProxyAPI ≥ 7.2.149 actually records the
 	// X-Codex-* headers: one block per model that served a request, keyed by
 	// model name. The top-level quota block is left empty on those builds.
@@ -183,7 +192,10 @@ func latestQuota(file rawAccount) rawQuotaBlob {
 	return best
 }
 
-func (c *Client) Accounts(ctx context.Context) ([]Account, error) {
+// Accounts lists the channel's accounts. For channels whose quota comes from
+// the upstream rather than response headers it is fetched here, through the
+// sidecar, with a short cache.
+func (c *Client) Accounts(ctx context.Context, ch Channel) ([]Account, error) {
 	var response struct {
 		Files []rawAccount `json:"files"`
 	}
@@ -193,11 +205,15 @@ func (c *Client) Accounts(ctx context.Context) ([]Account, error) {
 	now := time.Now()
 	accounts := make([]Account, 0, len(response.Files))
 	for _, file := range response.Files {
-		if !strings.EqualFold(file.Type, "codex") && !strings.EqualFold(file.Provider, "codex") {
+		if !strings.EqualFold(file.Type, ch.Key) && !strings.EqualFold(file.Provider, ch.Key) {
 			continue
 		}
 		acc := file.Account
-		acc.Quota = parseCodexQuota(latestQuota(file)).Current(now)
+		if ch.quotaFromAPI {
+			acc.Quota = c.geminiQuota(ctx, acc, now).Current(now)
+		} else {
+			acc.Quota = parseCodexQuota(latestQuota(file)).Current(now)
+		}
 		acc.Blocked = acc.BlockedAt(now)
 		accounts = append(accounts, acc)
 	}
@@ -210,11 +226,11 @@ type OAuthStart struct {
 	State  string `json:"state"`
 }
 
-func (c *Client) StartOAuth(ctx context.Context) (OAuthStart, error) {
+func (c *Client) StartOAuth(ctx context.Context, ch Channel) (OAuthStart, error) {
 	var out OAuthStart
-	err := c.do(ctx, http.MethodGet, "/v0/management/codex-auth-url?is_webui=true", nil, &out, true)
+	err := c.do(ctx, http.MethodGet, ch.authURLPath, nil, &out, true)
 	if err == nil && (out.URL == "" || out.State == "") {
-		err = errors.New("codex gateway returned an incomplete OAuth session")
+		err = fmt.Errorf("%s gateway returned an incomplete OAuth session", ch.Name)
 	}
 	return out, err
 }
@@ -235,8 +251,8 @@ func (c *Client) CancelOAuth(ctx context.Context, state string) error {
 	return c.do(ctx, http.MethodDelete, "/v0/management/oauth-session?state="+url.QueryEscape(state), nil, nil, true)
 }
 
-func (c *Client) SubmitCallback(ctx context.Context, state, redirectURL string) error {
-	body := map[string]string{"provider": "codex", "state": state, "redirect_url": redirectURL}
+func (c *Client) SubmitCallback(ctx context.Context, ch Channel, state, redirectURL string) error {
+	body := map[string]string{"provider": ch.Key, "state": state, "redirect_url": redirectURL}
 	var out OAuthStatus
 	return c.do(ctx, http.MethodPost, "/v0/management/oauth-callback", body, &out, true)
 }
@@ -263,19 +279,19 @@ func (c *Client) DeleteAccount(ctx context.Context, name string) error {
 
 func (c *Client) do(ctx context.Context, method, path string, body, out any, management bool) error {
 	if c == nil {
-		return errors.New("OpenAI Codex support is not configured")
+		return errors.New("the CLIProxyAPI sidecar is not configured")
 	}
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
 		if err != nil {
-			return fmt.Errorf("encode Codex gateway request: %w", err)
+			return fmt.Errorf("encode sidecar request: %w", err)
 		}
 		reader = bytes.NewReader(encoded)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
 	if err != nil {
-		return fmt.Errorf("build Codex gateway request: %w", err)
+		return fmt.Errorf("build sidecar request: %w", err)
 	}
 	key := c.apiKey
 	if management {
@@ -288,15 +304,15 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any, man
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("codex gateway unavailable: %w", err)
+		return fmt.Errorf("sidecar unavailable: %w", err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
-		return fmt.Errorf("read Codex gateway response: %w", err)
+		return fmt.Errorf("read sidecar response: %w", err)
 	}
 	if len(raw) > maxResponseBytes {
-		return errors.New("codex gateway response is too large")
+		return errors.New("sidecar response is too large")
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var apiErr struct {
@@ -307,35 +323,43 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any, man
 		if message == "" {
 			message = http.StatusText(resp.StatusCode)
 		}
-		return fmt.Errorf("codex gateway: %s", message)
+		return fmt.Errorf("sidecar: %s", message)
 	}
 	if out != nil && len(bytes.TrimSpace(raw)) > 0 {
 		if err := json.Unmarshal(raw, out); err != nil {
-			return fmt.Errorf("decode Codex gateway response: %w", err)
+			return fmt.Errorf("decode sidecar response: %w", err)
 		}
 	}
 	return nil
 }
 
-// ReconcileCredential creates or refreshes the one local credential that
-// represents the private sidecar. OAuth tokens never enter this database.
+// ReconcileCredential creates or refreshes the local credential of every
+// sidecar channel. Each one carries only the sidecar URL and internal API key —
+// OAuth tokens never enter this database — and is reset to active, which is
+// also what recovers a channel an older build had wrongly revoked.
 func ReconcileCredential(ctx context.Context, db *store.DB, c *Client) error {
-	if c == nil {
-		_, err := db.ExecContext(ctx, `UPDATE credentials SET status='disabled' WHERE id=?`, GatewayCredentialID)
-		return err
+	for _, ch := range Channels {
+		if c == nil {
+			if _, err := db.ExecContext(ctx, `UPDATE credentials SET status='disabled' WHERE id=?`, ch.CredentialID); err != nil {
+				return err
+			}
+			continue
+		}
+		now := time.Now()
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO credentials
+			  (id, label, subscription_type, provider, base_url, models,
+			   access_token, refresh_token, expires_at, status, weight, created_at)
+			VALUES (?, ?, 'oauth-sidecar', ?, ?, '', ?, '', ?, 'active', 1, ?)
+			ON CONFLICT(id) DO UPDATE SET
+			  label=excluded.label, subscription_type=excluded.subscription_type,
+			  provider=excluded.provider, base_url=excluded.base_url,
+			  access_token=excluded.access_token, refresh_token='',
+			  expires_at=excluded.expires_at, status='active', weight=1`,
+			ch.CredentialID, ch.Name+" gateway", string(ch.Provider), c.BaseURL(), c.APIKey(),
+			now.AddDate(100, 0, 0).Unix(), now.Unix()); err != nil {
+			return err
+		}
 	}
-	now := time.Now()
-	_, err := db.ExecContext(ctx, `
-		INSERT INTO credentials
-		  (id, label, subscription_type, provider, base_url, models,
-		   access_token, refresh_token, expires_at, status, weight, created_at)
-		VALUES (?, 'OpenAI Codex gateway', 'oauth-sidecar', ?, ?, '', ?, '', ?, 'active', 1, ?)
-		ON CONFLICT(id) DO UPDATE SET
-		  label=excluded.label, subscription_type=excluded.subscription_type,
-		  provider=excluded.provider, base_url=excluded.base_url,
-		  access_token=excluded.access_token, refresh_token='',
-		  expires_at=excluded.expires_at, status='active', weight=1`,
-		GatewayCredentialID, string(provider.Codex), c.BaseURL(), c.APIKey(),
-		now.AddDate(100, 0, 0).Unix(), now.Unix())
-	return err
+	return nil
 }
