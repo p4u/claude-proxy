@@ -70,6 +70,9 @@ func TestParseGeminiTier(t *testing.T) {
 // antigravity accounts, reads quota and tier through api-call with an
 // Antigravity User-Agent and the $TOKEN$ placeholder, and caches the result.
 func TestGeminiAccountsReadQuotaThroughSidecar(t *testing.T) {
+	// Accounts rolls expired windows over; keep this transport/cache fixture live.
+	reset := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	models := strings.ReplaceAll(liveModels, "2026-10-01T14:32:43Z", reset)
 	var apiCalls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -92,7 +95,7 @@ func TestGeminiAccountsReadQuotaThroughSidecar(t *testing.T) {
 				http.Error(w, "bad api-call", http.StatusBadRequest)
 				return
 			}
-			body := liveModels
+			body := models
 			if strings.HasSuffix(req.URL, ":loadCodeAssist") {
 				body = `{"currentTier":{"id":"free-tier"}}`
 			}

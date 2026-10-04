@@ -3,11 +3,60 @@ import {
   el, clear, spinner, errorState, emptyState, statusBadge, toast, modal, confirmDialog, button, copyText,
 } from "../ui.js";
 import { periodControl, sectionHead, segmented, meter } from "../components.js";
-import { getWindow, setWindowPeriod, setWindowCustom } from "../store.js";
+import { getWindow, setWindowPeriod, setWindowCustom, windowLabel } from "../store.js";
 import { compactNum, fullNum, ms, relTime, localTime, pct } from "../format.js";
 
+// Module-level render token: guards async fetches against stale responses when
+// the period or metric control fires before a previous load completes.
+let renderToken = 0;
+
+// Persisted across period changes so the operator's metric choice survives a
+// window switch without resetting back to "total".
+let selectedMetric = "total";
+
+// Metric definitions for the ranking panel.
+// total = input + output + cache_creation + cache_read (all four fields summed).
+// cache_creation and cache_read are reported separately from input/output and
+// are not included in those individual metrics.
+const METRICS = [
+  {
+    value: "total",
+    label: "Total",
+    desc:
+      "All tokens combined: input + output + cache creation + cache read. " +
+      "Cache-read tokens dominate at scale, so this total is usually much larger than output alone.",
+    fn: (s) => (s.tokens_in || 0) + (s.tokens_out || 0) + (s.cache_read || 0) + (s.cache_creation || 0),
+  },
+  {
+    value: "input",
+    label: "Input",
+    desc:
+      "Input tokens only — the prompt text (including conversation history) sent to the model each turn. " +
+      "Cache creation and cache read tokens are reported separately and excluded from this figure.",
+    fn: (s) => s.tokens_in || 0,
+  },
+  {
+    value: "output",
+    label: "Output",
+    desc:
+      "Output tokens only — the model's response tokens. " +
+      "This is the metric used by the per-user output limit configured below.",
+    fn: (s) => s.tokens_out || 0,
+  },
+  {
+    value: "cache_read",
+    label: "Cache read",
+    desc:
+      "Cache-read tokens. Usually the largest number here by far. " +
+      "Excluded from the configured proxy output limits — only output tokens count toward those caps.",
+    fn: (s) => s.cache_read || 0,
+  },
+];
+
 export async function render(root) {
+  const myToken = ++renderToken;
   clear(root);
+
   const win = getWindow();
   const head = sectionHead("Users", "Per-user bearer tokens and their traffic attribution.", [
     periodControl(win, (sel) => {
@@ -17,22 +66,249 @@ export async function render(root) {
     }),
     button("Create user", { kind: "primary", onClick: () => createModal(root) }),
   ]);
-  const body = el("div", { class: "card table-card" }, spinner("Loading users…"));
-  root.append(head, body);
+
+  // Ranking panel placeholder — filled after fetch completes.
+  const rankCard = el("div", { class: "card ranking" }, spinner("Loading ranking…"));
+
+  // Management section: label + card placeholder.
+  const mgmtCard = el("div", { class: "card table-card" }, spinner("Loading users…"));
+  const mgmtHead = el("div", { class: "users-mgmt-head" }, [
+    el("h2", { class: "users-mgmt-title", text: "Management" }),
+    el("span", { class: "users-mgmt-sub", text: "Tokens, limits, captures, and access controls" }),
+  ]);
+
+  root.append(head, rankCard, mgmtHead, mgmtCard);
+
+  // Fetch users and stats independently. A stats failure must show an explicit
+  // ranking error rather than silently treating everything as zero usage.
+  const statsOutcome = api.statsUsers(win).then(
+    (data) => ({ ok: true, data }),
+    (err) => ({ ok: false, err }),
+  );
 
   try {
-    const [users, stats] = await Promise.all([api.users(), api.statsUsers(win).catch(() => [])]);
-    clear(body);
+    const [users, statsResult] = await Promise.all([api.users(), statsOutcome]);
+
+    // Discard if: a newer render has started, or the user navigated away.
+    if (myToken !== renderToken) return;
+    if (!rankCard.isConnected) return;
+
+    const statsError = statsResult.ok ? null : statsResult.err;
+    const statById = statsResult.ok
+      ? new Map((statsResult.data || []).map((s) => [s.id, s]))
+      : new Map();
+
     if (!users || !users.length) {
-      body.append(emptyState("No users yet", 'Create a user to mint a bearer token. Each request it makes is attributed here.'));
+      const noUsers = emptyState(
+        "No users yet",
+        "Create a user to mint a bearer token. Each request it makes is attributed here.",
+      );
+      clear(rankCard).append(noUsers.cloneNode(true));
+      clear(mgmtCard).append(noUsers);
       return;
     }
-    const statById = new Map((stats || []).map((s) => [s.id, s]));
-    body.append(buildTable(users, statById, root));
+
+    clear(rankCard).append(buildRanking(users, statById, statsError, win, root));
+    clear(mgmtCard).append(buildMgmtTable(users, statById, root));
   } catch (e) {
-    clear(body).append(errorState(e.message, () => render(root)));
+    if (myToken !== renderToken) return;
+    if (!rankCard.isConnected) return;
+    clear(rankCard).append(errorState(e.message, () => render(root)));
+    clear(mgmtCard).append(errorState(e.message, () => render(root)));
   }
 }
+
+// ---------------------------------------------------------------------------
+// Ranking panel
+// ---------------------------------------------------------------------------
+
+// statsError is non-null when the stats fetch failed. In that case we show an
+// explicit error with a retry option rather than displaying zero bars which
+// would falsely imply the users have no activity.
+function buildRanking(users, statById, statsError, win, root) {
+  // Use module-level selectedMetric so the choice survives a period change.
+
+  const desc = el("p", { class: "ranking__desc" });
+
+  // aria-live status: announced to screen readers when the metric or window
+  // changes. Kept separate from the caption so it can be updated in place
+  // without re-rendering the whole table.
+  const liveStatus = el("div", {
+    class: "sr-only",
+    role: "status",
+    "aria-live": "polite",
+    "aria-atomic": "true",
+  });
+
+  const caption = el("caption");
+
+  function updateCaption() {
+    const metricLabel = (METRICS.find((m) => m.value === selectedMetric) || METRICS[0]).label;
+    const winStr = windowLabel(win);
+    const text = `Users ranked by ${metricLabel} token consumption (${winStr}), descending.`;
+    caption.textContent = text;
+    liveStatus.textContent = text;
+  }
+
+  const tbody = el("tbody");
+
+  // If stats failed entirely, show an error state inside the ranking card
+  // instead of a table. Management table is unaffected.
+  if (statsError) {
+    const msg = statsError.message || String(statsError);
+    return el("div", {}, [
+      liveStatus,
+      el("div", { class: "ranking__head" }, [
+        el("div", {}, [
+          el("div", { class: "eyebrow", text: "Token consumption" }),
+          el("h2", { class: "ranking__title" }, [
+            el("span", { text: "User ranking" }),
+            el("span", {
+              class: "ranking__period",
+              "aria-hidden": "true",
+              text: " · " + windowLabel(win),
+            }),
+          ]),
+        ]),
+      ]),
+      // Retry re-renders the whole page so both ranking and management refresh.
+      errorState(`Could not load usage stats: ${msg}`, () => render(root)),
+    ]);
+  }
+
+  const metricSeg = segmented(
+    METRICS.map((m) => ({ value: m.value, label: m.label })),
+    selectedMetric,
+    (v) => {
+      selectedMetric = v;
+      paintRows();
+      updateCaption();
+    },
+    "Token metric for ranking",
+  );
+
+  const table = el("table", { class: "ranking-table" }, [
+    caption,
+    el("thead", {}, el("tr", {}, [
+      el("th", { scope: "col", class: "col-rank", "aria-label": "Rank" }, el("span", { "aria-hidden": "true", text: "#" })),
+      el("th", { scope: "col", text: "User" }),
+      el("th", { scope: "col", class: "col-status", text: "Status" }),
+      el("th", { scope: "col", class: "col-bar", text: "Consumption" }),
+      el("th", { scope: "col", class: "num col-count", text: "Tokens" }),
+      el("th", { scope: "col", class: "num col-share", text: "Share" }),
+    ])),
+    tbody,
+  ]);
+
+  function paintRows() {
+    const metricDef = METRICS.find((m) => m.value === selectedMetric) || METRICS[0];
+    desc.textContent = metricDef.desc;
+
+    // Compute a value for every user (zero when no stats row exists).
+    const rows = users.map((u) => {
+      const s = statById.get(u.id) || {};
+      return { u, value: metricDef.fn(s) };
+    });
+
+    // Sort descending; stable sort preserves name order among equals.
+    rows.sort((a, b) => b.value - a.value);
+
+    const maxVal = rows.length ? rows[0].value : 0;
+    const totalVal = rows.reduce((sum, r) => sum + r.value, 0);
+    const allZero = maxVal === 0;
+
+    clear(tbody);
+
+    if (allZero) {
+      tbody.append(
+        el("tr", { class: "ranking-empty-row" }, [
+          el("td", { colspan: "6" }, [
+            el("span", {
+              text:
+                "No token activity recorded in this period. " +
+                "Change the period above or wait for some requests to be made.",
+            }),
+          ]),
+        ]),
+      );
+      return;
+    }
+
+    rows.forEach((r, i) => {
+      const barPct = maxVal > 0 ? (r.value / maxVal) * 100 : 0;
+      const sharePct = totalVal > 0 ? (r.value / totalVal) * 100 : 0;
+
+      const barFill = el("div", {
+        class: "rank-bar__fill",
+        style: `width: ${barPct.toFixed(1)}%`,
+        role: "meter",
+        "aria-valuenow": barPct.toFixed(0),
+        "aria-valuemin": "0",
+        "aria-valuemax": "100",
+        // Full count in the aria-label so screen readers get exact numbers
+        // regardless of how compact the visual label alongside the bar is.
+        "aria-label":
+          `${r.u.name}: ${fullNum(r.value)} tokens (${pct(sharePct, 1)} of total)`,
+      });
+      const barLabel = el("span", {
+        class: "rank-bar__label",
+        "aria-hidden": "true",
+        text: compactNum(r.value),
+      });
+      const barCell = el("div", { class: "rank-bar" }, [
+        el("div", { class: "rank-bar__track" }, barFill),
+        barLabel,
+      ]);
+
+      const isDisabled = (r.u.status || "").toLowerCase() === "disabled";
+      const tr = el("tr", { class: isDisabled ? "ranking-row--disabled" : "" }, [
+        el("td", { class: "col-rank", text: String(i + 1) }),
+        el("td", {}, [
+          el("span", { class: "cell-strong", text: r.u.name }),
+          el("span", { class: "cell-id", text: r.u.id }),
+        ]),
+        el("td", { class: "col-status" }, statusBadge(r.u.status)),
+        el("td", { class: "col-bar" }, barCell),
+        el("td", { class: "num col-count" }, [
+          // fullNum gives exact comma-formatted count — the "exact accessible count" requirement
+          el("span", { text: fullNum(r.value) }),
+        ]),
+        el("td", { class: "num col-share", text: pct(sharePct, 1) }),
+      ]);
+      tbody.append(tr);
+    });
+  }
+
+  updateCaption();
+  paintRows();
+
+  return el("div", {}, [
+    liveStatus,
+    el("div", { class: "ranking__head" }, [
+      el("div", {}, [
+        el("div", { class: "eyebrow", text: "Token consumption" }),
+        el("h2", { class: "ranking__title" }, [
+          el("span", { text: "User ranking" }),
+          el("span", {
+            class: "ranking__period",
+            "aria-hidden": "true",
+            text: " · " + windowLabel(win),
+          }),
+        ]),
+      ]),
+      el("div", { class: "ranking__controls" }, [
+        el("span", { class: "ranking__metric-label", "aria-hidden": "true", text: "Metric" }),
+        metricSeg,
+      ]),
+    ]),
+    desc,
+    el("div", { class: "table-scroll" }, table),
+  ]);
+}
+
+// ---------------------------------------------------------------------------
+// Management table (unchanged behaviour, improved aria)
+// ---------------------------------------------------------------------------
 
 const CACHE_READ_HELP =
   "Cache-read tokens over the selected period. Usually the largest number here by far, " +
@@ -154,31 +430,40 @@ function limitCell(u) {
   return wrap;
 }
 
-function buildTable(users, statById, root) {
-  const table = el("table", { class: "table" });
-  table.append(el("thead", {}, el("tr", {}, [
-    th("Name"), th("Status"),
-    el("th", { title: CAPTURE_HELP }, [
-      el("span", { text: "Full capture" }),
-      el("span", { class: "th-info", "aria-hidden": "true", text: "?" }),
-    ]),
-    el("th", { title: SUGGESTIONS_HELP }, [
-      el("span", { text: "Block suggestions" }),
-      el("span", { class: "th-info", "aria-hidden": "true", text: "?" }),
-    ]),
-    el("th", { class: "limit-col", title: LIMIT_HELP }, [
-      el("span", { text: "Usage limit" }),
-      el("span", { class: "th-info", "aria-hidden": "true", text: "?" }),
-    ]),
-    th("Requests", "num"), th("Errors", "num"),
-    th("Tokens in", "num"), th("Tokens out", "num"),
-    el("th", { class: "num", title: CACHE_READ_HELP }, [
-      el("span", { text: "Cache read" }),
-      el("span", { class: "th-info", "aria-hidden": "true", text: "?" }),
-    ]),
-    th("Avg latency", "num"),
-    th("Last used"), th("", "actions"),
-  ])));
+function buildMgmtTable(users, statById, root) {
+  const captionId = "mgmt-table-caption";
+  const table = el("table", { class: "table", "aria-labelledby": captionId });
+  const caption = el("caption", {
+    id: captionId,
+    class: "sr-only",
+    text: "User management: status, capture settings, usage limits, and actions",
+  });
+  table.append(
+    caption,
+    el("thead", {}, el("tr", {}, [
+      th("Name"), th("Status"),
+      el("th", { scope: "col", title: CAPTURE_HELP }, [
+        el("span", { text: "Full capture" }),
+        el("span", { class: "th-info", "aria-hidden": "true", text: "?" }),
+      ]),
+      el("th", { scope: "col", title: SUGGESTIONS_HELP }, [
+        el("span", { text: "Block suggestions" }),
+        el("span", { class: "th-info", "aria-hidden": "true", text: "?" }),
+      ]),
+      el("th", { scope: "col", class: "limit-col", title: LIMIT_HELP }, [
+        el("span", { text: "Usage limit" }),
+        el("span", { class: "th-info", "aria-hidden": "true", text: "?" }),
+      ]),
+      th("Requests", "num"), th("Errors", "num"),
+      th("Tokens in", "num"), th("Tokens out", "num"),
+      el("th", { scope: "col", class: "num", title: CACHE_READ_HELP }, [
+        el("span", { text: "Cache read" }),
+        el("span", { class: "th-info", "aria-hidden": "true", text: "?" }),
+      ]),
+      th("Avg latency", "num"),
+      th("Last used"), th("Actions", "actions"),
+    ])),
+  );
   const tb = el("tbody");
   for (const u of users) tb.append(userRow(u, statById.get(u.id) || {}, root));
   table.append(tb);
@@ -186,13 +471,18 @@ function buildTable(users, statById, root) {
     el("div", { class: "table-scroll" }, table),
     el("p", { class: "table-note" }, [
       el("strong", { text: "Full capture is off by default. " }),
-      el("span", { text: "Leaving it off keeps only the last user prompt per request. Turning it on stores both sides of every conversation for that user, including pasted file contents. Everything is purged on the same retention schedule." }),
+      el("span", {
+        text:
+          "Leaving it off keeps only the last user prompt per request. " +
+          "Turning it on stores both sides of every conversation for that user, " +
+          "including pasted file contents. Everything is purged on the same retention schedule.",
+      }),
     ]),
   ]);
 }
 
 function th(label, cls) {
-  return el("th", { class: cls || null, text: label });
+  return el("th", { scope: "col", class: cls || null, text: label });
 }
 
 function userRow(u, s, root) {
@@ -333,7 +623,7 @@ function limitModal(u, root) {
       paintEcho();
       loadUsage();
     },
-    "Rolling window"
+    "Rolling window",
   );
 
   const clearErr = () => {
@@ -396,7 +686,8 @@ function limitModal(u, root) {
       const r = await api.setUserLimit(u.id, { outputTokens, windowSeconds });
       u.limit_output_tokens =
         r && r.limit_output_tokens != null ? r.limit_output_tokens : outputTokens;
-      u.limit_window_seconds = r && r.limit_window_seconds != null ? r.limit_window_seconds : windowSeconds;
+      u.limit_window_seconds =
+        r && r.limit_window_seconds != null ? r.limit_window_seconds : windowSeconds;
       m.close();
       toast(okMsg, "good");
       render(root);
@@ -533,7 +824,8 @@ function suggestionsToggle(u) {
     help: SUGGESTIONS_HELP,
     save: async (want) => {
       const r = await api.setUserSuggestions(u.id, want);
-      const applied = r && typeof r.block_suggestions === "boolean" ? r.block_suggestions : want;
+      const applied =
+        r && typeof r.block_suggestions === "boolean" ? r.block_suggestions : want;
       u.block_suggestions = applied;
       return applied;
     },
@@ -581,7 +873,7 @@ function promptsModal(u) {
     [{ value: "prompts", label: "Prompts" }, { value: "conversations", label: "Conversations" }],
     "prompts",
     (v) => (v === "prompts" ? showPrompts(0) : showConvs(0)),
-    "Capture view"
+    "Capture view",
   );
   const m = modal({
     title: `Captured activity · ${u.name}`,
@@ -605,12 +897,20 @@ function promptsModal(u) {
   }
 
   async function showPrompts(offset) {
-    const r = await load(() => api.userPrompts(u.id, { limit: PROMPT_LIMIT, offset }), () => showPrompts(offset));
+    const r = await load(
+      () => api.userPrompts(u.id, { limit: PROMPT_LIMIT, offset }),
+      () => showPrompts(offset),
+    );
     if (!r) return;
     const items = r.items || [];
     clear(panel);
     if (!r.total) {
-      panel.append(emptyState("No prompts recorded", "Prompts are kept for a limited retention window, then purged. Nothing stored for this user."));
+      panel.append(
+        emptyState(
+          "No prompts recorded",
+          "Prompts are kept for a limited retention window, then purged. Nothing stored for this user.",
+        ),
+      );
       return;
     }
     const list = el("div", { class: "prompts" });
@@ -619,12 +919,20 @@ function promptsModal(u) {
   }
 
   async function showConvs(offset) {
-    const r = await load(() => api.userConversations(u.id, { limit: CONV_LIMIT, offset }), () => showConvs(offset));
+    const r = await load(
+      () => api.userConversations(u.id, { limit: CONV_LIMIT, offset }),
+      () => showConvs(offset),
+    );
     if (!r) return;
     const items = r.items || [];
     clear(panel);
     if (!r.total) {
-      panel.append(emptyState("No conversations recorded", "Conversations appear once this user routes a request and capture is enabled."));
+      panel.append(
+        emptyState(
+          "No conversations recorded",
+          "Conversations appear once this user routes a request and capture is enabled.",
+        ),
+      );
       return;
     }
     const list = el("div", { class: "convs" });
@@ -635,7 +943,7 @@ function promptsModal(u) {
   async function showMessages(conv, offset, backOffset) {
     const r = await load(
       () => api.conversationMessages(conv.conv_id, { limit: MSG_LIMIT, offset }),
-      () => showMessages(conv, offset, backOffset)
+      () => showMessages(conv, offset, backOffset),
     );
     if (!r) return;
     clear(panel);
@@ -654,24 +962,37 @@ function promptsModal(u) {
         sourceBadge(source),
         el("span", { class: "cap__bar-spacer" }),
         dl,
-      ])
+      ]),
     );
     if (source === "prompts") {
       panel.append(
         el("p", {
           class: "cap__note",
           text: "Assistant replies were not captured for this conversation — only the user prompts below were stored.",
-        })
+        }),
       );
     }
     const items = r.items || [];
     if (!items.length) {
-      panel.append(emptyState("Nothing stored for this conversation", "It may have been purged by the retention janitor."));
+      panel.append(
+        emptyState(
+          "Nothing stored for this conversation",
+          "It may have been purged by the retention janitor.",
+        ),
+      );
       return;
     }
     const list = el("div", { class: "msgs" });
     for (const msgRow of items) list.append(messageItem(msgRow));
-    panel.append(list, pager(r.total || items.length, r.limit || MSG_LIMIT, r.offset || 0, (o) => showMessages(conv, o, backOffset)));
+    panel.append(
+      list,
+      pager(
+        r.total || items.length,
+        r.limit || MSG_LIMIT,
+        r.offset || 0,
+        (o) => showMessages(conv, o, backOffset),
+      ),
+    );
     requestAnimationFrame(() => back.focus());
   }
 
@@ -680,19 +1001,28 @@ function promptsModal(u) {
 
 function sourceBadge(source) {
   const full = source === "full";
-  return el("span", { class: "badge badge--" + (full ? "good" : "muted"), title: full ? "Both sides of the conversation were captured" : "Only user prompts were captured" }, [
-    el("span", { class: "badge__dot" }),
-    el("span", { text: full ? "full" : "prompts" }),
-  ]);
+  return el(
+    "span",
+    {
+      class: "badge badge--" + (full ? "good" : "muted"),
+      title: full
+        ? "Both sides of the conversation were captured"
+        : "Only user prompts were captured",
+    },
+    [el("span", { class: "badge__dot" }), el("span", { text: full ? "full" : "prompts" })],
+  );
 }
 
 function convRow(c, onOpen) {
   const msgs = c.messages || 0;
   const prompts = c.prompts || 0;
-  const meta = [
-    msgs ? `${fullNum(msgs)} message${msgs === 1 ? "" : "s"}` : null,
-    prompts ? `${fullNum(prompts)} prompt${prompts === 1 ? "" : "s"}` : null,
-  ].filter(Boolean).join(" · ") || "no stored turns";
+  const meta =
+    [
+      msgs ? `${fullNum(msgs)} message${msgs === 1 ? "" : "s"}` : null,
+      prompts ? `${fullNum(prompts)} prompt${prompts === 1 ? "" : "s"}` : null,
+    ]
+      .filter(Boolean)
+      .join(" · ") || "no stored turns";
   return el("button", { class: "conv", type: "button", onClick: onOpen, title: c.conv_id }, [
     el("span", { class: "conv__main" }, [
       el("span", { class: "conv__id", text: convShort(c.conv_id) }),
@@ -710,7 +1040,9 @@ function promptItem(p) {
   const head = el("div", { class: "prompt__head" }, [
     el("span", { class: "prompt__time", text: localTime(tsOf(p.ts)) }),
     p.model ? el("span", { class: "prompt__model", text: p.model }) : null,
-    p.conv_id ? el("span", { class: "prompt__conv", text: convShort(p.conv_id), title: p.conv_id }) : null,
+    p.conv_id
+      ? el("span", { class: "prompt__conv", text: convShort(p.conv_id), title: p.conv_id })
+      : null,
   ]);
   // textContent (not innerHTML) — the prompt is untrusted user input.
   const bodyEl = el("pre", { class: "prompt__text" });
@@ -722,7 +1054,9 @@ function messageItem(msg) {
   const assistant = (msg.role || "").toLowerCase() === "assistant";
   const head = el("div", { class: "msg__head" }, [
     el("span", { class: "msg__role", text: assistant ? "Assistant" : "User" }),
-    msg.seq != null ? el("span", { class: "msg__seq", text: "#" + (Number(msg.seq) + 1) }) : null,
+    msg.seq != null
+      ? el("span", { class: "msg__seq", text: "#" + (Number(msg.seq) + 1) })
+      : null,
     el("span", { class: "msg__time", text: msg.ts ? localTime(tsOf(msg.ts)) : "" }),
     msg.model ? el("span", { class: "prompt__model", text: msg.model }) : null,
   ]);

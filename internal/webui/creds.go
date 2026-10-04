@@ -1,17 +1,20 @@
 package webui
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/p4u/claude-proxy/internal/codexgateway"
 	"github.com/p4u/claude-proxy/internal/creds"
 	"github.com/p4u/claude-proxy/internal/ingest"
 	"github.com/p4u/claude-proxy/internal/provider"
+	"github.com/p4u/claude-proxy/internal/store"
 )
 
 type credView struct {
@@ -129,6 +132,33 @@ func (s *Server) credAction(w http.ResponseWriter, r *http.Request, id, action s
 			return
 		}
 		writeJSON(w, map[string]any{"ok": true, "id": id, "weight": body.Weight})
+	case action == "settings" && r.Method == http.MethodPost:
+		var body struct {
+			Label  string `json:"label"`
+			Weight int    `json:"weight"`
+		}
+		if err := decodeJSON(w, r, &body); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		body.Label = strings.TrimSpace(body.Label)
+		if utf8.RuneCountInString(body.Label) > 200 {
+			writeErr(w, http.StatusBadRequest, "label must be 200 characters or fewer")
+			return
+		}
+		if body.Weight < 1 {
+			writeErr(w, http.StatusBadRequest, "weight must be >= 1")
+			return
+		}
+		if err := setCredSettings(ctx, s.db, id, body.Label, body.Weight); err != nil {
+			if errors.Is(err, creds.ErrNotFound) {
+				writeErr(w, http.StatusNotFound, err.Error())
+				return
+			}
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "id": id, "label": body.Label, "weight": body.Weight})
 	case action == "tokens" && r.Method == http.MethodPut:
 		var body struct {
 			CredentialsJSON string `json:"credentials_json"`
@@ -342,6 +372,28 @@ func (s *Server) listEndpoints(w http.ResponseWriter, _ *http.Request) {
 		out[string(p.ID)] = map[string]any{"name": p.Name, "default": p.BaseURL, "endpoints": eps}
 	}
 	writeJSON(w, out)
+}
+
+// setCredSettings atomically updates a credential's display label and selection
+// weight. label may be empty (clearing any previous label); weight must be >= 1.
+func setCredSettings(ctx context.Context, db *store.DB, id, label string, weight int) error {
+	var labelVal any = label
+	if label == "" {
+		labelVal = nil // store NULL so COALESCE returns "" on read
+	}
+	res, err := db.ExecContext(ctx,
+		`UPDATE credentials SET label=?, weight=? WHERE id=?`, labelVal, weight, id)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return creds.ErrNotFound
+	}
+	return nil
 }
 
 // decodeJSON decodes a bounded request body into v.

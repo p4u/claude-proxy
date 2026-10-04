@@ -104,6 +104,9 @@ export const api = {
   // Interrogate a candidate custom host without storing anything.
   probeHost: (body) => request("POST", "/credentials/probe", body),
   addCustom: (body) => request("POST", "/credentials/custom", body),
+  // Atomically update a credential's display label and selection weight.
+  updateCredSettings: (id, { label = "", weight } = {}) =>
+    request("POST", `/credentials/${enc(id)}/settings`, { label, weight }),
   // Sidecar channels (CLIProxyAPI): "codex" for OpenAI Codex, "gemini" for
   // Google Gemini via Antigravity. Same endpoints under /api/<channel>/.
   sidecar: (ch) => ({

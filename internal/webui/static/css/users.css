@@ -1,0 +1,281 @@
+/* Users page — ranking panel + management section divider.
+   All management-table and modal styles live in base.css.
+   Only ranking-specific styles belong here. */
+
+/* ---------- Screen-reader only ---------- */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---------- Ranking card ---------- */
+.ranking {
+  padding: 16px 18px 14px;
+  margin-bottom: 22px;
+}
+
+.ranking__head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.ranking__title {
+  font-size: 14.5px;
+  font-weight: 620;
+  margin: 3px 0 0;
+  letter-spacing: -0.01em;
+}
+
+.ranking__controls {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-shrink: 0;
+}
+
+.ranking__metric-label {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-muted);
+  white-space: nowrap;
+}
+
+/* Compact help text below the header, explaining the active metric */
+.ranking__desc {
+  font-size: 11.5px;
+  color: var(--ink-2);
+  margin: 0 0 12px;
+  line-height: 1.45;
+  max-width: 66ch;
+}
+
+/* ---------- Ranking table ---------- */
+.ranking-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.ranking-table caption {
+  /* caption is sr-only equivalent: text is accessible but not rendered */
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.ranking-table th {
+  text-align: left;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-muted);
+  font-weight: 500;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.ranking-table th.num,
+.ranking-table td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.ranking-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+.ranking-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.ranking-table tbody tr:hover {
+  background: var(--surface-2);
+}
+
+/* Rank number column */
+.ranking-table .col-rank {
+  width: 2.2em;
+  text-align: right;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-muted);
+  padding-right: 8px;
+}
+
+/* Bar column: fills remaining space */
+.col-bar {
+  width: 100%;
+  min-width: 140px;
+}
+
+/* Exact token count column */
+.col-count {
+  white-space: nowrap;
+  font-family: var(--mono);
+}
+
+/* Share column */
+.col-share {
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ink-2);
+  min-width: 4.5em;
+}
+
+/* Muted row for disabled users */
+.ranking-row--disabled td {
+  opacity: 0.55;
+}
+
+/* ---------- Proportional inline bar ---------- */
+.rank-bar {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.rank-bar__track {
+  flex: 1 1 auto;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--surface-3);
+  overflow: hidden;
+  min-width: 60px;
+}
+
+.rank-bar__fill {
+  height: 100%;
+  border-radius: 4px;
+  background: var(--accent);
+  transition: width 0.22s ease;
+  min-width: 2px; /* always show a sliver even for tiny values */
+}
+
+/* The compact label alongside the bar — visible, not sr-only */
+.rank-bar__label {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-2);
+  white-space: nowrap;
+  flex-shrink: 0;
+  min-width: 4.2em;
+  text-align: right;
+}
+
+/* Empty state inside the table */
+.ranking-empty-row td {
+  padding: 28px 12px;
+  text-align: center;
+  color: var(--ink-muted);
+  font-size: 13px;
+}
+
+/* ---------- Management section divider ---------- */
+.users-mgmt-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 12px;
+  margin-top: 4px;
+}
+
+.users-mgmt-title {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+}
+
+.users-mgmt-sub {
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+
+/* ---------- Responsive ---------- */
+
+/* ≤700px: share % redundant once the bar gives a visual proportion. */
+@media (max-width: 700px) {
+  .ranking__head {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+  }
+  .col-share {
+    display: none;
+  }
+}
+
+/* ≤520px: five-column layout (rank+user+status+bar+count) is ~444px — too wide
+   for ~336px available at 390px. Fix: drop the status column (disabled rows
+   are already visually muted via .ranking-row--disabled) and the separate
+   tokens column. The compact count moves into the bar label which now stays
+   visible; the full number is preserved in each bar fill's aria-label. */
+@media (max-width: 520px) {
+  .col-status,
+  .col-count {
+    display: none;
+  }
+  /* Bar label carries the only visible count now — keep it */
+  .rank-bar__label {
+    display: block;
+    min-width: 3.5em;
+  }
+  .ranking {
+    padding: 13px 14px 12px;
+  }
+  .ranking-table th,
+  .ranking-table td {
+    padding: 9px 9px;
+  }
+}
+
+/* ≤390px: the four-option metric segmented control ("Cache read" ~104px alone)
+   overflows the ~272px card width at 320px — this is the source of the 16px
+   page-wide overflow. Fix: reduce button font and padding so all four labels
+   fit. Also tighten cell padding so rank+user+bar fit within ~260px. */
+@media (max-width: 390px) {
+  .ranking {
+    padding: 12px 12px 10px;
+  }
+  /* Make metric buttons smaller so the control fits without overflowing */
+  .ranking__controls .seg__btn {
+    padding: 5px 7px;
+    font-size: 11px;
+    letter-spacing: 0;
+  }
+  .ranking-table th,
+  .ranking-table td {
+    padding: 8px 6px;
+  }
+  .rank-bar__track {
+    min-width: 40px;
+  }
+  .rank-bar__label {
+    min-width: 3em;
+    font-size: 10px;
+  }
+}

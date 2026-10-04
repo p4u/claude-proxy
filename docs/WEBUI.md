@@ -143,6 +143,13 @@ the selected window into equal intervals.
 - `POST /api/credentials/{id}/disable` | `/enable` (SetStatus disabled/active)
 - `POST /api/credentials/{id}/refresh` → force OAuth token refresh (`Refresher.RefreshNow`)
 - `POST /api/credentials/{id}/weight` `{weight}` (creds.SetWeight)
+- `POST /api/credentials/{id}/settings` `{label, weight}` → atomically edit the
+  native credential's display name and selection weight. Labels are trimmed,
+  limited to 200 characters, and an empty label clears the name; weight is an
+  integer ≥ 1. Returns `{ok,id,label,weight}` without tokens. `400` for invalid
+  input, `404` for a missing credential, `409` for synthetic gateway rows.
+  Does not alter provider, endpoint, status, models, or OAuth/API-key secrets.
+  Endpoint changes use the independently verified `/endpoint` operation.
 - `PUT  /api/credentials/{id}/tokens` `{credentials_json}` → `ingest.UpdateFromFile` logic
 - `DELETE /api/credentials/{id}` (creds.Delete)
 
@@ -220,11 +227,15 @@ queries must use the indexes on `request_log(ts)` / `usage_history(credential_id
 ## Frontend layout (SPA, hash-routing: #/dashboard #/usage #/credentials #/users)
 
 - **Login screen**: single password field.
-- **Dashboard**: header stat tiles (requests, tokens in/out, error rate, avg latency,
-  active convs) + requests-over-time chart (stack by user) + tokens chart + latency chart.
-  Global period selector (1h/6h/24h/7d/30d) drives every chart; per-chart group-by toggle.
-- **Subscriptions**: per-credential cards with 5h/7d/model-scoped utilization meters +
-  resets-at countdowns, and the utilization history multi-line chart.
+- **Dashboard**: header stat tiles and six aligned, equally sized chart panels:
+  token totals, request totals, requests by user/credential, tokens by user/credential,
+  latency, and new-session credential picks. A shared period selector
+  (1h/6h/24h/7d/30d/custom) drives all panels. The grid stacks on small screens.
+- **Subscriptions**: provider-grouped account cards, local provider badges, provider
+  filters, and an availability overview. Actual quota windows retain their reset
+  countdowns; providers without a quota API show observed tokens without invented
+  percentage bars. History/selection charts have a separate period selector;
+  account cards always show the latest snapshot.
 > **Add credential is one modal for every kind** (`addCredentialModal`). A type
 > selector switches between Anthropic subscription (paste `credentials.json`),
 > OpenAI Codex subscription (OAuth plus callback handoff), a provider API key
@@ -238,11 +249,18 @@ queries must use the indexes on `request_log(ts)` / `usage_history(credential_id
 > "Test connection" runs `POST /api/credentials/probe` for any key-based kind —
 > the only way to tell a bad key from a right key aimed at the wrong cluster.
 
-- **Credentials**: one table for regular credentials and Codex OAuth accounts,
-  with provider-specific enable/disable/refresh/delete actions. The add modal
-  contains the complete form or OAuth callback flow selected by credential type.
-- **Users**: table with per-period stats, create modal (token reveal + copy once),
-  rotate/disable/delete.
+- **Credentials**: responsive provider-grouped cards without a horizontal table
+  scroller. One keyboard-accessible Actions menu holds editing and provider-specific
+  enable/disable/refresh/delete operations. Native credentials support label/weight
+  editing and key-based credentials retain verified endpoint editing. Codex/Gemini
+  account identities and endpoints remain provider-managed; their weights are editable.
+  The add modal contains the complete form or OAuth callback flow selected by type.
+- **Users**: a descending token-consumption chart-table above the management table.
+  Periods include 24h (1 day), 7d and rolling 30d (1 month), plus shorter/custom
+  windows. Metrics are total, input, output, and cache read; total includes input,
+  output, cache creation and cache read. Ranking uses `/api/stats/users`, not users'
+  differently configured quota windows. Disabled users remain visible. The existing
+  create/reveal, rotate/disable/delete, privacy switches and output-token limits remain.
 
 ## Env / compose
 

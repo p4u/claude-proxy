@@ -38,6 +38,18 @@ function fade(hex, a) {
   return `rgba(${r},${g},${b},${a})`;
 }
 
+function escapeHTML(value) {
+  return String(value).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
+}
+
+// A single observer releases plots when a page/filter replaces their DOM.
+const liveCharts = new Set();
+const chartCleanup = new MutationObserver(() => {
+  for (const chart of liveCharts) {
+    if (!chart.container.isConnected || !chart.container.contains(chart.u.root)) chart.destroy();
+  }
+});
+
 // Shared tooltip plugin: crosshair value readout anchored near cursor.
 function tooltipPlugin(fmt) {
   let tip, over;
@@ -64,7 +76,7 @@ function tooltipPlugin(fmt) {
           if (s.show === false) continue;
           const v = u.data[i][idx];
           if (v == null) continue;
-          rows += `<div class="u-tip__row"><span class="u-tip__sw" style="background:${s._color}"></span><span class="u-tip__lbl">${s.label}</span><span class="u-tip__val">${fmt(v)}</span></div>`;
+          rows += `<div class="u-tip__row"><span class="u-tip__sw" style="background:${s._color}"></span><span class="u-tip__lbl">${escapeHTML(s.label)}</span><span class="u-tip__val">${escapeHTML(fmt(v))}</span></div>`;
         }
         if (!rows) {
           tip.style.display = "none";
@@ -207,7 +219,7 @@ export function timeChart(container, spec) {
               if (s.show === false) continue;
               const v = s._raw[idx];
               if (v == null) continue;
-              rows += `<div class="u-tip__row"><span class="u-tip__sw" style="background:${s._color}"></span><span class="u-tip__lbl">${s.label}</span><span class="u-tip__val">${fmt(v)}</span></div>`;
+              rows += `<div class="u-tip__row"><span class="u-tip__sw" style="background:${s._color}"></span><span class="u-tip__lbl">${escapeHTML(s.label)}</span><span class="u-tip__val">${escapeHTML(fmt(v))}</span></div>`;
             }
             const when = new Date(u.data[0][idx] * 1000).toLocaleString(undefined, {
               month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
@@ -254,7 +266,18 @@ export function timeChart(container, spec) {
     rawByItem,
   });
 
-  return { u, legendItems, legendEl, destroy: () => { ro.disconnect(); u.destroy(); } };
+  let destroyed = false;
+  const chart = { u, legendItems, legendEl, container, destroy: () => {
+    if (destroyed) return;
+    destroyed = true;
+    ro.disconnect();
+    u.destroy();
+    liveCharts.delete(chart);
+    if (!liveCharts.size) chartCleanup.disconnect();
+  } };
+  if (!liveCharts.size) chartCleanup.observe(document.body, { childList: true, subtree: true });
+  liveCharts.add(chart);
+  return chart;
 }
 
 // Interactive legend with keyboard-accessible solo behavior. Clicking a series

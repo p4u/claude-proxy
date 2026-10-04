@@ -1,7 +1,9 @@
 import { api } from "../api.js";
 import {
   el, clear, spinner, errorState, emptyState, statusBadge, toast, modal, confirmDialog, button,
+  actionMenu,
 } from "../ui.js";
+import { providerInfo, providerMark } from "../providers.js";
 import { sectionHead } from "../components.js";
 import { compactNum, relTime, localTime } from "../format.js";
 
@@ -62,7 +64,7 @@ export async function render(root) {
   const head = sectionHead("Credentials", "Managed subscriptions and API keys in the rotation pool.", [
     button("Add credential", { kind: "primary", onClick: () => addCredentialModal(root) }),
   ]);
-  const body = el("div", { class: "card table-card" }, spinner("Loading credentials…"));
+  const body = el("div", { class: "cred-list" }, spinner("Loading credentials…"));
   root.append(head, body);
 
   try {
@@ -70,6 +72,7 @@ export async function render(root) {
       api.credentials(), loadEndpoints(),
       ...SIDECAR_CHANNELS.map((ch) => api.sidecar(ch).accounts().catch((error) => ({ configured: true, error }))),
     ]);
+    if (!root.isConnected) return;
     clear(body);
     const credentials = [
       ...(rows || []),
@@ -81,7 +84,7 @@ export async function render(root) {
         'Click "Add credential" to connect a subscription, provider API key, or custom API host.',
       ));
     } else {
-      body.append(buildTable(credentials, root));
+      body.append(buildCardList(credentials, root));
     }
     SIDECAR_CHANNELS.forEach((ch, i) => {
       if (!sidecars[i]?.error) return;
@@ -91,13 +94,15 @@ export async function render(root) {
       }));
     });
   } catch (e) {
+    if (!root.isConnected) return;
     clear(body).append(errorState(e.message, () => render(root)));
   }
 }
 
-// Subscriptions whose OAuth accounts live in the CLIProxyAPI sidecar. One
-// entry per channel served under /api/<channel>/; the copy differs, the
-// mechanics do not.
+// ---------------------------------------------------------------------------
+// Sidecar channels — OpenAI Codex and Google Gemini via CLIProxyAPI
+// ---------------------------------------------------------------------------
+
 const SIDECAR = {
   codex: {
     name: "OpenAI Codex", vendor: "OpenAI",
@@ -122,12 +127,7 @@ function sidecarCredentialRows(data, ch) {
     id: `${ch}:${account.name}`,
     label: account.email || account.label || account.account || account.name,
     provider: ch,
-    // Google's tier ("free", a paid tier) when known; the sidecar's own
-    // account_type is just "oauth".
     subscription_type: account.quota?.plan_type || account.account_type || "subscription",
-    // `blocked`, not `unavailable`/`status`: the sidecar keeps those at
-    // "error" after its cooldown ends, until the account next serves a
-    // request, so they would pin a healthy account as errored.
     status: account.disabled ? "disabled" : (account.blocked ? "errored" : "active"),
     weight: account.base_weight ?? 1,
     effective_weight: account.effective_weight ?? null,
@@ -137,42 +137,19 @@ function sidecarCredentialRows(data, ch) {
   }));
 }
 
-function buildTable(rows, root) {
-  const table = el("table", { class: "table" });
-  table.append(
-    el("thead", {}, el("tr", {}, [
-      th("Label"), th("Provider"), th("Endpoint"), th("Type"), th("Status"), th("Weight"), th("Requests", "num"),
-      th("Last used"), th("Expires"), th("", "actions"),
-    ]))
-  );
-  const tb = el("tbody");
-  for (const c of rows) tb.append(credRow(c, root));
-  table.append(tb);
-  return el("div", { class: "table-scroll" }, table);
-}
-
-function th(label, cls) {
-  return el("th", { class: cls || null, text: label });
-}
-
 // ---------------------------------------------------------------------------
 // Provider metadata
 // ---------------------------------------------------------------------------
 
-// Endpoint presets, fetched once from /credentials/endpoints. The Go registry
-// stays the single source of truth; this is only a cache.
 let ENDPOINTS = {};
 async function loadEndpoints() {
   try {
     ENDPOINTS = (await api.endpoints()) || {};
   } catch {
-    ENDPOINTS = {}; // presets unavailable → the endpoint field still accepts a URL
+    ENDPOINTS = {};
   }
 }
 
-// The badge style capitalizes its text, which turns "glm" into "Glm". Spell out
-// the display form instead of fighting the CSS; unknown providers fall back to
-// the raw id so a new one stays legible before this map is updated.
 const PROVIDER_LABELS = {
   anthropic: "Anthropic", glm: "GLM", mimo: "MiMo", custom: "Custom Anthropic",
   custom_openai: "Custom OpenAI", codex: "OpenAI Codex", gemini: "Google Gemini",
@@ -181,9 +158,346 @@ function providerLabel(id) {
   return PROVIDER_LABELS[id] || id || "Anthropic";
 }
 
-// What each credential kind needs from the operator, and what to tell them
-// about it. Keeping the copy here rather than inline keeps the form builder
-// readable and the guidance consistent between the add and edit modals.
+// ---------------------------------------------------------------------------
+// Card list — grouped by provider
+// ---------------------------------------------------------------------------
+
+function buildCardList(credentials, root) {
+  // Group all credentials by provider ID.
+  const groups = new Map();
+  for (const c of credentials) {
+    const p = c.provider || "anthropic";
+    if (!groups.has(p)) groups.set(p, []);
+    groups.get(p).push(c);
+  }
+
+  // Sort by providerInfo().order (always available from ../providers.js).
+  const sorted = [...groups.keys()].sort((a, b) =>
+    (providerInfo(a).order ?? 99) - (providerInfo(b).order ?? 99),
+  );
+
+  const container = el("div", { class: "cred-page" });
+  for (const p of sorted) {
+    container.append(providerSection(p, groups.get(p), root));
+  }
+  return container;
+}
+
+function providerSection(provId, creds, root) {
+  const info = providerInfo(provId);
+  const name = info.name || providerLabel(provId);
+  const mark = providerMark(provId, "sm");
+
+  const head = el("div", { class: "cred-group__head" }, [
+    mark,
+    el("h2", { class: "cred-group__name", text: name }),
+    el("span", { class: "cred-group__count", text: `(${creds.length})` }),
+  ]);
+
+  const cards = el("div", { class: "cred-cards" });
+  for (const c of creds) {
+    cards.append(c.sidecar_account ? sidecarCredCard(c, root) : credCard(c, root));
+  }
+
+  return el("div", { class: "cred-group" }, [head, cards]);
+}
+
+// ---------------------------------------------------------------------------
+// Individual credential cards
+// ---------------------------------------------------------------------------
+
+// endpointLabel keeps the meta column compact.
+function endpointLabel(c) {
+  if (!c.endpoint) return "—";
+  if (c.endpoint_name) return c.endpoint_name;
+  try { return new URL(c.endpoint).host; } catch { return c.endpoint; }
+}
+
+function stat(val, label) {
+  return el("div", { class: "cred-stat" }, [
+    el("span", { class: "cred-stat__val", text: val }),
+    el("span", { class: "cred-stat__label", text: label }),
+  ]);
+}
+
+function credCard(c, root) {
+  const id = c.id || c.credential_id;
+  const disabled = (c.status || "").toLowerCase() === "disabled";
+  // OAuth subscriptions have a usage API; static API keys do not.
+  const isKey = c.has_usage_api === false;
+
+  const items = [
+    {
+      label: "Edit label & weight",
+      onClick: () => editSettingsModal(c, root),
+    },
+    ...(c.endpoint_editable ? [{
+      label: "Change endpoint",
+      onClick: () => endpointModal(c, root),
+    }] : []),
+    ...(!isKey ? [
+      {
+        label: "Refresh token",
+        onClick: () => act(() => api.post(`/credentials/${id}/refresh`), "Token refreshed", root),
+      },
+      {
+        label: "Update tokens",
+        onClick: () => updateModal(id, root),
+      },
+    ] : []),
+    {
+      label: disabled ? "Enable" : "Disable",
+      onClick: () => act(
+        () => api.post(`/credentials/${id}/${disabled ? "enable" : "disable"}`),
+        disabled ? "Enabled" : "Disabled",
+        root,
+      ),
+    },
+    {
+      label: "Delete",
+      danger: true,
+      onClick: async () => {
+        const ok = await confirmDialog({
+          title: "Delete credential?",
+          message: `"${c.label || id}" will be removed from the pool and its conversation bindings cleared. This can't be undone.`,
+          confirmLabel: "Delete",
+        });
+        if (ok) act(() => api.del(`/credentials/${id}`), "Credential deleted", root);
+      },
+    },
+  ];
+
+  const modelIDs = (c.models || []).map((m) => m.id).join(", ");
+  const typeText = c.subscription_type || (modelIDs ? `${(c.models || []).length} model(s)` : "—");
+  const wt = c.weight ?? "—";
+  const lastUsed = c.last_request_at ? relTime(tsOf(c.last_request_at)) : "never";
+  const expires = isKey ? "never" : (c.expires_at ? localTime(tsOf(c.expires_at)) : "—");
+
+  return el("article", { class: "card cred-card" + (disabled ? " cred-card--disabled" : "") }, [
+    el("div", { class: "cred-card__identity" }, [
+      el("div", { class: "cred-card__label", text: c.label || "(no label)" }),
+      el("div", { class: "cred-card__id", text: id }),
+    ]),
+    el("div", { class: "cred-card__meta" }, [
+      el("div", { class: "cred-card__endpoint", text: endpointLabel(c), title: c.endpoint || "" }),
+      el("div", { class: "cred-card__type", text: typeText, title: modelIDs || typeText }),
+    ]),
+    el("div", { class: "cred-card__right" }, [
+      statusBadge(c.status),
+      actionMenu(`Actions for ${c.label || id}`, items),
+    ]),
+    el("div", { class: "cred-card__stats" }, [
+      stat(String(wt), "weight"),
+      stat(compactNum(c.request_count ?? c.requests ?? 0), "requests"),
+      stat(lastUsed, "last used"),
+      stat(expires, "expires"),
+    ]),
+  ]);
+}
+
+function sidecarCredCard(c, root) {
+  const a = c.sidecar_account;
+  const ch = c.sidecar_channel;
+  const cfg = SIDECAR[ch];
+  const sc = api.sidecar(ch);
+  const disabled = c.status === "disabled";
+  const label = c.label || a.name;
+
+  // Sidecar accounts: weight is operator-adjustable; name/email are managed by
+  // the provider's OAuth system and cannot be renamed here.
+  const items = [
+    {
+      label: "Edit weight",
+      onClick: () => weightModal(c.id, c.weight, root, {
+        save: (weight) => sc.setWeight(a.name, weight),
+        help: "Operator bias — one input to the usage/reset-aware selection formula. The effective weight is recomputed every 90 s from base × quota.",
+      }),
+    },
+    {
+      label: disabled ? "Enable" : "Disable",
+      onClick: () => act(
+        () => sc.setDisabled(a.name, a.auth_index, !disabled),
+        disabled ? `${cfg.vendor} account enabled` : `${cfg.vendor} account disabled`,
+        root,
+      ),
+    },
+    {
+      label: "Refresh login",
+      onClick: () => sidecarOAuthModal(ch, root),
+    },
+    {
+      label: "Delete",
+      danger: true,
+      onClick: async () => {
+        const ok = await confirmDialog({
+          title: `Delete ${cfg.vendor} credential?`,
+          message: `"${label}" and its OAuth tokens will be removed from the sidecar. This can't be undone.`,
+          confirmLabel: "Delete",
+        });
+        if (ok) act(() => sc.remove(a.name), `${cfg.vendor} account deleted`, root);
+      },
+    },
+  ];
+
+  const wt = c.effective_weight != null
+    ? `${c.weight}→${c.effective_weight}`
+    : String(c.weight);
+  const wtTitle = c.effective_weight != null
+    ? `Base weight ${c.weight} (operator) × quota → ${c.effective_weight} pushed to sidecar. Refreshes every 90s.`
+    : "Operator base weight";
+  const refreshed = a.last_refresh ? relTime(tsOf(a.last_refresh)) : "never";
+
+  return el("article", { class: "card cred-card" + (disabled ? " cred-card--disabled" : "") }, [
+    el("div", { class: "cred-card__identity" }, [
+      el("div", { class: "cred-card__label", text: label }),
+      el("div", {
+        class: "cred-card__id",
+        text: "name/email managed by provider",
+        title: "Account identity comes from the OAuth provider. Only the selection weight can be adjusted here.",
+      }),
+    ]),
+    el("div", { class: "cred-card__meta" }, [
+      el("div", { class: "cred-card__endpoint", text: "Private sidecar", title: "OAuth tokens are stored by CLIProxyAPI" }),
+      el("div", { class: "cred-card__type", text: c.subscription_type || "subscription" }),
+    ]),
+    el("div", { class: "cred-card__right" }, [
+      statusBadge(c.status),
+      actionMenu(`Actions for ${label}`, items),
+    ]),
+    el("div", { class: "cred-card__stats" }, [
+      el("div", { class: "cred-stat", title: wtTitle }, [
+        el("span", { class: "cred-stat__val", text: wt }),
+        el("span", { class: "cred-stat__label", text: "weight" }),
+      ]),
+      stat(compactNum(c.request_count), "requests"),
+      stat(refreshed, "refreshed"),
+    ]),
+  ]);
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function tsOf(v) {
+  if (v == null) return 0;
+  if (typeof v === "number") return v;
+  const t = Date.parse(v);
+  return isNaN(t) ? 0 : t / 1000;
+}
+
+async function act(fn, okMsg, root) {
+  try {
+    await fn();
+    toast(okMsg, "good");
+    render(root);
+  } catch (e) {
+    toast(e.message, "critical", 6000);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Edit settings modal — label and weight (atomic POST /credentials/{id}/settings)
+// ---------------------------------------------------------------------------
+
+function editSettingsModal(c, root) {
+  const id = c.id || c.credential_id;
+  const labelInId = `cred-label-${++uid}`;
+  const weightInId = `cred-weight-${++uid}`;
+  const labelIn = el("input", {
+    id: labelInId, class: "input", type: "text", maxlength: "200",
+    value: c.label || "", placeholder: "Optional display name",
+  });
+  const weightIn = el("input", {
+    id: weightInId, class: "input input--sm", type: "number",
+    min: "1", max: "1000000", step: "1", value: String(c.weight ?? 1),
+  });
+  const err = el("p", { class: "form-err", role: "alert" });
+
+  const labelRow = field("Label", labelIn,
+    "Shown in listings and charts. Leave blank to use the provider default. Max 200 characters.");
+  labelRow.querySelector(".field-label").htmlFor = labelInId;
+
+  const weightRow = field("Weight", weightIn,
+    "Weights only compete within one provider. Anthropic defaults: pro 1, max/team/enterprise 5.");
+  weightRow.querySelector(".field-label").htmlFor = weightInId;
+
+  async function save(btn) {
+    const w = Number(weightIn.value);
+    if (!Number.isInteger(w) || w < 1 || w > 1_000_000) {
+      err.textContent = "Weight must be an integer from 1 to 1 000 000.";
+      return;
+    }
+    if (btn) btn.disabled = true;
+    err.textContent = "";
+    try {
+      await api.updateCredSettings(id, { label: labelIn.value.trim(), weight: w });
+      m.close();
+      toast("Saved", "good");
+      render(root);
+    } catch (e) {
+      err.textContent = e.message || "Could not save.";
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  // Enter in either input submits the form.
+  const onEnter = (e) => { if (e.key === "Enter") { e.preventDefault(); save(null); } };
+  labelIn.addEventListener("keydown", onEnter);
+  weightIn.addEventListener("keydown", onEnter);
+
+  const m = modal({
+    title: "Edit credential",
+    body: el("div", { class: "form" }, [labelRow, weightRow, err]),
+    actions: [
+      button("Cancel", { onClick: () => m.close() }),
+      button("Save", { kind: "primary", onClick: (ev) => save(ev.currentTarget) }),
+    ],
+  });
+  return m;
+}
+
+// ---------------------------------------------------------------------------
+// Weight-only modal (sidecar accounts — name/email managed by provider)
+// ---------------------------------------------------------------------------
+
+function weightModal(id, current, root, options = {}) {
+  const input = el("input", {
+    class: "input", type: "number",
+    min: "1", max: "1000000", step: "1",
+    value: String(current ?? 1),
+  });
+  const m = modal({
+    title: "Set selection weight",
+    subtitle: "Higher weight → more new conversations.",
+    body: el("div", { class: "form" }, [
+      field("Weight", input,
+        options.help || "Weights only compete within one provider. Anthropic defaults: pro 1, max/team/enterprise 5."),
+    ]),
+    actions: [
+      button("Cancel", { onClick: () => m.close() }),
+      button("Save", {
+        kind: "primary",
+        onClick: async () => {
+          const w = parseInt(input.value, 10);
+          if (isNaN(w) || w < 1 || w > 1_000_000) return toast("Enter an integer from 1 to 1000000", "warning");
+          m.close();
+          act(
+            () => options.save ? options.save(w) : api.post(`/credentials/${id}/weight`, { weight: w }),
+            "Weight updated", root,
+          );
+        },
+      }),
+    ],
+  });
+  return m;
+}
+
+// ---------------------------------------------------------------------------
+// Add credential modal
+// ---------------------------------------------------------------------------
+
 const KINDS = {
   anthropic: {
     label: "Anthropic subscription",
@@ -234,20 +548,19 @@ const KINDS = {
   },
 };
 
-// ---------------------------------------------------------------------------
-// Form building blocks
-// ---------------------------------------------------------------------------
-
 let uid = 0;
 
-// field wraps a control with its label and an optional help line. The help text
-// is the point of this refactor: every input says what it is for and what goes
-// wrong if it is off, instead of assuming the operator already knows.
 function field(labelText, control, help) {
+  const input = control.matches("input,select,textarea") ? control : control.querySelector("input,select,textarea");
+  const helpID = `field-help-${++uid}`;
+  if (input) {
+    if (!input.id) input.id = `field-${++uid}`;
+    input.setAttribute("aria-describedby", helpID);
+  }
   return el("div", { class: "form-row" }, [
-    el("label", { class: "field-label", text: labelText }),
+    el("label", { class: "field-label", text: labelText, for: input?.id }),
     control,
-    el("p", { class: "field-help", text: help || "" }),
+    el("p", { class: "field-help", id: helpID, text: help || "" }),
   ]);
 }
 
@@ -256,18 +569,6 @@ function setHelp(row, text) {
   if (p) p.textContent = text || "";
 }
 
-// endpointInput is a free-text URL box with an explicit preset dropdown.
-//
-// It was a native <input list> + <datalist> first, which was wired correctly
-// but behaved as a dead text box: a datalist filters its suggestions against
-// what is already typed, and this field is prefilled with the provider's
-// default URL — so the only option that ever matched was the one already
-// shown, and the other clusters were unreachable unless the operator first
-// deleted the whole URL. A picker with nothing to pick.
-//
-// The menu is therefore explicit: one editable field that accepts any URL, plus
-// a button listing every preset regardless of the current value. Presets stay a
-// shortcut, not a constraint, and there is still no separate "custom" field.
 function endpointInput(kind, value) {
   const input = el("input", {
     class: "input combo__input", type: "text", spellcheck: "false",
@@ -285,11 +586,7 @@ function endpointInput(kind, value) {
     menu.hidden = !on || !menu.childElementCount;
     input.setAttribute("aria-expanded", String(!menu.hidden));
   };
-  const choose = (url) => {
-    input.value = url;
-    open(false);
-    input.focus();
-  };
+  const choose = (url) => { input.value = url; open(false); input.focus(); };
 
   const fill = (k) => {
     clear(menu);
@@ -299,20 +596,14 @@ function endpointInput(kind, value) {
         el("span", { class: "combo__opt-url", text: e.url }),
       ]));
     }
-    // A provider with no presets (a custom host) gets a plain text field rather
-    // than a button that opens an empty menu.
     toggle.hidden = !menu.childElementCount;
     open(false);
-    // Default to the provider's own default so the common case needs no typing.
     if (!input.value) input.value = ENDPOINTS[k]?.default || "";
     input.placeholder = k === "custom_openai" ? "https://host/v1" : "https://host/anthropic";
   };
 
   toggle.addEventListener("click", () => open(menu.hidden));
   input.addEventListener("keydown", (e) => { if (e.key === "Escape") open(false); });
-  // Dismiss on an outside click. The listener outlives the modal, so it guards
-  // on the node still being connected rather than leaking a growing stack of
-  // handlers that act on detached DOM.
   document.addEventListener("click", (e) => {
     if (!root.isConnected) return;
     if (!root.contains(e.target)) open(false);
@@ -322,7 +613,6 @@ function endpointInput(kind, value) {
   return { input, root, setKind: fill, value: () => input.value.trim() };
 }
 
-// probePanel renders what a connection test discovered.
 function probePanel() {
   const root = el("div", { class: "probe" });
   const line = (k, v, tone) => el("div", { class: "probe__row" }, [
@@ -345,21 +635,12 @@ function probePanel() {
       if (p.reported_model) root.append(line("reports model", p.reported_model));
       if (p.error) root.append(line("error", p.error, "bad"));
       for (const m of p.models || []) {
-        // Context window is only knowable from a /v1/models the host may not
-        // serve; say so rather than leaving a silent blank.
         root.append(line("model", m.id + (m.context_window ? ` · ${m.context_window} ctx` : " · context unknown")));
       }
     },
   };
 }
 
-// ---------------------------------------------------------------------------
-// Add credential — one modal for every kind
-// ---------------------------------------------------------------------------
-
-// This was three near-identical modals (OAuth paste, provider key, custom host)
-// that had drifted apart. They ask for overlapping things, so they are now one
-// form whose fields follow the selected kind.
 function addCredentialModal(root) {
   let m;
   const kindSel = el("select", { class: "input" },
@@ -400,7 +681,6 @@ function addCredentialModal(root) {
     ]),
   ]);
 
-  // One sign-in flow per sidecar channel; sync() shows the selected one.
   const flows = Object.fromEntries(SIDECAR_CHANNELS.map((ch) => [ch, sidecarOAuthControls(ch, () => {
     m.close();
     render(root);
@@ -427,9 +707,6 @@ function addCredentialModal(root) {
     }
   };
 
-  // Testing before saving is offered for every key-based kind, not only custom
-  // hosts: it is the only way to tell a bad key from a right key pointed at the
-  // wrong cluster, which fail with the same upstream message.
   const testBtn = button("Test connection", {
     onClick: (ev) => busy(ev.currentTarget, "Testing…", async () => {
       if (!ep.value()) throw new Error("Enter an endpoint first.");
@@ -501,7 +778,6 @@ function addCredentialModal(root) {
     setHelp(endpointRow, cfg.endpointHelp);
     setHelp(keyRow, cfg.keyHelp);
     keyRow.querySelector(".field-label").textContent = cfg.openAIProtocol ? "Bearer token" : "API key";
-    // Presets belong to the selected provider; a custom host has none.
     ep.input.value = "";
     ep.setKind(k);
     probe.clear();
@@ -521,7 +797,7 @@ function addCredentialModal(root) {
 }
 
 // ---------------------------------------------------------------------------
-// Sidecar OAuth (OpenAI Codex, Google Gemini — managed by CLIProxyAPI)
+// Sidecar OAuth
 // ---------------------------------------------------------------------------
 
 function sidecarOAuthControls(ch, onConnected) {
@@ -575,7 +851,6 @@ function sidecarOAuthControls(ch, onConnected) {
     state = "";
     if (previousState) sc.cancelOAuth(previousState).catch(() => {});
     if (popup && !popup.closed) popup.close();
-    // Open synchronously so popup blockers recognize the user gesture.
     popup = window.open("about:blank", `${ch}-oauth`, "popup,width=720,height=800");
     err.textContent = "";
     manual.value = "";
@@ -614,10 +889,7 @@ function sidecarOAuthControls(ch, onConnected) {
         }
         throw new Error(current.error || `${cfg.vendor} authorization failed.`);
       }
-      if (!flowRoot.isConnected && run === thisRun) {
-        cancel();
-        return;
-      }
+      if (!flowRoot.isConnected && run === thisRun) { cancel(); return; }
       if (flowRoot.isConnected && run === thisRun) {
         await sc.cancelOAuth(state).catch(() => {});
         state = "";
@@ -647,10 +919,7 @@ function sidecarOAuthControls(ch, onConnected) {
 function sidecarOAuthModal(ch, root) {
   const cfg = SIDECAR[ch];
   let m;
-  const flow = sidecarOAuthControls(ch, () => {
-    m.close();
-    render(root);
-  });
+  const flow = sidecarOAuthControls(ch, () => { m.close(); render(root); });
   m = modal({
     title: `Refresh ${cfg.name} login`,
     subtitle: `Run OAuth again for the owner's ${cfg.vendor} account.`,
@@ -662,24 +931,9 @@ function sidecarOAuthModal(ch, root) {
 }
 
 // ---------------------------------------------------------------------------
-// Rows
+// Endpoint modal — move a key to another cluster (re-verified before commit)
 // ---------------------------------------------------------------------------
 
-// endpointLabel keeps the column narrow: a preset name when the URL matches
-// one, otherwise the custom URL's host.
-function endpointLabel(c) {
-  if (!c.endpoint) return "—";
-  if (c.endpoint_name) return c.endpoint_name;
-  try {
-    return new URL(c.endpoint).host;
-  } catch {
-    return c.endpoint;
-  }
-}
-
-// endpointModal moves an existing key to another endpoint. The backend
-// re-verifies the key there before committing, so a wrong pick is rejected
-// rather than silently breaking a working credential.
 function endpointModal(c, root) {
   const id = c.id || c.credential_id;
   const ep = endpointInput(c.provider, c.endpoint);
@@ -695,7 +949,7 @@ function endpointModal(c, root) {
     body,
     actions: [
       button("Cancel", { onClick: () => m.close() }),
-      button("Verify & move", {
+      button("Verify & apply endpoint", {
         kind: "primary",
         onClick: async (ev) => {
           const btn = ev.currentTarget;
@@ -722,155 +976,9 @@ function endpointModal(c, root) {
   return m;
 }
 
-function credRow(c, root) {
-  if (c.sidecar_account) return sidecarCredRow(c, root);
-
-  const id = c.id || c.credential_id;
-  const disabled = (c.status || "").toLowerCase() === "disabled";
-  // A static API key has no OAuth lineage: there is nothing to refresh and no
-  // .credentials.json to re-paste, so those actions are omitted rather than
-  // offered and then failing.
-  const isKey = c.has_usage_api === false;
-  const actions = el("div", { class: "row-actions" }, [
-    button("Weight", { onClick: () => weightModal(id, c.weight, root) }),
-    ...(c.endpoint_editable ? [button("Endpoint", { onClick: () => endpointModal(c, root) })] : []),
-    ...(isKey ? [] : [
-      button("Refresh", { onClick: () => act(() => api.post(`/credentials/${id}/refresh`), "Token refreshed", root) }),
-      button("Update tokens", { onClick: () => updateModal(id, root) }),
-    ]),
-    button(disabled ? "Enable" : "Disable", {
-      onClick: () => act(() => api.post(`/credentials/${id}/${disabled ? "enable" : "disable"}`), disabled ? "Enabled" : "Disabled", root),
-    }),
-    button("Delete", {
-      kind: "danger-ghost",
-      onClick: async () => {
-        const ok = await confirmDialog({
-          title: "Delete credential?",
-          message: `"${c.label || id}" will be removed from the pool and its conversation bindings cleared. This can't be undone.`,
-          confirmLabel: "Delete",
-        });
-        if (ok) act(() => api.del(`/credentials/${id}`), "Credential deleted", root);
-      },
-    }),
-  ]);
-
-  const modelIDs = (c.models || []).map((m) => m.id).join(", ");
-  const typeCell = c.subscription_type || (modelIDs ? `${(c.models || []).length} model(s)` : "—");
-  return el("tr", {}, [
-    el("td", {}, [el("span", { class: "cell-strong", text: c.label || "—" }), el("span", { class: "cell-id", text: id })]),
-    el("td", {}, el("span", { class: "badge", text: providerLabel(c.provider) })),
-    el("td", { text: endpointLabel(c), title: c.endpoint || "" }),
-    el("td", { text: typeCell, title: modelIDs }),
-    el("td", {}, statusBadge(c.status)),
-    el("td", { class: "num", text: String(c.weight ?? "—") }),
-    el("td", { class: "num", text: compactNum(c.request_count ?? c.requests ?? 0) }),
-    el("td", { text: c.last_request_at ? relTime(tsOf(c.last_request_at)) : "never" }),
-    el("td", { text: isKey ? "never" : (c.expires_at ? localTime(tsOf(c.expires_at)) : "—") }),
-    el("td", { class: "actions" }, actions),
-  ]);
-}
-
-function sidecarCredRow(c, root) {
-  const a = c.sidecar_account;
-  const ch = c.sidecar_channel;
-  const cfg = SIDECAR[ch];
-  const sc = api.sidecar(ch);
-  const disabled = c.status === "disabled";
-  const label = c.label || a.name;
-  const actions = el("div", { class: "row-actions" }, [
-    button("Weight", {
-      onClick: () => weightModal(c.id, c.weight, root, {
-        save: (weight) => sc.setWeight(a.name, weight),
-        help: "Operator bias — one input to the same usage/reset-aware selection formula used for Anthropic. The sidecar's effective weight is computed automatically from base × current quota and refreshed every 90s.",
-      }),
-    }),
-    button(disabled ? "Enable" : "Disable", {
-      onClick: () => act(
-        () => sc.setDisabled(a.name, a.auth_index, !disabled),
-        disabled ? `${cfg.vendor} account enabled` : `${cfg.vendor} account disabled`, root,
-      ),
-    }),
-    button("Refresh login", {
-      title: `Run ${cfg.vendor} OAuth again. Normal access-token refreshes happen automatically.`,
-      onClick: () => sidecarOAuthModal(ch, root),
-    }),
-    button("Delete", {
-      kind: "danger-ghost",
-      onClick: async () => {
-        const ok = await confirmDialog({
-          title: `Delete ${cfg.vendor} credential?`,
-          message: `"${label}" and its OAuth tokens will be removed from the sidecar. This can't be undone.`,
-          confirmLabel: "Delete",
-        });
-        if (ok) act(() => sc.remove(a.name), `${cfg.vendor} account deleted`, root);
-      },
-    }),
-  ]);
-  const refreshed = a.last_refresh ? relTime(tsOf(a.last_refresh)) : "never";
-  return el("tr", {}, [
-    el("td", {}, [el("span", { class: "cell-strong", text: label }), el("span", { class: "cell-id", text: a.name })]),
-    el("td", {}, el("span", { class: "badge", text: providerLabel(c.provider) })),
-    el("td", { text: "Private sidecar", title: "OAuth tokens are stored by CLIProxyAPI" }),
-    el("td", { text: c.subscription_type }),
-    el("td", { title: a.status_message || "" }, statusBadge(c.status)),
-    el("td", {
-      class: "num",
-      text: c.effective_weight != null ? `${c.weight} → ${c.effective_weight}` : String(c.weight),
-      title: c.effective_weight != null
-        ? `Base weight ${c.weight} (operator) × usage/reset heuristic → ${c.effective_weight} pushed to sidecar. Refreshes every 90s.`
-        : "Operator base weight",
-    }),
-    el("td", { class: "num", text: compactNum(c.request_count) }),
-    el("td", { text: refreshed, title: "Last OAuth token refresh" }),
-    el("td", { text: "Auto-refresh" }),
-    el("td", { class: "actions" }, actions),
-  ]);
-}
-
-function tsOf(v) {
-  if (v == null) return 0;
-  if (typeof v === "number") return v;
-  const t = Date.parse(v);
-  return isNaN(t) ? 0 : t / 1000;
-}
-
-async function act(fn, okMsg, root) {
-  try {
-    await fn();
-    toast(okMsg, "good");
-    render(root);
-  } catch (e) {
-    toast(e.message, "critical", 6000);
-  }
-}
-
-function weightModal(id, current, root, options = {}) {
-  const input = el("input", { class: "input", type: "number", min: "1", max: "1000000", step: "1", value: String(current ?? 1) });
-  const m = modal({
-    title: "Set selection weight",
-    subtitle: "Higher weight → more new conversations.",
-    body: el("div", { class: "form" }, [
-      field("Weight", input,
-        options.help || "Weights only compete within one provider. Anthropic defaults: pro 1, max/team/enterprise 5. API keys default to 1."),
-    ]),
-    actions: [
-      button("Cancel", { onClick: () => m.close() }),
-      button("Save", {
-        kind: "primary",
-        onClick: async () => {
-          const w = parseInt(input.value, 10);
-          if (isNaN(w) || w < 1 || w > 1_000_000) return toast("Enter an integer from 1 to 1000000", "warning");
-          m.close();
-          act(
-            () => options.save ? options.save(w) : api.post(`/credentials/${id}/weight`, { weight: w }),
-            "Weight updated", root,
-          );
-        },
-      }),
-    ],
-  });
-  return m;
-}
+// ---------------------------------------------------------------------------
+// Update tokens modal — replace tokens from a fresh login
+// ---------------------------------------------------------------------------
 
 function updateModal(id, root) {
   const ta = el("textarea", {

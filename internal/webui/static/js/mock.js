@@ -231,7 +231,7 @@ const DB = {
     // urgency = max(0, room_7d / remaining_fraction_7d − 1). Disabled creds and
     // saturated snapshots (≥100% on either window) are excluded from the share.
     const rows = CREDS.map((c, i) => {
-      const five = fives[i], seven = sevens[i];
+      const five = fives[i] ?? 0, seven = sevens[i] ?? 0;
       const room5 = Math.max(0, 1 - five / 100);
       const room7 = Math.max(0, 1 - seven / 100);
       const saturated = five >= 100 || seven >= 100;
@@ -307,6 +307,10 @@ const DB = {
         selection: { room_5h: room5, room_7d: 1, urgency: 0, score, share_pct: score > 0 ? 100 : 0, saturated },
       };
     });
+    for (const channelRows of [codexRows, geminiRows]) {
+      const total = channelRows.reduce((sum, row) => sum + row.selection.score, 0);
+      for (const row of channelRows) row.selection.share_pct = total ? row.selection.score / total * 100 : 0;
+    }
     return [...anthropicLike, ...codexRows, ...geminiRows];
   },
   "/usage/history": (q) => {
@@ -552,6 +556,27 @@ window.fetch = async (input, init = {}) => {
     // the rest of the mock session, matching how the real endpoint behaves.
     // Mirrors the real endpoint: re-verification can reject the move, so the
     // mock refuses an obviously bogus URL rather than always succeeding.
+    const settings = path.match(/^\/credentials\/([^/]+)\/settings$/);
+    if (settings && method === "POST") {
+      const b = JSON.parse(init.body || "{}");
+      if (typeof b.label !== "string" || [...b.label.trim()].length > 200) return json({ error: "label must be a string of at most 200 characters" }, 400);
+      if (!Number.isSafeInteger(b.weight) || b.weight < 1) return json({ error: "weight must be >= 1" }, 400);
+      const c = CREDS.find((x) => x.id === decodeURIComponent(settings[1]));
+      if (!c) return json({ error: "not found" }, 404);
+      c.label = b.label.trim();
+      c.weight = b.weight;
+      return json({ ok: true, id: c.id, label: c.label, weight: c.weight });
+    }
+    const credentialAction = path.match(/^\/credentials\/([^/]+)(?:\/(enable|disable|weight|refresh))?$/);
+    if (credentialAction && (credentialAction[2] || method === "DELETE")) {
+      const c = CREDS.find((x) => x.id === decodeURIComponent(credentialAction[1]));
+      if (!c) return json({ error: "not found" }, 404);
+      if (method === "DELETE") CREDS.splice(CREDS.indexOf(c), 1);
+      else if (credentialAction[2] === "enable") c.status = "active";
+      else if (credentialAction[2] === "disable") c.status = "disabled";
+      else if (credentialAction[2] === "weight") c.weight = JSON.parse(init.body || "{}").weight;
+      return json({ ok: true });
+    }
     const epm = path.match(/^\/credentials\/([^/]+)\/endpoint$/);
     if (epm && method === "POST") {
       const b = JSON.parse(init.body || "{}");
@@ -562,8 +587,8 @@ window.fetch = async (input, init = {}) => {
       const url = preset ? preset.url : b.endpoint;
       if (!/^https?:\/\//.test(url)) return json({ error: `unknown endpoint "${b.endpoint}"` }, 400);
       c.endpoint = url;
-      c.status = "active";
-      return json({ ok: true, id: c.id, status: "active", endpoint: url });
+      if (c.status !== "disabled") c.status = "active";
+      return json({ ok: true, id: c.id, status: c.status, endpoint: url });
     }
     // Mirrors ProbeCustomHost so the unified add-modal's "Test connection"
     // works offline for every provider kind.
