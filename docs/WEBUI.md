@@ -140,6 +140,28 @@ the selected window into equal intervals.
   URL or key may have changed since. `models` overrides discovery; omitted, the
   discovered catalogue is used. `400` if the host is unusable or no model could
   be determined.
+- `POST /api/credentials/oauth/start` → `{session, url}`. Begins an Anthropic
+  subscription sign-in from the browser (`internal/claudeoauth`), using Claude
+  Code's own OAuth client and its manual-code flow: `url` is claude.com's
+  authorize page with a PKCE challenge, and the redirect is
+  `platform.claude.com/oauth/code/callback`, which shows the operator an
+  authentication code instead of calling a localhost port — so it works for a
+  remote proxy. The PKCE verifier stays in server memory (10-minute sessions,
+  at most 32 in flight); the browser holds only the opaque `session`.
+- `POST /api/credentials/oauth/exchange` `{session, code, label?, weight?, credential_id?}`
+  → `{ok,id,label,status,subscription_type,weight}`. `code` is what Anthropic
+  displayed (`code#state`), a full callback URL, or a bare code; a state from a
+  different sign-in is refused before contacting Anthropic. The code is
+  exchanged at the token endpoint the refresher uses, then
+  `GET api.anthropic.com/api/oauth/profile` proves the token works and maps
+  `organization_type` to the plan (`claude_max` → `max`, …; an account without a
+  subscription is refused). Without `credential_id` a new credential is added
+  (label defaults to the account e-mail, weight to the plan default); with one,
+  that credential's tokens are replaced and its status set active, keeping its
+  label, weight and history. Sessions are single-use — any failure needs a new
+  sign-in. An unknown `credential_id` (`404`) or a sidecar gateway (`409`) is
+  rejected before the code is spent. Responses never contain tokens.
+- `POST /api/credentials/oauth/cancel` `{session}` → forget a pending sign-in.
 - `POST /api/credentials/{id}/disable` | `/enable` (SetStatus disabled/active)
 - `POST /api/credentials/{id}/refresh` → force OAuth token refresh (`Refresher.RefreshNow`)
 - `POST /api/credentials/{id}/weight` `{weight}` (creds.SetWeight)
@@ -250,7 +272,10 @@ queries must use the indexes on `request_log(ts)` / `usage_history(credential_id
 > the only way to tell a bad key from a right key aimed at the wrong cluster.
 
 - **Credentials**: responsive provider-grouped cards without a horizontal table
-  scroller. One keyboard-accessible Actions menu holds editing and provider-specific
+  scroller. Anthropic subscriptions are added — and reconnected via *Update
+  tokens* — by either method, chosen in the modal: **Sign in with Claude** (the
+  default; open the sign-in window, approve, paste the code Anthropic shows) or
+  **Paste credentials.json** (the original import). One keyboard-accessible Actions menu holds editing and provider-specific
   enable/disable/refresh/delete operations. Native credentials support label/weight
   editing and key-based credentials retain verified endpoint editing. Codex/Gemini
   account identities and endpoints remain provider-managed; their weights are editable.

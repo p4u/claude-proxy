@@ -18,6 +18,8 @@ const CREDS = [
     models: [{ id: "local-model", display_name: "local-model" }] },
 ];
 
+const claudeSessions = new Set();
+
 const CODEX_ACCOUNTS = [
   { name: "codex-owner-pro-91c7.json", auth_index: "mock-codex-owner", email: "owner@example.com",
     account_type: "pro", status: "active", disabled: false, unavailable: false, blocked: false,
@@ -556,6 +558,35 @@ window.fetch = async (input, init = {}) => {
     // the rest of the mock session, matching how the real endpoint behaves.
     // Mirrors the real endpoint: re-verification can reject the move, so the
     // mock refuses an obviously bogus URL rather than always succeeding.
+    // Anthropic browser sign-in. Mirrors claudeoauth.Flow: sessions are
+    // single-use, and the code "bad" stands in for one Anthropic rejects.
+    if (path === "/credentials/oauth/start" && method === "POST") {
+      const session = "mock_" + Math.random().toString(36).slice(2);
+      claudeSessions.add(session);
+      return json({ session, url: "https://claude.com/cai/oauth/authorize?code=true&state=" + session });
+    }
+    if (path === "/credentials/oauth/cancel" && method === "POST") {
+      claudeSessions.delete(JSON.parse(init.body || "{}").session);
+      return json({ ok: true });
+    }
+    if (path === "/credentials/oauth/exchange" && method === "POST") {
+      const b = JSON.parse(init.body || "{}");
+      const target = b.credential_id ? CREDS.find((x) => x.id === b.credential_id) : null;
+      if (b.credential_id && !target) return json({ error: "credential not found" }, 404);
+      if (!claudeSessions.delete(b.session)) return json({ error: "sign-in session expired or unknown; start the sign-in again" }, 400);
+      if (!String(b.code || "").trim()) return json({ error: "paste the authentication code shown after approving access" }, 400);
+      if (String(b.code).trim().startsWith("bad")) {
+        return json({ error: "the code was rejected by Anthropic (400) — it may have expired or been used already; start the sign-in again: invalid_grant" }, 400);
+      }
+      if (target) {
+        target.status = "active";
+        return json({ ok: true, id: target.id, label: target.label, status: "active", subscription_type: target.type, weight: target.weight });
+      }
+      const c = { id: "cred_" + Math.random().toString(16).slice(2, 10), label: b.label || "new-owner@example.com",
+        type: "max", weight: Number.isInteger(b.weight) ? b.weight : 5, status: "active" };
+      CREDS.push(c);
+      return json({ ok: true, id: c.id, label: c.label, status: "active", subscription_type: c.type, weight: c.weight });
+    }
     const settings = path.match(/^\/credentials\/([^/]+)\/settings$/);
     if (settings && method === "POST") {
       const b = JSON.parse(init.body || "{}");

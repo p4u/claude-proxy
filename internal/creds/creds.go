@@ -389,6 +389,13 @@ func UpdateTokens(ctx context.Context, db *store.DB, id, access, refresh string,
 	return err
 }
 
+// SetSubscriptionType records the plan, e.g. after a reconnect verified that
+// the account moved from pro to max.
+func SetSubscriptionType(ctx context.Context, db *store.DB, id, subType string) error {
+	_, err := db.ExecContext(ctx, `UPDATE credentials SET subscription_type=? WHERE id=?`, subType, id)
+	return err
+}
+
 func MarkLimited(ctx context.Context, db *store.DB, id string, retryAfter time.Time) error {
 	_, err := db.ExecContext(ctx, `
 		UPDATE credentials SET status='limited', retry_after=?, last_429_at=? WHERE id=?`,

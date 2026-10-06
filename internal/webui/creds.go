@@ -64,6 +64,8 @@ func (s *Server) handleCredentials(w http.ResponseWriter, r *http.Request, rest 
 		s.probeCustom(w, r)
 	case rest == "/custom" && r.Method == http.MethodPost:
 		s.addCustomCred(w, r)
+	case strings.HasPrefix(rest, "/oauth/"):
+		s.handleClaudeLogin(w, r, strings.TrimPrefix(rest, "/oauth"))
 	default:
 		// /{id} or /{id}/{action}
 		trimmed := strings.TrimPrefix(rest, "/")

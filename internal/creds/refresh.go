@@ -146,8 +146,17 @@ func (r *Refresher) refresh(ctx context.Context, id string, force bool) (*Creden
 	raw, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode == 400 || resp.StatusCode == 401 {
-		// invalid_grant or revoked
-		_ = SetStatus(ctx, r.db, id, StatusRevoked)
+		// invalid_grant or revoked — but only for the lineage this request
+		// used. If the tokens were replaced meanwhile (an Update tokens or a
+		// browser reconnect landed while this request was in flight), the
+		// rejection describes the old grant, and the credential is healthy.
+		revoked, err := revokeIfLineage(ctx, r.db, id, c.RefreshToken)
+		if err != nil {
+			return nil, err
+		}
+		if !revoked {
+			return Get(ctx, r.db, id)
+		}
 		return nil, fmt.Errorf("refresh rejected (%d): %s", resp.StatusCode, string(raw))
 	}
 	if resp.StatusCode != 200 {
@@ -162,10 +171,37 @@ func (r *Refresher) refresh(ctx context.Context, id string, force bool) (*Creden
 		return nil, fmt.Errorf("refresh missing tokens: %s", string(raw))
 	}
 	exp := time.Now().Add(time.Duration(rr.ExpiresIn)*time.Second - 5*time.Minute)
-	if err := UpdateTokens(ctx, r.db, id, rr.AccessToken, rr.RefreshToken, exp); err != nil {
+	// Conditional for the same reason: a stale refresh must not overwrite a
+	// newer login's tokens with the previous lineage.
+	if _, err := replaceTokensIfLineage(ctx, r.db, id, c.RefreshToken, rr.AccessToken, rr.RefreshToken, exp); err != nil {
 		return nil, err
 	}
 	return Get(ctx, r.db, id)
+}
+
+// replaceTokensIfLineage writes a refresh result only while the credential
+// still holds the refresh token the request was made with.
+func replaceTokensIfLineage(ctx context.Context, db *store.DB, id, oldRefresh, access, refresh string, expiresAt time.Time) (bool, error) {
+	res, err := db.ExecContext(ctx, `
+		UPDATE credentials SET access_token=?, refresh_token=?, expires_at=?, status='active'
+		WHERE id=? AND refresh_token=?`, access, refresh, expiresAt.Unix(), id, oldRefresh)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// revokeIfLineage marks the credential revoked only while it still holds the
+// refresh token that was rejected.
+func revokeIfLineage(ctx context.Context, db *store.DB, id, oldRefresh string) (bool, error) {
+	res, err := db.ExecContext(ctx,
+		`UPDATE credentials SET status=? WHERE id=? AND refresh_token=?`, string(StatusRevoked), id, oldRefresh)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
 // Loop runs proactive refresh in the background until ctx is cancelled.

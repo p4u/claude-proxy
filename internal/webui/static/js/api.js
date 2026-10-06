@@ -104,6 +104,14 @@ export const api = {
   // Interrogate a candidate custom host without storing anything.
   probeHost: (body) => request("POST", "/credentials/probe", body),
   addCustom: (body) => request("POST", "/credentials/custom", body),
+  // Anthropic subscription sign-in from the browser (Claude Code's manual-code
+  // OAuth flow). The PKCE verifier stays on the server; the browser holds only
+  // the session ID and the code Anthropic displays.
+  claudeLogin: {
+    start: () => request("POST", "/credentials/oauth/start"),
+    exchange: (body) => request("POST", "/credentials/oauth/exchange", body),
+    cancel: (session) => request("POST", "/credentials/oauth/cancel", { session }),
+  },
   // Atomically update a credential's display label and selection weight.
   updateCredSettings: (id, { label = "", weight } = {}) =>
     request("POST", `/credentials/${enc(id)}/settings`, { label, weight }),

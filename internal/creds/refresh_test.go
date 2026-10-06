@@ -88,3 +88,53 @@ func TestRefresherRejectionMarksRevoked(t *testing.T) {
 		t.Fatalf("status = %q, want revoked after rejection", got.Status)
 	}
 }
+
+// A refresh that started before the tokens were replaced (Update tokens or a
+// browser reconnect) must not revoke or overwrite the newer login when its
+// stale response finally arrives.
+func TestStaleRefreshDoesNotUndoReplacedTokens(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"rejected", 400, `{"error":"invalid_grant"}`},
+		{"succeeded", 200, `{"access_token":"sk-ant-oat-stale","refresh_token":"ref-stale","expires_in":3600}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := testDB(t)
+			entered, release := make(chan struct{}), make(chan struct{})
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				close(entered)
+				<-release
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			prev := TokenURL
+			SetTokenURL(srv.URL)
+			t.Cleanup(func() { SetTokenURL(prev); srv.Close() })
+
+			c, err := Insert(ctx, db, "a", "max", "sk-ant-oat-old", "ref-old", time.Now().Add(time.Hour), 5)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := NewRefresher(db)
+			done := make(chan error, 1)
+			go func() { _, err := r.RefreshNow(ctx, c.ID); done <- err }()
+
+			<-entered
+			if err := UpdateTokens(ctx, db, c.ID, "sk-ant-oat-relogin", "ref-relogin", time.Now().Add(8*time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+			close(release)
+			if err := <-done; err != nil {
+				t.Fatalf("stale refresh reported %v; the credential is healthy", err)
+			}
+			got, _ := Get(ctx, db, c.ID)
+			if got.RefreshToken != "ref-relogin" || got.AccessToken != "sk-ant-oat-relogin" || got.Status != StatusActive {
+				t.Fatalf("newer login undone: %+v", got)
+			}
+		})
+	}
+}

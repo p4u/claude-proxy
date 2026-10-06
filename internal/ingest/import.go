@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/p4u/claude-proxy/internal/claudeoauth"
 	"github.com/p4u/claude-proxy/internal/creds"
+	"github.com/p4u/claude-proxy/internal/provider"
 	"github.com/p4u/claude-proxy/internal/store"
 )
 
@@ -143,6 +145,50 @@ func updateVerified(ctx context.Context, db *store.DB, id string, o oauthBlock) 
 	}
 	if err := creds.UpdateTokens(ctx, db, id, accessToken, refreshToken, expires); err != nil {
 		return nil, err
+	}
+	return creds.Get(ctx, db, id)
+}
+
+// ImportOAuth stores a subscription signed in through the web UI's OAuth flow
+// (claudeoauth.Flow). The tokens were minted moments ago and already proved
+// themselves against Anthropic's profile endpoint, so unlike ImportFromJSON
+// there is no refresh round-trip — refreshing here would only rotate a token
+// nobody else holds. label defaults to the account e-mail, then the plan.
+func ImportOAuth(ctx context.Context, db *store.DB, t *claudeoauth.Tokens, label string, weight int) (*creds.Credential, error) {
+	dup, err := creds.HasRefreshToken(ctx, db, t.RefreshToken)
+	if err != nil {
+		return nil, fmt.Errorf("duplicate check: %w", err)
+	}
+	if dup {
+		return nil, fmt.Errorf("credential already imported (refresh token already exists in the pool)")
+	}
+	if label == "" {
+		label = t.Email
+	}
+	if label == "" {
+		label = t.SubscriptionType
+	}
+	return creds.Insert(ctx, db, label, t.SubscriptionType, t.AccessToken, t.RefreshToken, t.ExpiresAt, weight)
+}
+
+// UpdateFromOAuth re-points an existing credential at a fresh OAuth sign-in,
+// the web counterpart to UpdateFromJSON. Identity, weight and history are kept.
+func UpdateFromOAuth(ctx context.Context, db *store.DB, id string, t *claudeoauth.Tokens) (*creds.Credential, error) {
+	c, err := creds.Get(ctx, db, id)
+	if err != nil {
+		return nil, err
+	}
+	if c.Provider != provider.Anthropic {
+		return nil, fmt.Errorf("%s is not an Anthropic subscription", id)
+	}
+	if err := creds.UpdateTokens(ctx, db, id, t.AccessToken, t.RefreshToken, t.ExpiresAt); err != nil {
+		return nil, err
+	}
+	// The profile just verified the plan; keep it current if it changed.
+	if t.SubscriptionType != "" && t.SubscriptionType != c.SubscriptionType {
+		if err := creds.SetSubscriptionType(ctx, db, id, t.SubscriptionType); err != nil {
+			return nil, err
+		}
 	}
 	return creds.Get(ctx, db, id)
 }

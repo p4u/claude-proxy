@@ -503,6 +503,7 @@ const KINDS = {
     label: "Anthropic subscription",
     blurb: "A Pro/Max/Team/Enterprise login. The proxy keeps its token refreshed for you.",
     needsJSON: true,
+    claudeLogin: true,
   },
   codex: {
     label: "OpenAI Codex subscription",
@@ -685,10 +686,23 @@ function addCredentialModal(root) {
     m.close();
     render(root);
   })]));
-  const cancelFlows = () => Object.values(flows).forEach((f) => f.cancel());
+
+  // Anthropic offers two equivalent ways in: sign in from this page, or paste
+  // a .credentials.json copied from a Claude Code login.
+  const method = claudeMethodChoice((v) => sync(v));
+  const claudeFlow = claudeLoginControls({
+    label: () => label.value.trim(),
+    weight: () => parseInt(weight.value, 10),
+    onDone: () => { m.close(); render(root); },
+    onBusy: (on) => { method.setDisabled(on); kindSel.disabled = on; },
+  });
+  const cancelFlows = () => {
+    Object.values(flows).forEach((f) => f.cancel());
+    claudeFlow.cancel();
+  };
 
   const body = el("div", { class: "form" }, [
-    kindRow, endpointRow, keyRow, jsonRow, modelsRow, advanced, probe.root,
+    kindRow, method.root, claudeFlow.root, endpointRow, keyRow, jsonRow, modelsRow, advanced, probe.root,
     ...Object.values(flows).map((f) => f.root), err,
   ]);
 
@@ -759,13 +773,20 @@ function addCredentialModal(root) {
     }),
   });
 
-  const sync = () => {
+  const sync = (methodOnly) => {
     const k = kindSel.value;
     const cfg = KINDS[k];
+    const signIn = !!cfg.claudeLogin && method.value() === "oauth";
+    method.root.hidden = !cfg.claudeLogin;
+    claudeFlow.root.hidden = !signIn;
+    if (!signIn) claudeFlow.cancel();
+    jsonRow.hidden = !cfg.needsJSON || signIn;
+    submit.hidden = !!cfg.managedOAuth || signIn;
+    err.textContent = "";
+    if (methodOnly) return;
     setHelp(kindRow, cfg.blurb);
     endpointRow.hidden = !!cfg.needsJSON || !!cfg.managedOAuth;
     keyRow.hidden = !!cfg.needsJSON || !!cfg.managedOAuth;
-    jsonRow.hidden = !cfg.needsJSON;
     modelsRow.hidden = !cfg.models;
     planRow.hidden = !cfg.plan;
     testBtn.hidden = !!cfg.needsJSON || !!cfg.managedOAuth;
@@ -774,7 +795,6 @@ function addCredentialModal(root) {
       flow.root.hidden = cfg.managedOAuth !== ch;
       if (cfg.managedOAuth !== ch) flow.cancel();
     }
-    submit.hidden = !!cfg.managedOAuth;
     setHelp(endpointRow, cfg.endpointHelp);
     setHelp(keyRow, cfg.keyHelp);
     keyRow.querySelector(".field-label").textContent = cfg.openAIProtocol ? "Bearer token" : "API key";
@@ -783,7 +803,7 @@ function addCredentialModal(root) {
     probe.clear();
     err.textContent = "";
   };
-  kindSel.addEventListener("change", sync);
+  kindSel.addEventListener("change", () => sync());
 
   m = modal({
     title: "Add credential",
@@ -791,6 +811,7 @@ function addCredentialModal(root) {
     wide: true,
     body,
     actions: [button("Cancel", { onClick: () => { cancelFlows(); m.close(); } }), testBtn, submit],
+    onClose: cancelFlows,
   });
   sync();
   return m;
@@ -931,6 +952,152 @@ function sidecarOAuthModal(ch, root) {
 }
 
 // ---------------------------------------------------------------------------
+// Anthropic sign-in — Claude Code's manual-code OAuth flow, run from this page
+// ---------------------------------------------------------------------------
+
+// claudeMethodChoice offers both ways to bring in an Anthropic subscription.
+function claudeMethodChoice(onChange) {
+  const name = `claude-method-${++uid}`;
+  const option = (value, title, hint, checked) => {
+    const input = el("input", { type: "radio", name, value, checked: checked || null });
+    input.addEventListener("change", () => onChange(value));
+    return el("label", { class: "method-choice__opt" }, [
+      input,
+      el("span", { class: "method-choice__text" }, [
+        el("strong", { text: title }),
+        el("span", { class: "field-help", text: hint }),
+      ]),
+    ]);
+  };
+  const root = el("fieldset", { class: "method-choice" }, [
+    el("legend", { class: "field-label", text: "Method" }),
+    option("oauth", "Sign in with Claude", "Approve access on claude.com and paste back the code it shows. Nothing to copy from a terminal.", true),
+    option("json", "Paste credentials.json", "Import the file a Claude Code login writes.", false),
+  ]);
+  return {
+    root,
+    value: () => root.querySelector("input:checked")?.value || "oauth",
+    setDisabled: (on) => { root.disabled = on; },
+  };
+}
+
+// claudeLoginControls runs one sign-in. With credentialId it reconnects that
+// credential; otherwise it adds a new one using the optional label/weight
+// getters. Anthropic's page shows the code after access is approved; the
+// verifier that makes the code redeemable never leaves the server.
+function claudeLoginControls({ credentialId = "", label = () => "", weight = () => NaN, onDone, onBusy = () => {} }) {
+  let session = "";
+  let popup = null;
+  // gen invalidates in-flight /start responses when the operator restarts or
+  // abandons the flow; committing blocks a second sign-in while a code is
+  // being redeemed, since two exchanges could add or reconnect twice.
+  let gen = 0;
+  let committing = false;
+  const err = el("p", { class: "form-err", role: "alert" });
+  const status = el("p", { class: "field-help", text: "1. Open the Claude sign-in and approve access for the account to use." });
+  const link = el("a", { href: "#", target: "_blank", rel: "noopener noreferrer", text: "Open the sign-in page" });
+  const linkRow = el("p", { class: "field-help", hidden: "hidden" }, ["If no window opened, ", link, "."]);
+  const code = el("input", {
+    class: "input input--code", type: "text", spellcheck: "false", autocomplete: "off",
+    placeholder: "Paste the authentication code", disabled: "disabled",
+  });
+  const codeRow = field("Authentication code", code,
+    "2. After you approve, Anthropic shows a code — copy it and paste it here. It works once and is never stored.");
+  const open = button("Open Claude sign-in", { kind: "primary", onClick: () => begin() });
+  const connect = button(credentialId ? "Reconnect" : "Connect account", {
+    kind: "primary", disabled: true, onClick: () => finish(),
+  });
+  const root = el("div", { class: "codex-oauth claude-login" }, [
+    status, el("div", { class: "codex-oauth__actions" }, [open]), linkRow, codeRow,
+    el("div", { class: "codex-oauth__actions" }, [connect]), err,
+  ]);
+  code.addEventListener("input", () => { connect.disabled = !session || !code.value.trim(); });
+  code.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !connect.disabled) { e.preventDefault(); finish(); }
+  });
+
+  async function begin() {
+    if (committing) return;
+    err.textContent = "";
+    cancel();
+    const mine = gen;
+    // Open the window synchronously with the click so popup blockers allow it.
+    popup = window.open("about:blank", "claude-oauth", "popup,width=560,height=760");
+    open.disabled = true;
+    open.textContent = "Starting…";
+    try {
+      const started = await api.claudeLogin.start();
+      if (mine !== gen || !root.isConnected) { api.claudeLogin.cancel(started.session).catch(() => {}); return; }
+      session = started.session;
+      link.href = started.url;
+      linkRow.hidden = false;
+      if (popup && !popup.closed) popup.location.href = started.url;
+      code.disabled = false;
+      code.value = "";
+      code.focus();
+      status.textContent = "1. Approve access in the Claude window (sign in first if asked).";
+      open.textContent = "Restart sign-in";
+    } catch (e) {
+      if (mine !== gen) return;
+      if (popup && !popup.closed) popup.close();
+      err.textContent = e.message || "Could not start the sign-in.";
+      open.textContent = "Open Claude sign-in";
+    } finally {
+      if (mine === gen) open.disabled = false;
+    }
+  }
+
+  async function finish() {
+    err.textContent = "";
+    const pasted = code.value.trim();
+    if (!session) { err.textContent = "Open the Claude sign-in first."; return; }
+    if (!pasted) { err.textContent = "Paste the authentication code first."; return; }
+    connect.disabled = true;
+    open.disabled = true;
+    code.disabled = true;
+    committing = true;
+    onBusy(true);
+    const mine = gen;
+    const orig = connect.textContent;
+    connect.textContent = "Verifying…";
+    const payload = { session, code: pasted };
+    // The server consumes the session whatever the outcome: a code is single-use.
+    session = "";
+    if (credentialId) payload.credential_id = credentialId;
+    else {
+      if (label()) payload.label = label();
+      if (!isNaN(weight())) payload.weight = weight();
+    }
+    try {
+      const out = await api.claudeLogin.exchange(payload);
+      if (popup && !popup.closed) popup.close();
+      // Reported even if the dialog was dismissed meanwhile: the credential
+      // was stored, so the list must refresh.
+      toast(credentialId ? "Subscription reconnected" : `Added ${out.label || "subscription"} (${out.subscription_type || "subscription"})`, "good");
+      onDone(out);
+    } catch (e) {
+      if (mine === gen) err.textContent = `${e.message || "Sign-in failed."} Start the sign-in again to get a new code.`;
+    } finally {
+      committing = false;
+      onBusy(false);
+      open.disabled = false;
+      connect.textContent = orig;
+    }
+  }
+
+  function cancel() {
+    gen++;
+    const pending = session;
+    session = "";
+    connect.disabled = true;
+    if (pending) api.claudeLogin.cancel(pending).catch(() => {});
+    if (popup && !popup.closed) popup.close();
+  }
+
+  return { root, cancel };
+}
+
+// ---------------------------------------------------------------------------
 // Endpoint modal — move a key to another cluster (re-verified before commit)
 // ---------------------------------------------------------------------------
 
@@ -981,47 +1148,60 @@ function endpointModal(c, root) {
 // ---------------------------------------------------------------------------
 
 function updateModal(id, root) {
+  let m;
+  const method = claudeMethodChoice((v) => syncMethod(v));
+  const flow = claudeLoginControls({
+    credentialId: id,
+    onDone: () => { m.close(); render(root); },
+    onBusy: (on) => method.setDisabled(on),
+  });
   const ta = el("textarea", {
     class: "input input--code", rows: "9", spellcheck: "false",
     placeholder: '{\n  "claudeAiOauth": {\n    "accessToken": "...",\n    "refreshToken": "...",\n    "expiresAt": ...\n  }\n}',
   });
   const err = el("p", { class: "form-err", role: "alert" });
-  const m = modal({
+  const jsonRow = field("credentials.json", ta,
+    "Use this when the subscription was re-logged-in elsewhere and the stored refresh token no longer works.");
+  const update = button("Update", {
+    kind: "primary",
+    onClick: async (ev) => {
+      const btn = ev.currentTarget;
+      const raw = ta.value.trim();
+      err.textContent = "";
+      if (!raw) { err.textContent = "Paste a credentials JSON first."; return; }
+      try { JSON.parse(raw); } catch { err.textContent = "That isn't valid JSON."; return; }
+      btn.disabled = true;
+      const orig = btn.textContent;
+      btn.textContent = "Verifying…";
+      try {
+        await api.put(`/credentials/${id}/tokens`, { credentials_json: raw });
+        m.close();
+        toast("Tokens updated", "good");
+        render(root);
+      } catch (e) {
+        err.textContent = e.message || "Update failed.";
+      } finally {
+        btn.disabled = false;
+        btn.textContent = orig;
+      }
+    },
+  });
+  const syncMethod = (v) => {
+    const signIn = v === "oauth";
+    flow.root.hidden = !signIn;
+    jsonRow.hidden = signIn;
+    update.hidden = signIn;
+    err.textContent = "";
+    if (!signIn) flow.cancel();
+  };
+  m = modal({
     title: "Update tokens",
     subtitle: "Replace this credential's tokens from a fresh login. Identity, weight and history are kept.",
     wide: true,
-    body: el("div", { class: "form" }, [
-      field("credentials.json", ta,
-        "Use this when the subscription was re-logged-in elsewhere and the stored refresh token no longer works."),
-      err,
-    ]),
-    actions: [
-      button("Cancel", { onClick: () => m.close() }),
-      button("Update", {
-        kind: "primary",
-        onClick: async (ev) => {
-          const btn = ev.currentTarget;
-          const raw = ta.value.trim();
-          err.textContent = "";
-          if (!raw) { err.textContent = "Paste a credentials JSON first."; return; }
-          try { JSON.parse(raw); } catch { err.textContent = "That isn't valid JSON."; return; }
-          btn.disabled = true;
-          const orig = btn.textContent;
-          btn.textContent = "Verifying…";
-          try {
-            await api.put(`/credentials/${id}/tokens`, { credentials_json: raw });
-            m.close();
-            toast("Tokens updated", "good");
-            render(root);
-          } catch (e) {
-            err.textContent = e.message || "Update failed.";
-          } finally {
-            btn.disabled = false;
-            btn.textContent = orig;
-          }
-        },
-      }),
-    ],
+    body: el("div", { class: "form" }, [method.root, flow.root, jsonRow, err]),
+    actions: [button("Cancel", { onClick: () => m.close() }), update],
+    onClose: () => flow.cancel(),
   });
+  syncMethod(method.value());
   return m;
 }

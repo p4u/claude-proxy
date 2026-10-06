@@ -509,7 +509,8 @@ published on host loopback next to Codex's 1455; the forwarder hop is
 | `internal/creds/` | Credential model, status management, proactive/reactive token refresh |
 | `internal/router/` | Conversation key derivation |
 | `internal/store/` | SQLite wrapper, schema, migrations (WAL mode), lock-contention retry |
-| `internal/ingest/` | OAuth `.credentials.json` parser/importer |
+| `internal/ingest/` | OAuth `.credentials.json` parser/importer; stores web OAuth sign-ins (`ImportOAuth`, `UpdateFromOAuth`) |
+| `internal/claudeoauth/` | Anthropic subscription sign-in from the web UI: Claude Code's manual-code OAuth flow (PKCE verifier kept in memory, code exchange, profile-based plan detection) |
 | `internal/admin/` | Admin REST API (`/admin/*` routes) |
 | `internal/usertoken/` | Named per-user bearer tokens; request identity (`Identity{IsAdmin,FullCapture,...}` in context); output-token usage limits (`limit.go`) |
 | `internal/usage/` | Anthropic usage API client, background poller, history storage + asciigraph chart |
@@ -676,6 +677,27 @@ the refresher compares against it, so a date the refresh window can never reach
 is simpler than threading a nullable expiry through every caller. The refresher
 also skips non-refreshable providers outright. CLI, TUI and web UI all render it
 as "never" rather than a date in 2126.
+
+### Adding an Anthropic subscription from the web UI
+
+*Add credential → Anthropic subscription* offers two methods. **Sign in with
+Claude** runs the same OAuth login as Claude Code's `/login` from the proxy's
+page: it opens claude.com's authorize page, the operator approves, Anthropic's
+callback page shows an authentication code, and pasting it back finishes the
+import — nothing to copy out of a terminal. **Paste credentials.json** is the
+original method. *Update tokens* offers the same choice for reconnecting an
+existing credential.
+
+The flow uses Claude Code's client ID and its manual redirect
+(`platform.claude.com/oauth/code/callback`), the only registered redirect that
+is not a localhost port, so it works for a proxy on a remote host; the scopes
+match a Claude Code subscription login, so the result is interchangeable with an
+imported `.credentials.json`. The PKCE verifier never leaves the server, a
+session is single-use and expires after 10 minutes, and the new token must read
+`/api/oauth/profile` — which also yields the plan (`max`/`pro`/`team`/
+`enterprise`) — before anything is stored. A fresh sign-in creates a new grant;
+it does not invalidate the account's other Claude Code logins, unlike
+re-importing a `.credentials.json` that another process also refreshes.
 
 ```bash
 make import FROM=path/to/.credentials.json LABEL=myaccount [WEIGHT=5]

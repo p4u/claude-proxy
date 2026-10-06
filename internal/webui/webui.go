@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/p4u/claude-proxy/internal/claudeoauth"
 	"github.com/p4u/claude-proxy/internal/codexgateway"
 	"github.com/p4u/claude-proxy/internal/creds"
 	"github.com/p4u/claude-proxy/internal/store"
@@ -32,6 +33,8 @@ type Server struct {
 	static  fs.FS
 	limiter *loginLimiter
 	codex   *codexgateway.Client
+	// claudeLogin holds in-flight Anthropic browser sign-ins.
+	claudeLogin *claudeoauth.Flow
 
 	codexOAuthMu   sync.Mutex
 	codexOAuthLast time.Time
@@ -62,6 +65,7 @@ func NewWithCodex(db *store.DB, refresher *creds.Refresher, password string, sec
 		static:        sub,
 		limiter:       newLoginLimiter(),
 		codex:         codex,
+		claudeLogin:   claudeoauth.New(),
 	}
 }
 

@@ -481,6 +481,16 @@ td.actions { text-align: right; white-space: nowrap; }
 .codex-oauth { display: flex; flex-direction: column; gap: 12px; }
 .codex-oauth[hidden] { display: none; }
 .codex-oauth__actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.method-choice { border: 0; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 8px; min-width: 0; }
+.method-choice[hidden] { display: none; }
+.method-choice legend { grid-column: 1 / -1; padding: 0; margin-bottom: 2px; }
+.method-choice__opt { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; cursor: pointer; background: var(--surface-1); }
+.method-choice__opt:has(input:checked) { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.method-choice__opt:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+.method-choice__opt input { margin-top: 3px; accent-color: var(--accent); }
+.method-choice__text { display: grid; gap: 2px; min-width: 0; }
+.method-choice__text strong { font-size: 13px; }
+.method-choice__text .field-help { margin: 0; }
 .form-grid { display: grid; grid-template-columns: 1fr 140px; gap: 12px; }
 .field-label { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-muted); }
 .input { width: 100%; background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: var(--r-sm); color: var(--ink); font-size: 13.5px; padding: 9px 11px; font-family: var(--sans); transition: border-color 0.14s, background 0.14s; }
