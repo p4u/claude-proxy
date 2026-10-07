@@ -132,6 +132,8 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, rest string) {
 		s.handleUsageCurrent(w, r)
 	case rest == "/usage/history" && r.Method == http.MethodGet:
 		s.handleUsageHistory(w, r)
+	case rest == "/routing/events" && r.Method == http.MethodGet:
+		s.handleRoutingEvents(w, r)
 	case rest == "/conversations" && r.Method == http.MethodGet:
 		s.handleConversations(w, r)
 	case strings.HasPrefix(rest, "/conversations/"):

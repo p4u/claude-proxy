@@ -133,6 +133,22 @@ CREATE TABLE IF NOT EXISTS usage_history (
 CREATE INDEX IF NOT EXISTS idx_usage_history_cred_time
   ON usage_history(credential_id, captured_at);
 
+-- Routing metadata only: conversation references are hashed, never prompts or
+-- credentials. No foreign keys: deleting an account must not erase its history.
+CREATE TABLE IF NOT EXISTS routing_event (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts           INTEGER NOT NULL,
+  policy       TEXT NOT NULL,
+  mode         TEXT NOT NULL,
+  kind         TEXT NOT NULL,
+  reason       TEXT NOT NULL,
+  conversation TEXT NOT NULL DEFAULT '',
+  source_id    TEXT NOT NULL DEFAULT '',
+  target_id    TEXT NOT NULL DEFAULT '',
+  evidence     TEXT NOT NULL DEFAULT '{}' CHECK(length(evidence) <= 2048)
+);
+CREATE INDEX IF NOT EXISTS idx_routing_event_ts ON routing_event(ts, id);
+
 CREATE TABLE IF NOT EXISTS codex_account_weight (
   name    TEXT PRIMARY KEY,
   weight  INTEGER NOT NULL DEFAULT 1

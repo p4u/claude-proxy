@@ -1,15 +1,18 @@
 package proxy
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/p4u/claude-proxy/internal/creds"
+	"github.com/p4u/claude-proxy/internal/pool"
 	"github.com/p4u/claude-proxy/internal/store"
 )
 
@@ -93,6 +96,161 @@ func TestRebalanceFailedNoticeWriteReannounces(t *testing.T) {
 	auths, _ := upstream.snapshot()
 	if len(auths) != 2 || auths[0] != auths[1] {
 		t.Fatalf("auths = %v", auths)
+	}
+}
+
+type shortRebalanceWriter struct{ *httptest.ResponseRecorder }
+
+func (w shortRebalanceWriter) Write(b []byte) (int, error) {
+	return w.ResponseRecorder.Write(b[:len(b)-1])
+}
+
+type failedFlushRebalanceWriter struct{ *httptest.ResponseRecorder }
+
+func (w failedFlushRebalanceWriter) FlushError() error { return io.ErrClosedPipe }
+
+type cancelledRebalanceWriter struct {
+	*httptest.ResponseRecorder
+	cancel context.CancelFunc
+}
+
+func (w cancelledRebalanceWriter) Write(b []byte) (int, error) {
+	n, err := w.ResponseRecorder.Write(b)
+	w.cancel()
+	return n, err
+}
+
+func TestRebalanceIncompleteDeliveryReannounces(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		wrap func(*httptest.ResponseRecorder, context.CancelFunc) http.ResponseWriter
+	}{
+		{"short write", func(r *httptest.ResponseRecorder, _ context.CancelFunc) http.ResponseWriter {
+			return shortRebalanceWriter{r}
+		}},
+		{"flush error", func(r *httptest.ResponseRecorder, _ context.CancelFunc) http.ResponseWriter {
+			return failedFlushRebalanceWriter{r}
+		}},
+		{"cancelled context", func(r *httptest.ResponseRecorder, cancel context.CancelFunc) http.ResponseWriter {
+			return cancelledRebalanceWriter{r, cancel}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var up rebalanceUpstream
+			h, cs, db, _ := setupProxy(t, up.handler("application/json", rebalanceRespJSON))
+			seedRebalancePin(t, db, cs, time.Now().Add(-2*time.Hour).Unix())
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(rebalanceReqBody)).WithContext(ctx)
+			req.Header.Set("X-Router-Conversation-ID", rebalanceConvID)
+			h.ServeHTTP(tc.wrap(httptest.NewRecorder(), cancel), req)
+			rw := postRebalance(t, h, "/v1/messages", rebalanceReqBody)
+			if rw.Header().Get("X-Router-Rebalance") != "pending" {
+				t.Fatalf("incomplete delivery authorized switch: %v", rw.Header())
+			}
+			auths, _ := up.snapshot()
+			if len(auths) != 2 || auths[0] != auths[1] {
+				t.Fatalf("auths = %v", auths)
+			}
+		})
+	}
+}
+
+func TestRebalanceAccountAffinitySurvivesOptOutAndRestart(t *testing.T) {
+	var up rebalanceUpstream
+	h, cs, db, _ := setupProxy(t, up.handler("application/json", rebalanceRespJSON))
+	seedRebalancePin(t, db, cs, time.Now().Add(-2*time.Hour).Unix())
+	h.RebalanceSessions = false
+	body := `{"model":"claude-sonnet-5","container":"container_test","messages":[]}`
+	first := postRebalance(t, h, "/v1/messages", body)
+	if first.Code != http.StatusOK || first.Header().Get("X-Router-Rebalance") != "" {
+		t.Fatalf("account-bound response = %d %v", first.Code, first.Header())
+	}
+	// Simulate a restart and re-enable elective balancing. Later turns may not
+	// repeat the resource reference, but the binding must remain account-bound.
+	h.pool = pool.New(db)
+	h.RebalanceSessions = true
+	for range 2 {
+		rw := postRebalance(t, h, "/v1/messages", rebalanceReqBody)
+		if rw.Code != http.StatusOK || rw.Header().Get("X-Router-Rebalance") != "" {
+			t.Fatalf("account-bound history lost affinity: %d %v", rw.Code, rw.Header())
+		}
+	}
+	assertPinnedTo(t, db, cs[0].ID)
+}
+
+// A 200 header is not proof of a completed generation. Known upstream read
+// failures, SSE error events, and a stream ending before message_stop all leave
+// the notice unacknowledged. The next request reannounces on the source account;
+// only a subsequent completed response authorizes the switch.
+func TestRebalanceIncompleteResponseReannounces(t *testing.T) {
+	const streamError = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"try later\"}}\n\n"
+	for _, tc := range []struct {
+		name, contentType string
+		body              []byte
+		encoding          string
+		shortBody         bool
+	}{
+		{"upstream read failure", "application/json", []byte(rebalanceRespJSON), "", true},
+		{"truncated JSON", "application/json", []byte(`{"type":"message","content":[`), "", false},
+		{"SSE early EOF", "text/event-stream", []byte(rebalanceSSEHead), "", false},
+		{"SSE error", "text/event-stream", []byte(rebalanceSSEHead + streamError), "", false},
+		{"SSE error then stop", "text/event-stream", []byte(rebalanceSSEHead + streamError + rebalanceSSETail), "", false},
+		{"gzip SSE early EOF", "text/event-stream", gzipBytes(t, []byte(rebalanceSSEHead)), "gzip", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var up rebalanceUpstream
+			h, cs, db, _ := setupProxy(t, func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				up.record(r.Header.Get("Authorization"), string(body))
+				if up.authCount() == 1 {
+					w.Header().Set("Content-Type", tc.contentType)
+					if tc.encoding != "" {
+						w.Header().Set("Content-Encoding", tc.encoding)
+					}
+					if tc.shortBody {
+						w.Header().Set("Content-Length", strconv.Itoa(len(tc.body)+10))
+					}
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write(tc.body)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, rebalanceRespJSON)
+			})
+			seedRebalancePin(t, db, cs, time.Now().Add(-2*time.Hour).Unix())
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(rebalanceStreamReq))
+			req.Header.Set("X-Router-Conversation-ID", rebalanceConvID)
+			// Keep gzip in the relay, rather than letting net/http decompress it.
+			req.Header.Set("Accept-Encoding", "gzip")
+			first := httptest.NewRecorder()
+			h.ServeHTTP(first, req)
+			if first.Code != http.StatusOK || first.Header().Get("X-Router-Rebalance") != "pending" {
+				t.Fatalf("first response = %d %v", first.Code, first.Header())
+			}
+			if first.Body.String() != string(tc.body) {
+				t.Fatalf("incomplete body changed: got %q, want %q", first.Body.String(), tc.body)
+			}
+			if up.authCount() != 1 {
+				t.Fatalf("partial response replayed automatically: %d requests", up.authCount())
+			}
+			assertPinnedTo(t, db, cs[0].ID)
+
+			second := postRebalance(t, h, "/v1/messages", rebalanceReqBody)
+			if second.Header().Get("X-Router-Rebalance") != "pending" {
+				t.Fatalf("incomplete response authorized switch: %v", second.Header())
+			}
+			assertPinnedTo(t, db, cs[0].ID)
+			third := postRebalance(t, h, "/v1/messages", rebalanceReqBody)
+			if third.Header().Get("X-Router-Rebalance") != "switched" {
+				t.Fatalf("completed response did not authorize switch: %v", third.Header())
+			}
+			auths, _ := up.snapshot()
+			if len(auths) != 3 || auths[0] != "Bearer "+cs[0].AccessToken || auths[1] != auths[0] || auths[2] != "Bearer "+cs[1].AccessToken {
+				t.Fatalf("auths = %v", auths)
+			}
+		})
 	}
 }
 

@@ -120,8 +120,8 @@ func TestRebalanceRevalidatesAndReannouncesAfterRestart(t *testing.T) {
 	l.Release(true)
 	execRebalance(t, db, `UPDATE credentials SET status='disabled' WHERE id=?`, cs[1].ID)
 	l = acquireRebalance(t, p, opts)
-	if l.Credential.ID != cs[0].ID || l.Rebalance != "" {
-		t.Fatalf("stale destination used: %+v", l)
+	if l.Credential.ID != cs[0].ID || l.Rebalance != "cancelled" || l.RebalanceReason != "no-longer-eligible" {
+		t.Fatalf("stale destination not cancelled: %+v", l)
 	}
 }
 

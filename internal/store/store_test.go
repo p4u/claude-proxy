@@ -38,7 +38,8 @@ func TestMigrateLegacyConversationBoundAt(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Recreate the previous conversations shape in this synthetic database.
-	if _, err := db.Exec(`ALTER TABLE conversations DROP COLUMN bound_at;
+	if _, err := db.Exec(`DROP INDEX idx_conversations_bound_at;
+		ALTER TABLE conversations DROP COLUMN bound_at;
 		INSERT INTO credentials (id,access_token,refresh_token,expires_at,status,created_at) VALUES ('test','fake','fake',4100000000,'active',1700000000);
 		INSERT INTO conversations (id,credential_id,created_at,last_seen_at) VALUES ('old','test',1700000000,1700000100)`); err != nil {
 		db.Close()

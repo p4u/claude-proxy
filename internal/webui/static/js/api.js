@@ -163,6 +163,22 @@ export const api = {
     request("GET", `/conversations/${enc(convID)}/messages?${page(limit, offset)}`),
 
   conversations: (limit = 100) => request("GET", `/conversations?limit=${limit}`),
+
+  // Routing decision log: what the elective router did (live) or only
+  // considered (shadow). Cursor-paginated by descending event id — pass the
+  // previous response's next_before as `before` to continue, omit it to start
+  // at the newest. Envelope: {items, next_before, retention_days}.
+  routingEvents: ({ limit = 50, before } = {}) => {
+    const lim = Number(limit);
+    // Number(null) is 0, which would page past every row — only real values
+    // (number or numeric string) may become a cursor.
+    const cur = before != null && before !== "" ? Number(before) : NaN;
+    return request(
+      "GET",
+      `/routing/events?limit=${Number.isFinite(lim) ? Math.min(Math.max(Math.trunc(lim), 1), 200) : 50}` +
+        (Number.isFinite(cur) ? `&before=${Math.trunc(cur)}` : ""),
+    );
+  },
 };
 
 // Markdown export is a normal navigation, not an XHR: same-origin cookie auth

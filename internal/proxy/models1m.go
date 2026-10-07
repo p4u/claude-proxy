@@ -589,8 +589,9 @@ func (h *Handler) serveModels(w http.ResponseWriter, r *http.Request, start time
 		}
 
 		rec := newBufferedRW()
-		status, rxBytes, _, _ := h.forward(rec, r, nil, cred, true, false)
-		h.logRequest(r.Context(), r.URL.Path, "", cred.ID, status, 0, rxBytes, time.Since(start), tokenUsage{})
+		result := h.forward(rec, r, nil, cred, true, false)
+		status := result.status
+		h.logRequest(r.Context(), r.URL.Path, "", cred.ID, status, 0, result.rxBytes, time.Since(start), tokenUsage{})
 
 		if status != http.StatusOK {
 			h.log.Warn("models: provider fetch failed, omitting its models",
@@ -617,7 +618,7 @@ func (h *Handler) serveModels(w http.ResponseWriter, r *http.Request, start time
 		lastErr = nil
 		h.log.Info("models discovery",
 			"provider", string(p.ID), "cred", cred.ID, "label", cred.Label,
-			"models", len(entries), "bytes_received", rxBytes)
+			"models", len(entries), "bytes_received", result.rxBytes)
 	}
 
 	if answered == 0 {

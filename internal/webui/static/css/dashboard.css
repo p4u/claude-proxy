@@ -16,3 +16,111 @@
 @media (max-width: 860px) {
   .dash-charts { grid-template-columns: 1fr; }
 }
+
+/* ---------- Routing activity panel (full width, below the charts) ---------- */
+/* Scoped under .routing, which only the dashboard renders, so nothing bleeds
+   into other pages. Everything wraps and wraps-anywhere: the panel must never
+   be the reason the page grows a horizontal scrollbar. */
+.routing {
+  margin-top: 22px;
+  padding: 16px 18px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+.routing__head { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; flex-wrap: wrap; }
+.routing__intro { min-width: 0; }
+.routing__title { font-size: 16px; font-weight: 640; letter-spacing: -0.01em; }
+.routing__sub { color: var(--ink-2); font-size: 12.5px; line-height: 1.45; margin-top: 3px; max-width: 72ch; }
+.routing__tools { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; flex: none; }
+.routing__retention { font-family: var(--mono); font-size: 10.5px; color: var(--ink-muted); letter-spacing: 0.05em; }
+.routing__retention:empty { display: none; }
+
+.routing__legend { display: flex; flex-wrap: wrap; gap: 6px 16px; }
+.routing__lg { display: inline-flex; align-items: center; gap: 7px; }
+.routing__lg .badge { font-size: 10px; padding: 2px 8px 2px 7px; flex: none; }
+.routing__lg-txt { font-size: 11.5px; color: var(--ink-2); }
+
+.routing__list { display: flex; flex-direction: column; min-width: 0; }
+.routing__list .empty,
+.routing__list .loading { border: 1px dashed var(--border); border-radius: var(--r-sm); margin-top: 2px; }
+
+/* Shadow badge kind — an evaluation, so outlined rather than filled. */
+.badge--shadow { color: var(--accent); background: var(--accent-soft); border-style: dashed; border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+
+.rev { display: flex; flex-direction: column; gap: 4px; padding: 10px 2px; border-bottom: 1px solid var(--border); min-width: 0; }
+.rev:last-child { border-bottom: none; }
+/* Shadow rows never moved a conversation — a dashed accent edge marks the
+   "reasoned about, not executed" rows at a glance. */
+.rev--shadow { border-left: 3px dashed color-mix(in srgb, var(--accent) 55%, transparent); padding-left: 11px; }
+.rev__main { display: flex; align-items: center; gap: 8px 10px; flex-wrap: wrap; min-width: 0; }
+.rev__main .badge { flex: none; }
+.rev__time { font-family: var(--mono); font-size: 10.5px; color: var(--ink-muted); white-space: nowrap; flex: none; }
+.rev__policy { font-family: var(--mono); font-size: 10.5px; color: var(--ink-2); text-transform: uppercase; letter-spacing: 0.08em; flex: none; }
+.rev__path { font-family: var(--mono); font-size: 12px; font-weight: 600; letter-spacing: 0.03em; overflow-wrap: anywhere; }
+.rev__conv { font-family: var(--mono); font-size: 10.5px; color: var(--ink-muted); letter-spacing: 0.04em; overflow-wrap: anywhere; margin-left: auto; }
+.rev__mode { font-family: var(--mono); font-size: 10px; color: var(--signal); border: 1px dashed color-mix(in srgb, var(--signal) 55%, transparent); border-radius: 20px; padding: 1px 8px; flex: none; }
+.rev__reason { font-size: 12.5px; color: var(--ink-2); line-height: 1.45; overflow-wrap: anywhere; margin: 0; }
+.rev__chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.rev__chip {
+  font-family: var(--mono); font-size: 10.5px; color: var(--ink-2);
+  border: 1px solid var(--border); border-radius: 20px; padding: 2px 9px;
+  overflow-wrap: anywhere; max-width: 100%;
+}
+.rev__chip--muted { color: var(--ink-muted); }
+
+/* Evidence block under a row: headline chips plus a collapsible details
+   element holding the bounded known fields and the full blocker list. */
+.rev__ev { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.rev__det {
+  border: 1px solid var(--border); border-radius: var(--r-sm);
+  background: var(--surface-2); max-width: 100%; min-width: 0;
+  overflow-wrap: anywhere;
+}
+.rev__det > summary {
+  font-family: var(--mono); font-size: 10.5px; text-transform: uppercase;
+  letter-spacing: 0.08em; color: var(--ink-muted); cursor: pointer;
+  padding: 6px 11px; user-select: none; list-style: none;
+}
+.rev__det > summary::-webkit-details-marker { display: none; }
+.rev__det > summary::before { content: "▸ "; }
+.rev__det[open] > summary::before { content: "▾ "; }
+.rev__det[open] > summary { border-bottom: 1px solid var(--border); }
+.rev__det-body { display: flex; flex-direction: column; gap: 12px; padding: 11px 13px; }
+.rev__det-sec { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.rev__det-h {
+  font-family: var(--mono); font-size: 10px; text-transform: uppercase;
+  letter-spacing: 0.09em; color: var(--ink-muted);
+}
+.rev__kvs { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.rev__kv { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; min-width: 0; }
+.rev__kv-k { font-size: 11.5px; color: var(--ink-2); flex: none; }
+.rev__kv-v {
+  font-family: var(--mono); font-size: 11.5px; color: var(--ink);
+  font-variant-numeric: tabular-nums; text-align: right;
+  overflow-wrap: anywhere; max-width: 100%;
+}
+.rev__det-list { margin: 0; padding: 0 0 0 18px; display: flex; flex-direction: column; gap: 3px; }
+.rev__det-list li { font-size: 11.5px; color: var(--ink-2); line-height: 1.45; overflow-wrap: anywhere; }
+
+.routing__err {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  border: 1px solid color-mix(in srgb, var(--critical) 45%, transparent);
+  border-left-width: 3px; border-radius: var(--r-sm);
+  padding: 8px 11px; font-size: 12.5px; color: var(--ink-2);
+}
+.routing__err[hidden] { display: none; }
+.routing__foot { display: flex; align-items: center; justify-content: space-between; gap: 6px 10px; flex-wrap: wrap; border-top: 1px solid var(--border); padding-top: 10px; }
+.routing__count { font-family: var(--mono); font-size: 11px; color: var(--ink-muted); }
+.routing__note { font-size: 11.5px; color: var(--ink-2); line-height: 1.5; border-top: 1px solid var(--border); padding-top: 10px; }
+.routing__note strong { color: var(--ink); font-weight: 600; }
+
+@media (max-width: 560px) {
+  /* Squeeze the leading gap so the badge row still fits one line where it can. */
+  .rev__main { gap: 6px 8px; }
+  .rev__conv { margin-left: 0; }
+  .routing__foot { flex-direction: column-reverse; align-items: stretch; }
+  .routing__foot .btn { width: 100%; }
+  .routing__count { text-align: center; }
+}

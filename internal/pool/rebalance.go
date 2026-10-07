@@ -20,36 +20,70 @@ const (
 	rebalanceLatestAge   = 15 * time.Minute
 	rebalancePreviousAge = 30 * time.Minute
 	rebalanceSampleGap   = 5 * time.Minute
+	rebalanceResetJitter = 2 * time.Second
+	rebalanceDrainWait   = 2 * time.Second
 )
 
-// RequestOptions controls elective migration only. Emergency failover always
-// runs first. ObserveOnly participates in leases but cannot announce or switch.
+// RequestOptions gates elective migration and identifies account-bound history.
+// Emergency binding runs first, respecting AccountBound. ObserveOnly requests
+// participate in leases but cannot announce or switch.
 type RequestOptions struct {
 	Rebalance   bool
 	ObserveOnly bool
+	// AccountBound permanently disables elective handoffs for this binding,
+	// including later requests that omit account-scoped objects.
+	AccountBound bool
 }
 
 type rebalancePlan struct {
 	source, target string
 	created        time.Time
 	notified       bool
+	conversation   string // hashed reference only; never a raw client-supplied key
+	lastDeferred   time.Time
+	done           chan struct{} // closed under p.mu when replaced, cancelled, or switched
+	reason         string        // completion reason, also guarded by p.mu
 }
 
 type sessionState struct {
-	inflight  int
-	drained   chan struct{}
-	pending   *rebalancePlan
-	lastCheck time.Time
-	lastUsed  time.Time
+	inflight     int
+	waiting      int
+	drained      chan struct{}
+	pending      *rebalancePlan
+	lastCheck    time.Time
+	lastUsed     time.Time
+	drainWait    time.Duration // zero uses rebalanceDrainWait; test-only override
+	accountBound bool          // sticky; bindLocked hydrates/persists the durable flag
+}
+
+// finishPlan wakes every waiter, even when the source still has live streams.
+// The caller holds p.mu, including when inspecting the completed plan's reason.
+func (p *Pool) finishPlan(s *sessionState, reason string) {
+	if plan := s.pending; plan != nil {
+		// A successful switch was audited in the pin-update transaction. Other
+		// outcomes are nonblocking, best-effort observations, emitted once.
+		if reason != "switched" {
+			p.recordRouting(plan.routingEvent("cancelled", reason, p.now()))
+		}
+		plan.reason = reason
+		close(plan.done)
+		s.pending = nil
+	}
+}
+
+func (plan *rebalancePlan) routingEvent(kind, reason string, now time.Time) store.RoutingEvent {
+	return store.RoutingEvent{TS: now.Unix(), Policy: "rebalance", Mode: "live", Kind: kind, Reason: reason,
+		Conversation: plan.conversation, SourceID: plan.source, TargetID: plan.target}
 }
 
 // Lease holds a credential for one entire upstream request, including streaming.
 // Call Release on EVERY exit path. All requests sharing a Pool must acquire a
 // lease for in-flight protection; leases do not coordinate separate processes.
 type Lease struct {
-	Credential *creds.Credential
-	IsNew      bool
-	Rebalance  string // empty, "pending", or "switched"
+	Credential      *creds.Credential
+	IsNew           bool
+	Rebalance       string // empty, "pending", "switched", "deferred", or "cancelled"
+	RebalanceReason string // bounded, account-neutral diagnostic for deferred/cancelled
 
 	pool  *Pool
 	state *sessionState
@@ -57,9 +91,10 @@ type Lease struct {
 	once  sync.Once
 }
 
-// Release reports whether the pending notice was emitted on a successful
-// response without a detected client write failure. It is NOT a client
-// acknowledgment: HTTP cannot prove the client read the headers. Idempotent.
+// Release reports whether the pending notice was emitted on a completed,
+// successful response without a detected upstream, parser, or client write
+// failure. It is NOT a client acknowledgment: HTTP cannot prove the client read
+// the headers. Idempotent.
 func (l *Lease) Release(notified bool) {
 	l.once.Do(func() {
 		p := l.pool
@@ -81,10 +116,11 @@ func (l *Lease) Release(notified bool) {
 // announced rebalancing. Selection and lease registration share p.mu; registering
 // after Bind would allow a switch in the gap before the request was counted.
 //
-// Once a notice has completed, new generation requests wait for earlier leases
-// to drain. The wait is cancellable and holds neither a mutex nor a transaction.
-// This prevents continuous overlapping generation requests from deferring a
-// switch forever. Count-only requests never initiate or execute a migration.
+// Once a notice has completed, new generation requests briefly wait for earlier
+// leases to drain. The wait holds neither a mutex nor a transaction, and wakes on
+// cancellation, notice expiry, or its bounded budget. A timed-out request keeps
+// the usable current pin; it never interrupts or forcibly moves an old stream.
+// Count-only requests never initiate or execute a migration.
 func (p *Pool) AcquireScoped(ctx context.Context, convID string, prov provider.ID, scope string, allowed []string, opts RequestOptions) (*Lease, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -94,9 +130,22 @@ func (p *Pool) AcquireScoped(ctx context.Context, convID string, prov provider.I
 		s = &sessionState{}
 		p.sessions[key] = s
 	}
-	eligible := opts.Rebalance && !opts.ObserveOnly && provider.Get(prov).PollsUsage && scope == "" && allowed == nil
+	// Latch before binding so the emergency path can apply the same safety
+	// policy. bindLocked may also restore this flag from durable storage.
+	if opts.AccountBound {
+		s.accountBound = true
+	}
+	if s.accountBound {
+		p.finishPlan(s, "account-bound")
+	}
 	touch := true
+	var waited *rebalancePlan
+	var deadline time.Time
+	budgetExpired := false
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		c, isNew, err := p.bindLocked(ctx, convID, prov, scope, allowed, touch)
 		if err != nil {
 			return nil, err
@@ -104,56 +153,130 @@ func (p *Pool) AcquireScoped(ctx context.Context, convID string, prov provider.I
 		touch = false // a drain wait must not count the request twice
 		now := p.now()
 		s.lastUsed = now
-		if isNew || !opts.Rebalance || c.Status != creds.StatusActive ||
-			(s.pending != nil && (s.pending.source != c.ID || now.Sub(s.pending.created) >= rebalanceNoticeTTL)) {
-			s.pending = nil
-		}
-		if eligible && s.pending != nil && s.pending.notified && s.inflight > 0 {
-			drained := s.drained
-			p.mu.Unlock()
-			select {
-			case <-ctx.Done():
-				p.mu.Lock()
-				return nil, ctx.Err()
-			case <-drained:
-				p.mu.Lock()
-				continue // re-run emergency failover and revalidate after waiting
-			}
+		eligible := opts.Rebalance && !opts.ObserveOnly && !s.accountBound && provider.Get(prov).PollsUsage && scope == "" && allowed == nil
+		switch {
+		case s.accountBound:
+			p.finishPlan(s, "account-bound")
+		case isNew || s.pending != nil && s.pending.source != c.ID:
+			p.finishPlan(s, "pin-changed")
+		case !opts.Rebalance:
+			p.finishPlan(s, "disabled")
+		case c.Status != creds.StatusActive:
+			p.finishPlan(s, "source-unusable")
+		case s.pending != nil && now.Sub(s.pending.created) >= rebalanceNoticeTTL:
+			p.finishPlan(s, "notice-expired")
 		}
 		l := &Lease{Credential: c, IsNew: isNew, pool: p, state: s}
-		if eligible && !isNew && c.Status == creds.StatusActive &&
+		// A waiter belongs to one plan, never a replacement. Other waiters may
+		// already have switched the pin; in that case just join the new pin.
+		planEnded := waited != nil && s.pending != waited
+		if planEnded && c.ID == waited.source {
+			l.Rebalance, l.RebalanceReason = "cancelled", waited.reason
+		}
+		if waited != nil && !time.Now().Before(deadline) {
+			budgetExpired = true
+		}
+		if eligible && !planEnded && !budgetExpired && s.pending != nil && s.pending.notified && s.inflight > 0 {
+			if waited == nil {
+				waited = s.pending
+				budget := s.drainWait
+				if budget <= 0 {
+					budget = rebalanceDrainWait
+				}
+				deadline = time.Now().Add(budget)
+			}
+			reason := p.waitForDrain(ctx, s, waited, deadline, now)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if reason == "notice-expired" && s.pending == waited {
+				p.finishPlan(s, reason)
+			} else if reason == "drain-timeout" {
+				budgetExpired = true
+			}
+			continue // re-run emergency failover and revalidate after every wake
+		}
+		if eligible && !planEnded && !isNew && c.Status == creds.StatusActive &&
 			(s.pending != nil || now.Sub(s.lastCheck) >= rebalanceCheckEvery) {
 			s.lastCheck = now
 			var target *creds.Credential
 			err := store.Retry(ctx, func() error {
 				var err error
-				target, err = p.rebalanceOnce(ctx, key, c, s.pending, now)
+				target, err = p.rebalanceOnce(ctx, key, c, s.pending, now, !budgetExpired)
 				return err
 			})
 			if err != nil {
 				// An optional optimization must not turn a working pin into a 502.
 				p.log.Warn("session rebalance check failed", "conv", key, "err", err)
-				s.pending = nil
+				if s.pending != nil {
+					l.Rebalance, l.RebalanceReason = "cancelled", "revalidation-failed"
+				}
+				p.finishPlan(s, "revalidation-failed")
 			} else if target == nil {
-				s.pending = nil
+				if s.pending != nil {
+					l.Rebalance, l.RebalanceReason = "cancelled", "no-longer-eligible"
+				}
+				p.finishPlan(s, "no-longer-eligible")
 			} else if s.pending != nil && s.pending.notified {
-				l.Credential, l.IsNew, l.Rebalance = target, true, "switched"
-				p.destinations[target.ID] = now
-				s.pending = nil
-				p.log.Info("session rebalanced", "conv", key, "from", c.ID, "to", target.ID)
+				if budgetExpired {
+					l.Rebalance, l.RebalanceReason = "deferred", "drain-timeout"
+					if s.pending.lastDeferred.IsZero() || now.Sub(s.pending.lastDeferred) >= time.Minute {
+						p.recordRouting(s.pending.routingEvent("deferred", "drain-timeout", now))
+						s.pending.lastDeferred = now
+					}
+				} else {
+					l.Credential, l.IsNew, l.Rebalance = target, true, "switched"
+					p.destinations[target.ID] = now
+					p.finishPlan(s, "switched")
+					p.log.Info("session rebalanced", "conv", key, "from", c.ID, "to", target.ID)
+				}
 			} else {
 				if s.pending == nil {
-					s.pending = &rebalancePlan{source: c.ID, target: target.ID, created: now}
+					s.pending = &rebalancePlan{source: c.ID, target: target.ID, created: now,
+						conversation: store.ConversationReference(key), done: make(chan struct{})}
+					p.recordRouting(s.pending.routingEvent("pending", "usage-advantage", now))
 					p.log.Info("session rebalance pending", "conv", key, "from", c.ID, "to", target.ID)
 				}
 				l.Rebalance, l.plan = "pending", s.pending
 			}
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 		if s.inflight == 0 {
 			s.drained = make(chan struct{})
 		}
 		s.inflight++
 		return l, nil
+	}
+}
+
+// waitForDrain temporarily releases p.mu. One stopped timer covers both the
+// total request wait budget (never reset by a wake) and the notice's remaining
+// lifetime. No polling, background goroutine, or transaction spans this wait.
+func (p *Pool) waitForDrain(ctx context.Context, s *sessionState, plan *rebalancePlan, deadline, now time.Time) string {
+	delay, reason := time.Until(deadline), "drain-timeout"
+	if ttl := plan.created.Add(rebalanceNoticeTTL).Sub(now); ttl <= delay {
+		delay, reason = ttl, "notice-expired"
+	}
+	timer := time.NewTimer(max(0, delay))
+	defer timer.Stop()
+	drained := s.drained
+	s.waiting++
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		s.waiting--
+	}()
+	select {
+	case <-ctx.Done():
+		return ""
+	case <-drained:
+		return ""
+	case <-plan.done:
+		return ""
+	case <-timer.C:
+		return reason
 	}
 }
 
@@ -174,7 +297,8 @@ func (c rebalanceCandidate) fresh(now time.Time) bool {
 	}
 	a, b := c.samples[0], c.samples[1]
 	if a.captured-b.captured < int64(rebalanceSampleGap/time.Second) ||
-		a.fhReset != b.fhReset || a.sdReset != b.sdReset {
+		!sameRebalanceWindow(a.fhReset, b.fhReset, now.Unix()) ||
+		!sameRebalanceWindow(a.sdReset, b.sdReset, now.Unix()) {
 		return false
 	}
 	for i, s := range c.samples {
@@ -185,12 +309,24 @@ func (c rebalanceCandidate) fresh(now time.Time) bool {
 		age := now.Sub(time.Unix(s.captured, 0))
 		// Comparisons also reject NaN/Inf; missing reset timestamps do not
 		// invent urgency, while elapsed windows are never treated as empty.
-		if age < 0 || age > ageLimit || !(s.fh >= 0 && s.fh < 100 && s.sd >= 0 && s.sd < 100) ||
-			(s.fhReset > 0 && s.fhReset <= now.Unix()) || (s.sdReset > 0 && s.sdReset <= now.Unix()) {
+		if age < 0 || age > ageLimit || !(s.fh >= 0 && s.fh < 100 && s.sd >= 0 && s.sd < 100) {
 			return false
 		}
 	}
 	return true
+}
+
+// A known, still-future reset may move a couple of seconds between polls.
+// Missing resets agree only with other missing resets; never hide a rollover,
+// elapsed window, or invalid timestamp behind the jitter allowance.
+func sameRebalanceWindow(a, b, now int64) bool {
+	if a == 0 && b == 0 {
+		return true
+	}
+	if a <= 0 || b <= 0 || a <= now || b <= now {
+		return false
+	}
+	return max(a, b)-min(a, b) <= int64(rebalanceResetJitter/time.Second)
 }
 
 func (c rebalanceCandidate) betterThan(source rebalanceCandidate, now time.Time) bool {
@@ -221,12 +357,13 @@ func rebalanceAdvantage(oldWeight int, old rebalanceSample, weight int, target r
 // rebalanceOnce revalidates an announced destination in the same short write
 // transaction that changes the pin. Unlike normal new-binding selection, it has
 // no limited-credential fallback and never bootstraps missing usage as 0%.
-func (p *Pool) rebalanceOnce(ctx context.Context, key string, current *creds.Credential, plan *rebalancePlan, now time.Time) (*creds.Credential, error) {
-	// Discovery only announces intent, so it needs no SQLite write lock. An
-	// acknowledged plan rechecks everything inside an immediate transaction.
+func (p *Pool) rebalanceOnce(ctx context.Context, key string, current *creds.Credential, plan *rebalancePlan, now time.Time, allowSwitch bool) (*creds.Credential, error) {
+	// Discovery and timeout validation need no SQLite write lock. Only an
+	// acknowledged plan with a drained source may change the pin, rechecking
+	// everything inside an immediate transaction.
 	var reader rebalanceReader = p.db
 	var tx *sql.Tx
-	if plan != nil && plan.notified {
+	if allowSwitch && plan != nil && plan.notified {
 		var err error
 		tx, err = p.db.BeginTx(ctx, nil)
 		if err != nil {
@@ -283,6 +420,12 @@ func (p *Pool) rebalanceOnce(ctx context.Context, key string, current *creds.Cre
 		if err != nil || n != 1 {
 			return nil, err
 		}
+		if err := store.AppendRoutingEvent(ctx, tx, store.RoutingEvent{
+			TS: now.Unix(), Policy: "rebalance", Mode: "live", Kind: "switched", Reason: "usage-advantage",
+			Conversation: store.ConversationReference(key), SourceID: current.ID, TargetID: target.ID,
+		}); err != nil {
+			return nil, err // an unauditable elective move must roll back
+		}
 		if err := tx.Commit(); err != nil {
 			return nil, err
 		}
@@ -328,7 +471,8 @@ func (p *Pool) pruneRebalances(now time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for key, s := range p.sessions {
-		if s.inflight == 0 && now.Sub(s.lastUsed) > rebalancePreviousAge {
+		if s.inflight == 0 && s.waiting == 0 && now.Sub(s.lastUsed) > rebalancePreviousAge {
+			p.finishPlan(s, "notice-expired")
 			delete(p.sessions, key)
 		}
 	}

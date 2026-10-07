@@ -240,6 +240,27 @@ meter.
 - `POST /api/users/{id}/rotate` → `{token}`
 - `DELETE /api/users/{id}`
 
+### Routing activity
+- `GET /api/routing/events?limit=50&before=123` →
+  `{items:[{id,ts,policy,mode,kind,reason,conversation,source_id,target_id,evidence}],next_before,retention_days:7}`.
+  UI cookie authentication is required; no user-token or public session lookup.
+  `limit` is 1–200; `before` is an optional positive event ID (exclusive).
+  `ts` uses Unix seconds. `conversation` is a hashed reference, not the client ID.
+  Results are newest-ID first; `next_before:null` ends pagination (an exact full
+  final page may be followed by an empty page). Responses are `no-store`.
+- `policy=rebalance,mode=live`: `pending`, `switched`, `deferred`, `cancelled`.
+  Only `switched` confirms a pin change; it commits in the same transaction as
+  the binding. Pending records mean a plan was prepared, not client acknowledgement.
+  Other events use a bounded best-effort queue; shutdown/overflow/write failure can
+  leave gaps. `coverage_gap` reports observed queue overflow.
+- `policy=expiry,mode=shadow,kind=shadow_decision`: per-account unused-weekly-quota
+  forecasts, **never actual moves or per-conversation allocation recommendations**.
+  Evidence carries numeric observations and readiness blockers; missing quota is
+  unknown, not 0%. No prompts, credential secrets, endpoints or raw error messages are recorded.
+- Retention targets seven days or 50,000 newest events, purged in batches of 1,000.
+  History survives account deletion. The dashboard shows the latest history
+  independently of the traffic-chart period, with Refresh and bounded Load older.
+
 ### Conversations
 - `GET /api/conversations?limit=100` → recent bindings (reuse admin listConvs query).
 
@@ -252,7 +273,9 @@ queries must use the indexes on `request_log(ts)` / `usage_history(credential_id
 - **Dashboard**: header stat tiles and six aligned, equally sized chart panels:
   token totals, request totals, requests by user/credential, tokens by user/credential,
   latency, and new-session credential picks. A shared period selector
-  (1h/6h/24h/7d/30d/custom) drives all panels. The grid stacks on small screens.
+  (1h/6h/24h/7d/30d/custom) drives all charts. The grid stacks on small screens.
+  A full-width Routing activity panel below them has independent cursor paging,
+  live-vs-shadow badges, reason/evidence details, and a local Refresh control.
 - **Subscriptions**: provider-grouped account cards, local provider badges, provider
   filters, and an availability overview. Actual quota windows retain their reset
   countdowns; providers without a quota API show observed tokens without invented

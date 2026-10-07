@@ -535,8 +535,8 @@ published on host loopback next to Codex's 1455; the forwarder hop is
 **Proactive long-session rebalancing** (`internal/pool/rebalance.go`): long-lived
 pins may move to a substantially better-provisioned Anthropic subscription after
 an API header notice — on by default (`REBALANCE_SESSIONS`, `--rebalance-sessions`);
-the Codex sidecar and emergency failover paths are untouched (exhaustion of a
-pinned credential is still handled by the pre-existing emergency rebind). Dwell/
+the Codex sidecar is untouched; ordinary portable conversations retain emergency
+failover, while account-bound conversations must keep their account (see below). Dwell/
 cooldown both key off the durable `bound_at` timestamp: pins must be at least
 an hour old, with at most one proactive switch per conversation per hour; this
 survives restart. A separate per-process gate allows at most one elective move
@@ -545,20 +545,63 @@ not a fixed-time scheduler. A destination qualifies when its token expiry is
 > 5 min in the future, its 5h/7d usage is ≤ 60%, its effective score is
 ≥ 4× the source's **and** (unweighted room score ≥ 2× **or** weekly urgency
 factor ≥ 4×), required for the two latest usage samples (≥ 5 min apart,
-latest ≤ 15 min old, older ≤ 30 min old, resets consistent/future when
-known). The first successful response on the old account announces the
+latest ≤ 15 min old, older ≤ 30 min old, resets consistent within 2 seconds and
+future when known; unknown-to-known transitions and real rollovers are rejected).
+Only a completed successful response acknowledges the notice (SSE must reach
+`message_stop` without a detected error/read/write failure). The first successful
+response on the old account announces the
 move (`X-Router-Rebalance: pending` + a generic `X-Router-Message`); a later
 eligible request revalidates and switches after this conversation binding's
 prior in-flight responses drain, and the header reads `switched`. `count_tokens` and
 background Haiku calls join the lease but never drive a switch. The pending
 announcement expires after 15 min and restarts discard it (re-announced);
 if the destination stops qualifying the pending switch is cancelled. The
-cancellable wait on in-flight responses can add latency, in-flight streams are
-never interrupted, and the new account's prompt cache may need a cold rebuild. Requests
-with account-scoped files/containers/server tools are excluded (body guard).
+cancellable drain wait has a 2-second budget; timeout defers the move and serves
+the still-usable source, never interrupts an old stream or forces a switch.
+SQLite contention may add its own latency. The new account's prompt cache may
+need a cold rebuild. Account-scoped files/containers/server tools latch durable
+`conversations.account_bound`: later thin helpers and restarted pools cannot
+move that binding, even with elective balancing off. A saturated bound pin stays
+on its account for an honest upstream error; an unusable one returns the existing
+orphaned-credential error instead of silently moving resources to another account.
+This protects known bindings, not resources imported from an unknown account;
+operator deletion of a credential/binding discards that association.
 In-flight tracking is local to one pool/process — a single serving instance
 is recommended (not cross-process safe). The headers are not necessarily
-displayed by Claude Code, and no account IDs/names/usage are exposed.
+displayed by Claude Code, and no account IDs/names/usage are exposed in them.
+
+**Routing history and expiry shadow observations** (`pool/routing.go`, `pool/expiry.go`):
+`EXPIRY_POLICY=shadow` (`--expiry-policy`, `CLAUDE_PROXY_EXPIRY_POLICY`) records
+per-account forecasts once a minute; `off` disables the forecasts, not live
+handoff history. There is deliberately **no enforcement mode**. Three observed
+quota samples establish a destination-local range of percentage-point burn rates;
+projection is limited to weekly resets within two hours and does not cross a 5h
+reset. New bindings, pending handoffs, in-flight work and changing request rates
+make incremental demand uncertain; counts/cache tokens are evidence, never quota
+denominators. Missing quota, incomplete scoped limits, stream-success knowledge,
+incremental demand and cold-cache cost remain explicit blockers. These are spare
+capacity observations, **not per-conversation allocation recommendations** or
+claims that a safe aggressive move is ready. No simulated reservations or source
+relief are applied; a future enforcement design still needs destination-local
+calibration and complete model-scoped eligibility.
+
+The observer never changes pins, headers, selection RNG, `EffectiveScore`, or
+Codex/Gemini balancing. Work is bounded (128 accounts, 20,000 recent requests,
+4,096 local sessions, 500ms read budget); incomplete reads report uncertainty.
+Same-reason observations are coalesced for 15 minutes, at most 64 writes/tick.
+`usage_history.*_observed` distinguishes new valid measurements from historical
+zeros of unknown provenance without changing normal scoring.
+
+`routing_event` records hashed conversation references and bounded metadata only.
+Actual elective switches commit their event atomically with the pin update;
+other lifecycle observations use a 256-entry best-effort queue, with logged gaps
+on overload/failure. Seven-day/50,000-row retention is pruned in 1,000-row batches.
+The cookie-authenticated Control room **Routing activity** panel shows live moves,
+pending/deferred/cancelled plans, and explicitly nonexecuted shadow forecasts.
+This is operator visibility, not guaranteed inline Claude Code notification.
+Error request logs now retain the requested model when no response model exists;
+429 diagnostics distinguish upstream retry timing from the proxy's fallback,
+without storing raw upstream error text.
 
 > Selection stays **weighted-random** rather than greedy-best on purpose: bindings are sticky and usage is only polled every 10 min, so greedy would dump every new conversation onto one cred between polls (thundering herd) and overshoot. Weighted-random spreads load and self-corrects each poll cycle.
 
@@ -624,7 +667,8 @@ instead; it does not load `.env` automatically. Key Compose variables:
 | `LOG_COLOR` | `auto` | `auto\|always\|never` |
 | `UI_PASSWORD` | _(empty)_ | Web UI password (`CLAUDE_PROXY_UI_PASSWORD`); empty = UI disabled. UI is served at `/` (old `/ui/*` paths 308-redirect); API prefixes `/v1/`, `/admin/`, `/api/`, `/health` are reserved |
 | `MODELS_1M` | _(enabled)_ | Append `[1m]` model variants to `GET /v1/models` for Claude Code gateway model discovery (`CLAUDE_PROXY_MODELS_1M`); set `0` to disable |
-| `REBALANCE_SESSIONS` | `1` | Proactive long-session rebalance for direct Anthropic subscriptions, announced via an API header notice (`CLAUDE_PROXY_REBALANCE_SESSIONS`; `0` disables it). Emergency failover is unchanged. |
+| `REBALANCE_SESSIONS` | `1` | Proactive long-session rebalance for direct Anthropic subscriptions, announced via an API header notice (`CLAUDE_PROXY_REBALANCE_SESSIONS`; `0` disables it). Account-bound conversations never migrate. |
+| `EXPIRY_POLICY` | `shadow` | `off` or `shadow` only (`CLAUDE_PROXY_EXPIRY_POLICY`, `--expiry-policy`). Records bounded unused-quota forecasts in Routing activity; never changes routing. |
 | `UI_SECURE_COOKIES` | _(empty)_ | Force `Secure` UI session cookies (`CLAUDE_PROXY_UI_SECURE_COOKIES`); auto-detected behind Traefik via `X-Forwarded-Proto` |
 | `PROMPT_RETENTION_DAYS` | `7` | Retain prompt/full-capture rows; `0` disables capture (`CLAUDE_PROXY_PROMPT_RETENTION_DAYS`) |
 | `CLIPROXY_API_KEY` | _(generated)_ | Private proxy-to-CLIProxyAPI API key; never sent to OpenAI |

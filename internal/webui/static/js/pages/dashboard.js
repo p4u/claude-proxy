@@ -4,6 +4,7 @@ import { statTile, segmented, chartFrame, periodControl, sectionHead } from "../
 import { getWindow, setWindowPeriod, setWindowCustom, windowLabel } from "../store.js";
 import { timeChart } from "../charts.js";
 import { compactNum, fullNum, ms, pct } from "../format.js";
+import { routingHistoryPanel } from "../routing-history.js";
 
 const GROUP_OPTS = [
   { value: "user", label: "By user" },
@@ -37,7 +38,10 @@ export async function render(root) {
   );
   // Uniform 2-column grid; see dashboard.css for the minmax(0, 1fr) column rule.
   const chartsWrap = el("div", { class: "dash-charts" });
-  root.append(head, tilesWrap, chartsWrap);
+  // Full-width routing decision log below the charts. Self-contained: it
+  // loads its own pages and guards its own async state.
+  const routing = routingHistoryPanel();
+  root.append(head, tilesWrap, chartsWrap, routing);
 
   // Overview tiles — follow the global window. Field names lost the `_24h`
   // suffix in v2; keep a fallback to the old names for older backends.

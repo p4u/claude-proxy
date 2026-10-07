@@ -9,11 +9,11 @@ import (
 	"github.com/p4u/claude-proxy/internal/store"
 )
 
-// Concurrency behaviour of AcquireScoped's drain wait. Once a pending notice
-// has been acknowledged, a new generation request must wait for earlier leases
-// to drain — without holding p.mu or a database transaction — re-run its
-// binding with touch=false after the drain (no double count), and honour
-// context cancellation without leaking a lease.
+// Concurrency behaviour of AcquireScoped's bounded drain wait. Once a pending
+// notice has been acknowledged, a new generation request briefly waits for
+// earlier leases to drain — without holding p.mu or a database transaction —
+// re-runs its binding with touch=false after waking (no double count), and
+// honours context cancellation without leaking a lease.
 //
 // Everything is deterministic: a waiter parks only after its first, counted
 // bind has committed, so polling request_count plus a non-blocking channel
@@ -114,6 +114,19 @@ func longPin(t *testing.T, db *store.DB) (pin string, count int64) {
 // waiter has been verified to be waiting, not finished.
 func parkedDrainWaiter(t *testing.T, p *Pool, db *store.DB) (*Lease, <-chan acquireResult, context.CancelFunc) {
 	t.Helper()
+	observe := announcedDrainSource(t, p)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	waiter := goAcquire(p, ctx, RequestOptions{Rebalance: true})
+	awaitRequestCount(t, db, 3)
+	assertStillWaiting(t, waiter)
+	return observe, waiter, cancel
+}
+
+// announcedDrainSource leaves a source lease open after a completed notice.
+// Tests can adjust the per-session wait budget before launching any waiter.
+func announcedDrainSource(t *testing.T, p *Pool) *Lease {
+	t.Helper()
 	observe := acquireRebalance(t, p, RequestOptions{Rebalance: true, ObserveOnly: true})
 	if observe.Rebalance != "" {
 		t.Fatalf("observe-only lease announced: %+v", observe)
@@ -126,12 +139,7 @@ func parkedDrainWaiter(t *testing.T, p *Pool, db *store.DB) (*Lease, <-chan acqu
 		t.Fatalf("notice lease: %+v", notice)
 	}
 	notice.Release(true)
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	waiter := goAcquire(p, ctx, RequestOptions{Rebalance: true})
-	awaitRequestCount(t, db, 3)
-	assertStillWaiting(t, waiter)
-	return observe, waiter, cancel
+	return observe
 }
 
 // Cancellation: a request parked in the drain wait must return

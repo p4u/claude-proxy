@@ -154,7 +154,16 @@ func runServe(args []string) {
 	}
 	rebalanceSessions := fs.Bool("rebalance-sessions", rebalanceDefault,
 		"proactive Anthropic long-session rebalance with API header notice (env CLAUDE_PROXY_REBALANCE_SESSIONS); 0 disables.")
+	expiryDefault := strings.TrimSpace(os.Getenv("CLAUDE_PROXY_EXPIRY_POLICY"))
+	if expiryDefault == "" {
+		expiryDefault = "shadow"
+	}
+	expiryPolicy := fs.String("expiry-policy", expiryDefault, "weekly expiry forecasts: off|shadow (env CLAUDE_PROXY_EXPIRY_POLICY); never changes routing")
 	_ = fs.Parse(args)
+	if *expiryPolicy != "off" && *expiryPolicy != "shadow" {
+		fmt.Fprintln(os.Stderr, "expiry-policy must be off or shadow; live enforcement is not available")
+		os.Exit(1)
+	}
 
 	db := openDB(*dbPath)
 	defer db.Close()
@@ -227,13 +236,15 @@ func runServe(args []string) {
 
 	p := pool.NewWithLogger(db, logger)
 	go p.Janitor(ctx)
+	go p.RoutingLoop(ctx, *expiryPolicy == "shadow")
+	logger.Info("weekly expiry policy configured", "mode", *expiryPolicy, "enforcement", false)
 
 	go usage.NewPoller(db, logger).Loop(ctx)
 
 	proxyH := proxy.New(db, p, r, logger)
 	// Proactive Anthropic long-session rebalance: enabled by default; an
 	// operator can turn it off with --rebalance-sessions=false or
-	// CLAUDE_PROXY_REBALANCE_SESSIONS=0. Emergency failover is unchanged.
+	// CLAUDE_PROXY_REBALANCE_SESSIONS=0. Resource affinity applies either way.
 	proxyH.RebalanceSessions = *rebalanceSessions
 	if *rebalanceSessions {
 		logger.Info("anthropic long-session rebalance enabled")

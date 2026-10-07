@@ -13,8 +13,8 @@ import (
 // either the notice or its explanation. Model output is never modified.
 type rebalanceWriter struct {
 	http.ResponseWriter
-	state, emitted string
-	wrote, failed  bool
+	state, emitted          string
+	wrote, failed, complete bool
 }
 
 func (w *rebalanceWriter) WriteHeader(status int) {
@@ -63,9 +63,10 @@ func (w *rebalanceWriter) Flush() {
 }
 
 func (w *rebalanceWriter) pendingEmitted() bool {
-	// Emission is not acknowledgment: even a successful Write cannot prove
-	// that the client consumed the headers. Known write failures reannounce.
-	return w.emitted == "pending" && !w.failed
+	// Emission is not acknowledgment: even a completed response cannot prove
+	// that the client consumed the headers. Require successful completion;
+	// known upstream, protocol, write and flush failures must reannounce.
+	return w.emitted == "pending" && w.complete && !w.failed
 }
 
 // portableRebalanceRequest excludes account-scoped Files/container/server-tool

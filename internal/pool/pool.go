@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/p4u/claude-proxy/internal/creds"
@@ -27,14 +28,17 @@ type Pool struct {
 	log *slog.Logger
 	mu  sync.Mutex // guards selection and request-lease atomicity
 
-	sessions     map[string]*sessionState
-	destinations map[string]time.Time
-	now          func() time.Time
+	sessions       map[string]*sessionState
+	destinations   map[string]time.Time
+	now            func() time.Time
+	routingEvents  chan store.RoutingEvent
+	routingDropped atomic.Uint64
 }
 
 func New(db *store.DB) *Pool {
 	return &Pool{db: db, log: slog.Default(), now: time.Now,
-		sessions: make(map[string]*sessionState), destinations: make(map[string]time.Time)}
+		sessions: make(map[string]*sessionState), destinations: make(map[string]time.Time),
+		routingEvents: make(chan store.RoutingEvent, 256)}
 }
 
 func NewWithLogger(db *store.DB, log *slog.Logger) *Pool {
@@ -135,7 +139,8 @@ func (p *Pool) bindOnce(ctx context.Context, convID string, prov provider.ID, sc
 	// Sticky bindings are per (conversation, provider) — see Key.
 	convKey := KeyScoped(convID, prov, scope)
 
-	err = tx.QueryRowContext(ctx, `SELECT credential_id FROM conversations WHERE id=?`, convKey).Scan(&credID)
+	var accountBound bool
+	err = tx.QueryRowContext(ctx, `SELECT credential_id,account_bound FROM conversations WHERE id=?`, convKey).Scan(&credID, &accountBound)
 	switch {
 	case err == sql.ErrNoRows:
 		newConv = true
@@ -161,6 +166,18 @@ func (p *Pool) bindOnce(ctx context.Context, convID string, prov provider.ID, sc
 		}
 	}
 
+	// Persist resource affinity in the same transaction that checks emergency
+	// rebinding. A thin sibling request or a restarted pool must not forget it.
+	if s := p.sessions[convKey]; s != nil {
+		if s.accountBound && !accountBound {
+			if _, err := tx.ExecContext(ctx, `UPDATE conversations SET account_bound=1 WHERE id=?`, convKey); err != nil {
+				return nil, false, err
+			}
+			accountBound = true
+		}
+		s.accountBound = accountBound
+	}
+
 	c, err := getCredTx(ctx, tx, credID)
 	if err != nil {
 		return nil, false, err
@@ -179,6 +196,13 @@ func (p *Pool) bindOnce(ctx context.Context, convID string, prov provider.ID, sc
 	if !newConv {
 		switch c.Status {
 		case creds.StatusExpired, creds.StatusRevoked, creds.StatusDisabled:
+			if accountBound {
+				// Keep the latch even when this request cannot be served.
+				if err := tx.Commit(); err != nil {
+					return nil, false, err
+				}
+				return c, false, ErrCredentialOrphaned
+			}
 			newCredID, perr := p.pickActiveLocked(ctx, tx, prov, allowed)
 			if perr != nil {
 				if errors.Is(perr, ErrNoCredentials) {
@@ -205,7 +229,7 @@ func (p *Pool) bindOnce(ctx context.Context, convID string, prov provider.ID, sc
 			if serr != nil {
 				return nil, false, serr
 			}
-			if saturated {
+			if saturated && !accountBound {
 				newCredID, perr := p.pickActiveLocked(ctx, tx, prov, allowed)
 				switch {
 				case errors.Is(perr, ErrNoCredentials):

@@ -90,6 +90,13 @@ func Open(path string) (*DB, error) {
 		// Current pin age, not conversation age. Legacy rows use created_at
 		// until their first rebind, avoiding an unbounded startup backfill.
 		`ALTER TABLE conversations ADD COLUMN bound_at INTEGER NOT NULL DEFAULT 0`,
+		// Once a request uses account-scoped resources, even thin helpers must
+		// retain that account. Survives pool-state pruning and restarts.
+		`ALTER TABLE conversations ADD COLUMN account_bound INTEGER NOT NULL DEFAULT 0`,
+		// Historical zeros did not distinguish absent buckets from measured zero.
+		// Only new, validated usage readings may establish forecast coverage.
+		`ALTER TABLE usage_history ADD COLUMN five_hour_observed INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_history ADD COLUMN seven_day_observed INTEGER NOT NULL DEFAULT 0`,
 		// Model-scoped weekly limit from the usage API's limits[] array
 		// ("weekly_scoped", e.g. Fable). NULL = none published; the old
 		// seven_day_sonnet_* columns are no longer written (the API returns
@@ -102,6 +109,11 @@ func Open(path string) (*DB, error) {
 			_ = sdb.Close()
 			return nil, fmt.Errorf("migrate %q: %w", alter, err)
 		}
+	}
+	// Must follow the bound_at migration for databases created before it existed.
+	if _, err := sdb.Exec(`CREATE INDEX IF NOT EXISTS idx_conversations_bound_at ON conversations(bound_at)`); err != nil {
+		_ = sdb.Close()
+		return nil, fmt.Errorf("index conversation binding times: %w", err)
 	}
 	return &DB{sdb}, nil
 }

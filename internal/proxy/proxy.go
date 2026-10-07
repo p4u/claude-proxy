@@ -89,6 +89,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Keep the client-selected model even if alias rewriting changes the wire
+	// name or an error response has no usage/model fields to parse.
+	requestedModel := requestModel(body)
+
 	if h.Augment1M && r.Method == http.MethodGet && r.URL.Path == "/v1/models" {
 		h.serveModels(w, r, start)
 		return
@@ -167,9 +171,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// (conversation, provider) could hand a request to a host that cannot
 		// serve it. See pool.BindScoped.
 		convID = pool.KeyScoped(dr.ConvID, prov, custom.Model)
+		directSubscription := provider.Get(prov).PollsUsage
+		// Account affinity is safety state, not an elective-rebalance setting:
+		// latch it even while rebalancing is disabled, before emergency binding.
+		accountBound := directSubscription && !portableRebalanceRequest(body)
 		lease, err := h.pool.AcquireScoped(r.Context(), dr.ConvID, prov, custom.Model, custom.CredIDs, pool.RequestOptions{
-			Rebalance:   h.RebalanceSessions && provider.Get(prov).PollsUsage && portableRebalanceRequest(body),
-			ObserveOnly: r.URL.Path == "/v1/messages/count_tokens" || strings.Contains(requestModel(body), "haiku"),
+			Rebalance:    h.RebalanceSessions && directSubscription && !accountBound,
+			ObserveOnly:  r.URL.Path == "/v1/messages/count_tokens" || strings.Contains(requestModel(body), "haiku"),
+			AccountBound: accountBound,
 		})
 		if err != nil {
 			h.log.Warn("bind failed", "err", err, "conv", convID, "src", string(convSrc), "provider", string(prov))
@@ -213,44 +222,67 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	status, rxBytes, usage, reply := h.forward(w, r, body, cred, true, captureReply)
+	result := h.forward(w, r, body, cred, true, captureReply)
+	result.complete = result.complete && !notice.failed && r.Context().Err() == nil
+	notice.complete = result.complete
+	usage := result.usage
+	if usage.Model == "" {
+		usage.Model = requestedModel
+	}
 	latency := time.Since(start)
 	h.log.Info("forwarded",
 		"cred", cred.ID, "label", cred.Label,
-		"conv", convID, "status", status,
+		"conv", convID, "status", result.status,
 		"latency_ms", latency.Milliseconds(),
-		"bytes_sent", len(body), "bytes_received", rxBytes,
-		"model", usage.Model,
+		"bytes_sent", len(body), "bytes_received", result.rxBytes,
+		"model", usage.Model, "requested_model", requestedModel, "response_model", result.usage.Model,
+		"response_complete", result.complete, "error_type", result.errorType,
 		"tokens_in", usage.InputTokens, "tokens_out", usage.OutputTokens)
 
-	if captureReply && status == http.StatusOK {
-		h.captureAssistantReply(r.Context(), convID, replySeq, usage.Model, reply)
+	if captureReply && result.status == http.StatusOK {
+		h.captureAssistantReply(r.Context(), convID, replySeq, usage.Model, result.text)
 	}
 
-	h.logRequest(r.Context(), r.URL.Path, convID, cred.ID, status, int64(len(body)), rxBytes, latency, usage)
+	h.logRequest(r.Context(), r.URL.Path, convID, cred.ID, result.status, int64(len(body)), result.rxBytes, latency, usage)
 }
 
-// decodeBodySnippet decompresses a body if it was sent gzip/deflate, then
-// trims/normalizes for log display. Returns a printable string.
-func decodeBodySnippet(raw []byte, encoding string) string {
-	body := raw
-	switch strings.ToLower(strings.TrimSpace(encoding)) {
-	case "gzip":
-		if zr, err := gzip.NewReader(bytes.NewReader(raw)); err == nil {
-			if d, derr := io.ReadAll(io.LimitReader(zr, 4096)); derr == nil {
-				body = d
-			}
-			zr.Close()
+const errorBodyCap = 4096
+
+// upstreamErrorType extracts only a bounded, recognized error type. Messages
+// can contain prompts or credential material; neither they nor arbitrary
+// upstream-provided type strings belong in diagnostic logs.
+func upstreamErrorType(raw []byte, encoding string) string {
+	if isGzip(encoding) {
+		zr, err := gzip.NewReader(bytes.NewReader(raw))
+		if err != nil {
+			return "unknown"
+		}
+		defer zr.Close()
+		raw, err = io.ReadAll(io.LimitReader(zr, errorBodyCap))
+		if err != nil {
+			return "unknown"
 		}
 	}
-	s := string(body)
-	if len(s) > 512 {
-		s = s[:512] + "…"
+	var body struct {
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
 	}
-	// Strip trailing whitespace; collapse newlines so log line stays one row.
-	s = strings.TrimSpace(s)
-	s = strings.ReplaceAll(s, "\n", " ")
-	return s
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return "unknown"
+	}
+	return safeErrorType(body.Error.Type)
+}
+
+func safeErrorType(kind string) string {
+	switch kind {
+	case "invalid_request_error", "authentication_error", "permission_error",
+		"not_found_error", "request_too_large", "rate_limit_error", "api_error",
+		"overloaded_error", "timeout_error", "billing_error":
+		return kind
+	default:
+		return "unknown"
+	}
 }
 
 func maskBearer(v string) string {
@@ -297,12 +329,24 @@ func (h *Handler) failBind(w http.ResponseWriter, err error, prov provider.ID) {
 	}
 }
 
-// forward sends the request upstream and streams the response back. Returns the
-// upstream HTTP status (or -1 on local failure), bytes received from upstream,
-// the parsed token usage, and — when captureText is set — the assistant's
-// visible output text (for full conversation capture). If allowRetry is true
-// and upstream returns 401, the proxy refreshes the credential and retries once.
-func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, cred *creds.Credential, allowRetry, captureText bool) (int, int64, tokenUsage, string) {
+// forwardResult separates transport/protocol completion from the HTTP status:
+// a 200 stream can still fail after its headers have already reached the client.
+// complete requires a successful response read and written in full, plus parser
+// confirmation when a Messages response is inspected (including message_stop
+// and no error event for SSE). Partial responses are never retried.
+type forwardResult struct {
+	status    int // upstream status, or -1 on local failure
+	rxBytes   int64
+	usage     tokenUsage
+	text      string // opt-in assistant text capture only
+	complete  bool
+	errorType string // sanitized upstream error type, never the error message
+}
+
+// forward sends the request upstream and streams the response back. If
+// allowRetry is true and upstream returns 401, it refreshes the credential and
+// retries once, before any response bytes have been sent to the client.
+func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, cred *creds.Credential, allowRetry, captureText bool) (result forwardResult) {
 	// The upstream is a property of the credential, not of the proxy. GLM's
 	// base URL carries a path prefix (/api/anthropic), so this concatenates
 	// onto the base rather than swapping a host.
@@ -315,21 +359,21 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 			payload, _ := json.Marshal(map[string]any{"input_tokens": approximateAnthropicTokens(body)})
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(payload)
+			n, err := w.Write(payload)
 			_ = creds.MarkSuccess(r.Context(), h.db, cred.ID)
-			return http.StatusOK, int64(len(payload)), tokenUsage{}, ""
+			return forwardResult{status: http.StatusOK, rxBytes: int64(n), complete: err == nil && n == len(payload)}
 		case "/v1/messages":
 			translated, stream, err := translateAnthropicToOpenAI(body)
 			if err != nil {
 				http.Error(w, "translate request: "+err.Error(), http.StatusBadRequest)
 				_ = creds.MarkError(r.Context(), h.db, cred.ID)
-				return http.StatusBadRequest, 0, tokenUsage{}, ""
+				return forwardResult{status: http.StatusBadRequest}
 			}
 			body, openAIStream = translated, stream
 			requestURI = "/chat/completions"
 		default:
 			http.Error(w, "proxy: custom OpenAI hosts support /v1/messages and /v1/messages/count_tokens", http.StatusNotImplemented)
-			return http.StatusNotImplemented, 0, tokenUsage{}, ""
+			return forwardResult{status: http.StatusNotImplemented}
 		}
 	}
 	upstreamURL := provider.ResolveBaseURL(up.ID, cred.BaseURL) + requestURI
@@ -338,7 +382,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 	if err != nil {
 		http.Error(w, "build upstream req", http.StatusBadGateway)
 		_ = creds.MarkError(r.Context(), h.db, cred.ID)
-		return -1, 0, tokenUsage{}, ""
+		return forwardResult{status: -1}
 	}
 
 	copyHeaders(upstreamReq.Header, r.Header)
@@ -371,7 +415,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 		http.Error(w, "upstream: "+err.Error(), http.StatusBadGateway)
 		_ = creds.MarkError(r.Context(), h.db, cred.ID)
 		h.log.Error("upstream transport error", "cred", cred.ID, "err", err)
-		return -1, 0, tokenUsage{}, ""
+		return forwardResult{status: -1}
 	}
 	if up.ID == provider.CustomOpenAI {
 		if resp.StatusCode >= 400 {
@@ -395,13 +439,13 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 			if readErr != nil || len(raw) > maxBodyBytes {
 				http.Error(w, "translate response: response too large or unreadable", http.StatusBadGateway)
 				_ = creds.MarkError(r.Context(), h.db, cred.ID)
-				return -1, 0, tokenUsage{}, ""
+				return forwardResult{status: -1}
 			}
 			translated, translateErr := translateOpenAIJSON(raw)
 			if translateErr != nil {
 				http.Error(w, "translate response: "+translateErr.Error(), http.StatusBadGateway)
 				_ = creds.MarkError(r.Context(), h.db, cred.ID)
-				return -1, 0, tokenUsage{}, ""
+				return forwardResult{status: -1}
 			}
 			resp.Body = io.NopCloser(bytes.NewReader(translated))
 			resp.ContentLength = int64(len(translated))
@@ -434,58 +478,63 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 		// and say what actually needs fixing.
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		_ = resp.Body.Close()
+		errorType := upstreamErrorType(raw, resp.Header.Get("Content-Encoding"))
 		_ = creds.SetStatus(r.Context(), h.db, cred.ID, creds.StatusRevoked)
 		_ = creds.MarkError(r.Context(), h.db, cred.ID)
 		h.log.Error("upstream 401 on API key; marked revoked",
 			"cred", cred.ID, "label", cred.Label, "provider", string(up.ID),
-			"snippet", decodeBodySnippet(raw, resp.Header.Get("Content-Encoding")))
+			"error_type", errorType)
 		http.Error(w, `{"type":"error","error":{"type":"authentication_error","message":"proxy: `+up.Name+` API key rejected; replace it"}}`, http.StatusBadGateway)
-		return 401, 0, tokenUsage{}, ""
+		return forwardResult{status: http.StatusUnauthorized, errorType: errorType}
 	}
 
 	if resp.StatusCode == http.StatusUnauthorized && allowRetry && !up.DelegatedAuth {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		_ = resp.Body.Close()
+		errorType := upstreamErrorType(raw, resp.Header.Get("Content-Encoding"))
 		h.log.Warn("upstream 401; attempting refresh",
 			"cred", cred.ID,
-			"snippet", decodeBodySnippet(raw, resp.Header.Get("Content-Encoding")))
+			"error_type", errorType)
 		fresh, rerr := h.refresher.RefreshNow(r.Context(), cred.ID)
 		if rerr != nil {
 			_ = creds.SetStatus(r.Context(), h.db, cred.ID, creds.StatusExpired)
 			_ = creds.MarkError(r.Context(), h.db, cred.ID)
 			h.log.Error("refresh failed after 401; marked expired", "cred", cred.ID, "err", rerr)
 			http.Error(w, "proxy: credential expired", http.StatusBadGateway)
-			return 401, 0, tokenUsage{}, ""
+			return forwardResult{status: http.StatusUnauthorized, errorType: errorType}
 		}
 		h.log.Info("refresh succeeded; retrying upstream", "cred", cred.ID)
 		return h.forward(w, r, body, fresh, false, captureText)
 	}
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		// Peek at the body so we can log the error message, then replay it for the client.
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		_ = resp.Body.Close()
-		resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(raw), strings.NewReader("")))
-
-		retryAt := parseRetryAfter(resp.Header.Get("Retry-After"))
+		retryAt, retrySource := parseRetryAfter(resp.Header.Get("Retry-After"))
 		retryIn := time.Until(retryAt).Round(time.Second)
-		// Synthesize Retry-After when upstream omitted it so the client knows when to retry.
-		if resp.Header.Get("Retry-After") == "" {
+		// Keep an upstream value unchanged, even if it was unparseable locally.
+		// The provenance describes the local delay; synthesized describes the
+		// client-facing header. These differ for an invalid upstream value.
+		synthesized := resp.Header.Get("Retry-After") == ""
+		if synthesized {
 			resp.Header.Set("Retry-After", strconv.Itoa(int(retryIn.Seconds())))
 		}
 		_ = creds.MarkLimited(r.Context(), h.db, cred.ID, retryAt)
 		_ = creds.MarkError(r.Context(), h.db, cred.ID)
-		h.log.Warn(
-			"upstream 429; marked credential limited",
-			"cred", cred.ID,
-			"retry_in", retryIn.String(),
-			"retry_after", retryAt.Format(time.RFC3339),
-			"body", decodeBodySnippet(raw, resp.Header.Get("Content-Encoding")),
-			"rl_tokens_remaining", resp.Header.Get("Anthropic-Ratelimit-Tokens-Remaining"),
-			"rl_tokens_reset", resp.Header.Get("Anthropic-Ratelimit-Tokens-Reset"),
-			"rl_requests_remaining", resp.Header.Get("Anthropic-Ratelimit-Requests-Remaining"),
-			"rl_requests_reset", resp.Header.Get("Anthropic-Ratelimit-Requests-Reset"),
-		)
+		// Observe the body during the normal relay, never consume/close it to
+		// peek. A diagnostic size cap must not truncate the client's response.
+		defer func() {
+			h.log.Warn(
+				"upstream 429; marked credential limited",
+				"cred", cred.ID,
+				"retry_in", retryIn.String(),
+				"retry_after", retryAt.Format(time.RFC3339),
+				"retry_after_source", retrySource, "retry_after_synthesized", synthesized,
+				"error_type", result.errorType,
+				"rl_tokens_remaining", resp.Header.Get("Anthropic-Ratelimit-Tokens-Remaining"),
+				"rl_tokens_reset", resp.Header.Get("Anthropic-Ratelimit-Tokens-Reset"),
+				"rl_requests_remaining", resp.Header.Get("Anthropic-Ratelimit-Requests-Remaining"),
+				"rl_requests_reset", resp.Header.Get("Anthropic-Ratelimit-Requests-Reset"),
+			)
+		}()
 	} else if resp.StatusCode == http.StatusOK {
 		_ = creds.MarkSuccess(r.Context(), h.db, cred.ID)
 	} else if resp.StatusCode >= 400 {
@@ -507,47 +556,55 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 		cap = newUsageCapture(resp.Header.Get("Content-Type"), resp.Header.Get("Content-Encoding"), captureText)
 	}
 
+	result.status = resp.StatusCode
+	var errorBody []byte
+	defer func() {
+		if cap != nil {
+			result.usage = cap.Close()
+			result.text = cap.Text()
+			result.complete = result.complete && cap.Complete()
+			result.errorType = cap.ErrorType()
+		} else if resp.StatusCode >= 400 {
+			result.errorType = upstreamErrorType(errorBody, resp.Header.Get("Content-Encoding"))
+		}
+	}()
+
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
-	var rxBytes int64
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
-				h.log.Warn("client write error", "err", werr, "cred", cred.ID, "streamed", rxBytes)
-				u, text := closeUsage(cap)
-				return resp.StatusCode, rxBytes, u, text
+			if resp.StatusCode >= 400 && len(errorBody) < errorBodyCap {
+				errorBody = append(errorBody, buf[:min(n, errorBodyCap-len(errorBody))]...)
+			}
+			nw, werr := w.Write(buf[:n])
+			if werr == nil && nw != n {
+				werr = io.ErrShortWrite
+			}
+			if werr != nil {
+				h.log.Warn("client write error", "err", werr, "cred", cred.ID, "streamed", result.rxBytes)
+				return result
 			}
 			if cap != nil {
 				cap.Write(buf[:n])
 			}
-			rxBytes += int64(n)
+			result.rxBytes += int64(n)
 			if flusher != nil {
 				flusher.Flush()
 			}
 		}
 		if rerr == io.EOF {
 			h.log.Debug("stream done",
-				"cred", cred.ID, "label", cred.Label, "status", resp.StatusCode, "bytes", rxBytes)
-			u, text := closeUsage(cap)
-			return resp.StatusCode, rxBytes, u, text
+				"cred", cred.ID, "label", cred.Label, "status", resp.StatusCode, "bytes", result.rxBytes)
+			result.complete = resp.StatusCode >= 200 && resp.StatusCode < 300 && r.Context().Err() == nil &&
+				(resp.ContentLength < 0 || result.rxBytes == resp.ContentLength)
+			return result
 		}
 		if rerr != nil {
-			h.log.Warn("upstream stream error", "err", rerr, "cred", cred.ID, "streamed", rxBytes)
-			u, text := closeUsage(cap)
-			return resp.StatusCode, rxBytes, u, text
+			h.log.Warn("upstream stream error", "err", rerr, "cred", cred.ID, "streamed", result.rxBytes)
+			return result
 		}
 	}
-}
-
-// closeUsage finalizes a capture (nil-safe) and returns the parsed usage plus
-// any accumulated assistant text.
-func closeUsage(c *usageCapture) (tokenUsage, string) {
-	if c == nil {
-		return tokenUsage{}, ""
-	}
-	u := c.Close()
-	return u, c.Text()
 }
 
 // logRequest inserts one row into request_log for dashboard aggregation.
@@ -598,18 +655,16 @@ func isHopByHop(k string) bool {
 	return hopByHop[http.CanonicalHeaderKey(k)]
 }
 
-// parseRetryAfter handles both delta-seconds and HTTP-date forms.
-// Default when the header is absent: 30s — short-term burst limits clear quickly.
-func parseRetryAfter(v string) time.Time {
+// parseRetryAfter handles both delta-seconds and HTTP-date forms and reports
+// whether the local retry time came from upstream or the existing 30s fallback.
+// Missing/malformed headers retain that short-term burst-limit fallback.
+func parseRetryAfter(v string) (time.Time, string) {
 	v = strings.TrimSpace(v)
-	if v == "" {
-		return time.Now().Add(30 * time.Second)
-	}
 	if secs, err := strconv.Atoi(v); err == nil {
-		return time.Now().Add(time.Duration(secs) * time.Second)
+		return time.Now().Add(time.Duration(secs) * time.Second), "upstream"
 	}
 	if t, err := http.ParseTime(v); err == nil {
-		return t
+		return t, "upstream"
 	}
-	return time.Now().Add(30 * time.Second)
+	return time.Now().Add(30 * time.Second), "fallback"
 }

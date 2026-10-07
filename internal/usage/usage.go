@@ -156,10 +156,16 @@ func Fetch(ctx context.Context, client *http.Client, accessToken string) (*Respo
 	return &r, nil
 }
 
-// Save stores a usage snapshot in the database.
+// Save stores a usage snapshot in the database. Observation flags distinguish
+// actual zero utilization from a missing or invalid reading; historical rows
+// retain their unknown flags. The existing percentage columns stay unchanged
+// for finite values, so the live selection policy does not consume these flags.
 func Save(ctx context.Context, db *store.DB, credID string, r *Response) error {
-	fhPct := bucketPct(&r.FiveHour)
-	sdPct := bucketPct(&r.SevenDay)
+	fhPct, fhObserved := bucketObservation(&r.FiveHour)
+	sdPct, sdObserved := bucketObservation(&r.SevenDay)
+	if math.IsNaN(fhPct) || math.IsInf(fhPct, 0) || math.IsNaN(sdPct) || math.IsInf(sdPct, 0) {
+		return fmt.Errorf("usage snapshot: nonfinite utilization")
+	}
 	var (
 		scPct   *float64
 		scReset *int64
@@ -171,13 +177,13 @@ func Save(ctx context.Context, db *store.DB, credID string, r *Response) error {
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO usage_history
 		  (credential_id, captured_at,
-		   five_hour_pct,    five_hour_resets_at,
-		   seven_day_pct,    seven_day_resets_at,
+		   five_hour_pct,    five_hour_resets_at, five_hour_observed,
+		   seven_day_pct,    seven_day_resets_at, seven_day_observed,
 		   seven_day_scoped_pct, seven_day_scoped_resets_at, seven_day_scoped_label)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		credID, time.Now().Unix(),
-		fhPct, parseResetsAt(r.FiveHour.ResetsAt),
-		sdPct, parseResetsAt(r.SevenDay.ResetsAt),
+		fhPct, parseResetsAt(r.FiveHour.ResetsAt), fhObserved,
+		sdPct, parseResetsAt(r.SevenDay.ResetsAt), sdObserved,
 		scPct, scReset, scLabel)
 	return err
 }
@@ -362,6 +368,11 @@ func bucketPct(b *Bucket) float64 {
 		return 0
 	}
 	return *b.Utilization
+}
+
+func bucketObservation(b *Bucket) (pct float64, observed bool) {
+	pct = bucketPct(b)
+	return pct, b != nil && b.Utilization != nil && pct >= 0 && pct <= 100
 }
 
 func parseResetsAt(s *string) *int64 {

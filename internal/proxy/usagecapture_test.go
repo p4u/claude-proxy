@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"compress/gzip"
+	"strings"
 	"testing"
 )
 
@@ -35,7 +36,7 @@ func gzipBytes(t *testing.T, b []byte) []byte {
 }
 
 func TestParseSSEUsage(t *testing.T) {
-	u, _ := parseSSEUsage(bytes.NewReader([]byte(sseFixture)), false)
+	u := parseSSEUsage(bytes.NewReader([]byte(sseFixture)), false).usage
 	if u.Model != "claude-sonnet-4" {
 		t.Errorf("model = %q, want claude-sonnet-4", u.Model)
 	}
@@ -54,7 +55,7 @@ func TestParseSSEUsage(t *testing.T) {
 }
 
 func TestParseJSONUsage(t *testing.T) {
-	u, _ := parseJSONUsage([]byte(jsonFixture), false)
+	u := parseJSONUsage([]byte(jsonFixture), false).usage
 	if u.Model != "claude-opus-4" {
 		t.Errorf("model = %q, want claude-opus-4", u.Model)
 	}
@@ -69,15 +70,77 @@ func TestParseJSONUsage(t *testing.T) {
 func TestParseMalformed(t *testing.T) {
 	// Malformed SSE data lines are skipped, yielding zero usage.
 	bad := "event: message_start\ndata: {not json}\n\ndata: \n\nnot-a-data-line\n"
-	if u, _ := parseSSEUsage(bytes.NewReader([]byte(bad)), false); u != (tokenUsage{}) {
+	if u := parseSSEUsage(bytes.NewReader([]byte(bad)), false).usage; u != (tokenUsage{}) {
 		t.Errorf("expected zero usage on malformed SSE, got %+v", u)
 	}
 	// Malformed JSON body → zero usage.
-	if u, _ := parseJSONUsage([]byte("{broken"), false); u != (tokenUsage{}) {
+	if u := parseJSONUsage([]byte("{broken"), false).usage; u != (tokenUsage{}) {
 		t.Errorf("expected zero usage on malformed JSON, got %+v", u)
 	}
-	if u, _ := parseJSONUsage(nil, false); u != (tokenUsage{}) {
+	if u := parseJSONUsage(nil, false).usage; u != (tokenUsage{}) {
 		t.Errorf("expected zero usage on empty JSON, got %+v", u)
+	}
+}
+
+func TestUsageCaptureCompletion(t *testing.T) {
+	const sseError = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"private message\"}}\n\n"
+	for _, tc := range []struct {
+		name, contentType, encoding string
+		body                        []byte
+		complete                    bool
+		errorType                   string
+	}{
+		{"SSE complete", "text/event-stream", "", []byte(sseFixture), true, ""},
+		{"SSE missing stop", "text/event-stream", "", []byte(rebalanceSSEHead), false, ""},
+		{"SSE error", "text/event-stream", "", []byte(rebalanceSSEHead + sseError), false, "overloaded_error"},
+		{"SSE error then stop", "text/event-stream", "", []byte(sseError + sseFixture), false, "overloaded_error"},
+		{"SSE error without data type", "text/event-stream", "", []byte("event: error\ndata: {}\n\n" + sseFixture), false, "unknown"},
+		{"SSE malformed", "text/event-stream", "", []byte("data: {broken}\n\n" + sseFixture), false, ""},
+		{"SSE non-JSON data", "text/event-stream", "", []byte("data: broken\n\n" + sseFixture), false, ""},
+		{"SSE done alone", "text/event-stream", "", []byte("data: [DONE]\n\n"), false, ""},
+		{"SSE done after stop", "text/event-stream", "", []byte(sseFixture + "\ndata: [DONE]\n\n"), true, ""},
+		{"SSE line cap", "text/event-stream", "", []byte(sseFixture + "data: " + strings.Repeat("x", (1<<20)+1)), false, ""},
+		{"SSE gzip complete", "text/event-stream", "gzip", gzipBytes(t, []byte(sseFixture)), true, ""},
+		{"SSE gzip incomplete", "text/event-stream", "gzip", gzipBytes(t, []byte(rebalanceSSEHead)), false, ""},
+		{"SSE bad gzip", "text/event-stream", "gzip", []byte(sseFixture), false, ""},
+		{"JSON complete", "application/json", "", []byte(jsonFixture), true, ""},
+		{"JSON malformed", "application/json", "", []byte(`{"type":"message"`), false, ""},
+		{"JSON error", "application/json", "", []byte(`{"type":"error","error":{"type":"rate_limit_error"}}`), false, "rate_limit_error"},
+		{"JSON unknown error", "application/json", "", []byte(`{"type":"error","error":{"type":"private upstream value"}}`), false, "unknown"},
+		{"JSON null", "application/json", "", []byte(`null`), false, ""},
+		{"JSON cap", "application/json", "", []byte(jsonFixture + strings.Repeat(" ", usageJSONCap)), false, ""},
+		{"JSON gzip complete", "application/json", "gzip", gzipBytes(t, []byte(jsonFixture)), true, ""},
+		{"JSON gzip bad", "application/json", "gzip", []byte(jsonFixture), false, ""},
+		{"JSON gzip expanded cap", "application/json", "gzip", gzipBytes(t, []byte(jsonFixture+strings.Repeat(" ", usageJSONCap))), false, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newUsageCapture(tc.contentType, tc.encoding, false)
+			if c.Complete() {
+				t.Fatal("capture claims completion before Close")
+			}
+			c.Write(tc.body)
+			c.Close()
+			if c.Complete() != tc.complete || c.ErrorType() != tc.errorType {
+				t.Fatalf("completion = %v, error type = %q; want %v, %q", c.Complete(), c.ErrorType(), tc.complete, tc.errorType)
+			}
+		})
+	}
+}
+
+func TestUsageCaptureGzipTrailerRequiredForCompletion(t *testing.T) {
+	for _, tc := range []struct{ contentType, body string }{
+		{"text/event-stream", sseFixture},
+		{"application/json", jsonFixture},
+	} {
+		t.Run(tc.contentType, func(t *testing.T) {
+			raw := gzipBytes(t, []byte(tc.body))
+			c := newUsageCapture(tc.contentType, "gzip", false)
+			c.Write(raw[:len(raw)-4]) // decoded body is present, gzip trailer is not
+			c.Close()
+			if c.Complete() {
+				t.Fatal("truncated gzip body counted as completed response")
+			}
+		})
 	}
 }
 

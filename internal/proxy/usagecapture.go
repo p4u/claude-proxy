@@ -52,24 +52,46 @@ func (u tokenUsage) apply(model string, b usageBlock, isStart bool) tokenUsage {
 	return u
 }
 
-// parseSSEUsage scans an Anthropic SSE stream and extracts token usage from the
-// `message_start` (model + input/cache tokens) and `message_delta` (final
-// output_tokens) events. When captureText is set it also concatenates the
-// assistant's visible output from `content_block_delta` events of type
-// `text_delta` (thinking and tool deltas are ignored). Malformed lines are
-// skipped; it always drains r.
-func parseSSEUsage(r io.Reader, captureText bool) (tokenUsage, string) {
-	var u tokenUsage
+// capturedResponse keeps usage independently of completion: an interrupted
+// generation can report billable tokens without finishing successfully.
+type capturedResponse struct {
+	usage     tokenUsage
+	text      string
+	complete  bool
+	errorType string
+}
+
+// parseSSEUsage extracts usage and opt-in visible text from an Anthropic SSE
+// stream. Malformed data is skipped for usage, but cannot establish successful
+// completion. Only message_stop with no error event/read/parse failure does.
+func parseSSEUsage(r io.Reader, captureText bool) capturedResponse {
+	var result capturedResponse
 	var text strings.Builder
+	var failed, errorEvent bool
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20) // up to 1 MiB per SSE data line
 	for sc.Scan() {
 		line := sc.Bytes()
+		if len(line) == 0 {
+			errorEvent = false
+			continue
+		}
+		if bytes.HasPrefix(line, []byte("event:")) {
+			errorEvent = string(bytes.TrimSpace(line[len("event:"):])) == "error"
+			if errorEvent {
+				failed, result.errorType = true, "unknown"
+			}
+			continue
+		}
 		if !bytes.HasPrefix(line, []byte("data:")) {
 			continue
 		}
 		payload := bytes.TrimSpace(line[len("data:"):])
-		if len(payload) == 0 || payload[0] != '{' {
+		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
+		if payload[0] != '{' {
+			failed = true
 			continue
 		}
 		var ev struct {
@@ -83,41 +105,67 @@ func parseSSEUsage(r io.Reader, captureText bool) (tokenUsage, string) {
 				Type string `json:"type"`
 				Text string `json:"text"`
 			} `json:"delta"`
+			Error struct {
+				Type string `json:"type"`
+			} `json:"error"`
 		}
 		if err := json.Unmarshal(payload, &ev); err != nil {
+			failed = true
 			continue
+		}
+		if ev.Type == "error" || errorEvent {
+			failed, result.errorType = true, safeErrorType(ev.Error.Type)
 		}
 		switch ev.Type {
 		case "message_start":
-			u = u.apply(ev.Message.Model, ev.Message.Usage, true)
+			result.usage = result.usage.apply(ev.Message.Model, ev.Message.Usage, true)
 		case "message_delta":
-			u = u.apply("", ev.Usage, false)
+			result.usage = result.usage.apply("", ev.Usage, false)
+		case "message_stop":
+			result.complete = true
 		case "content_block_delta":
 			if captureText && ev.Delta.Type == "text_delta" && text.Len() < captureTextCap {
 				text.WriteString(ev.Delta.Text)
 			}
 		}
 	}
-	return u, text.String()
+	result.complete = result.complete && !failed && sc.Err() == nil
+	result.text = text.String()
+	return result
 }
 
-// parseJSONUsage parses a non-stream Anthropic Messages response body and
-// extracts top-level model + usage, plus (when captureText is set) the
-// concatenated `content[]` text blocks. Malformed bodies yield a zero
-// tokenUsage and empty text.
-func parseJSONUsage(b []byte, captureText bool) (tokenUsage, string) {
+// parseJSONUsage extracts model, usage and opt-in visible text. Successful
+// completion requires a valid JSON object rather than a truncated/error body.
+func parseJSONUsage(b []byte, captureText bool) capturedResponse {
+	b = bytes.TrimSpace(b)
+	if len(b) == 0 || b[0] != '{' {
+		return capturedResponse{}
+	}
 	var body struct {
+		Type    string     `json:"type"`
 		Model   string     `json:"model"`
 		Usage   usageBlock `json:"usage"`
 		Content []struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
 		} `json:"content"`
+		Error *struct {
+			Type string `json:"type"`
+		} `json:"error"`
 	}
 	if err := json.Unmarshal(b, &body); err != nil {
-		return tokenUsage{}, ""
+		return capturedResponse{}
 	}
-	var text string
+	result := capturedResponse{
+		usage:    tokenUsage{}.apply(body.Model, body.Usage, true),
+		complete: body.Type != "error" && body.Error == nil,
+	}
+	if !result.complete {
+		result.errorType = "unknown"
+		if body.Error != nil {
+			result.errorType = safeErrorType(body.Error.Type)
+		}
+	}
 	if captureText {
 		var parts []string
 		for _, c := range body.Content {
@@ -125,9 +173,9 @@ func parseJSONUsage(b []byte, captureText bool) (tokenUsage, string) {
 				parts = append(parts, c.Text)
 			}
 		}
-		text = strings.Join(parts, "\n\n")
+		result.text = strings.Join(parts, "\n\n")
 	}
-	return tokenUsage{}.apply(body.Model, body.Usage, true), text
+	return result
 }
 
 const usageJSONCap = 1 << 20 // 1 MiB cap on buffered non-stream bodies
@@ -146,16 +194,17 @@ type usageCapture struct {
 	broken bool // pipe reader gone; stop feeding
 
 	// non-stream JSON path (buffered, no goroutine)
-	stream bool
-	buf    bytes.Buffer
-	gzip   bool
+	stream    bool
+	buf       bytes.Buffer
+	gzip      bool
+	truncated bool
+	closed    bool
 
 	// captureText accumulates the assistant's visible output text; only set
 	// when the request's user opted into full conversation capture.
 	captureText bool
 
-	usage tokenUsage
-	text  string
+	result capturedResponse
 }
 
 // isEventStream reports whether the content type is an SSE stream.
@@ -196,7 +245,7 @@ func (c *usageCapture) runSSE(pr *io.PipeReader) {
 		defer zr.Close()
 		r = zr
 	}
-	c.usage, c.text = parseSSEUsage(r, c.captureText)
+	c.result = parseSSEUsage(r, c.captureText)
 }
 
 // Write feeds response bytes to the parser. It never returns an error to the
@@ -214,36 +263,52 @@ func (c *usageCapture) Write(p []byte) {
 		}
 		return
 	}
-	// Buffered JSON path, capped.
-	if remaining := usageJSONCap - c.buf.Len(); remaining > 0 {
-		if len(p) > remaining {
-			p = p[:remaining]
-		}
-		c.buf.Write(p)
+	// Buffered JSON path, capped. A valid prefix at the cap must not be
+	// mistaken for a completely inspected response.
+	remaining := usageJSONCap - c.buf.Len()
+	if len(p) > remaining {
+		c.truncated = true
+		p = p[:remaining]
 	}
+	c.buf.Write(p)
 }
 
 // Text returns the assistant output text accumulated during Close. It is empty
 // unless the capture was built with captureText.
-func (c *usageCapture) Text() string { return c.text }
+func (c *usageCapture) Text() string { return c.result.text }
+
+// Complete reports protocol completion after Close. Transport, context and
+// client-write success are separate requirements checked by the relay.
+func (c *usageCapture) Complete() bool { return c.closed && c.result.complete }
+
+// ErrorType returns only a sanitized error type observed during parsing.
+func (c *usageCapture) ErrorType() string { return c.result.errorType }
 
 // Close finalizes parsing and returns the extracted usage. Safe to call once.
 func (c *usageCapture) Close() tokenUsage {
+	defer func() { c.closed = true }()
 	if c.stream {
 		_ = c.pw.Close()
 		<-c.done
-		return c.usage
+		return c.result.usage
 	}
 	raw := c.buf.Bytes()
 	if c.gzip {
-		if zr, err := gzip.NewReader(bytes.NewReader(raw)); err == nil {
-			if d, derr := io.ReadAll(io.LimitReader(zr, usageJSONCap)); derr == nil {
-				raw = d
-			}
-			zr.Close()
+		zr, err := gzip.NewReader(bytes.NewReader(raw))
+		if err != nil {
+			return tokenUsage{}
+		}
+		defer zr.Close()
+		raw, err = io.ReadAll(io.LimitReader(zr, usageJSONCap+1))
+		if err != nil {
+			return tokenUsage{}
+		}
+		if len(raw) > usageJSONCap {
+			c.truncated = true
+			raw = raw[:usageJSONCap]
 		}
 	}
-	u, text := parseJSONUsage(raw, c.captureText)
-	c.text = text
-	return u
+	c.result = parseJSONUsage(raw, c.captureText)
+	c.result.complete = c.result.complete && !c.truncated
+	return c.result.usage
 }

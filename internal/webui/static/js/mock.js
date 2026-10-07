@@ -182,6 +182,136 @@ function totalsSeries(q) {
   };
 }
 
+// ---------- Routing decision log (/routing/events) ----------
+// Deterministic fixtures with cursor pagination. One "pass" is a realistic
+// slice of elective-router behaviour: a live pending→switched pair and
+// outcomes that ended without a move (rebalance is the only policy that
+// executes live moves), plus one expiry shadow decision. Expiry is
+// shadow-only and per-destination: conversation/source are empty and the
+// nested evidence object describes the destination-opportunity measurement
+// — never executable, with the unknowns that rule out a real proposal.
+// "quota-unknown" passes omit the forecast block, "workload-unknown" passes
+// omit workload_last_hour, so partial evidence renders get exercised too.
+// Passes are stamped backwards in time, ids descend with them, so the
+// `before` cursor (id < before) pages strictly newest-first.
+
+const ROUTING_CONVS = ["9c1b7f3ae2d48501", "b42e0d6c91f7a3e8", "7d95c2f01e8ab463", "e0b8412c6d97f5aa"];
+
+const ROUTING_EVENTS = (() => {
+  const evs = [];
+  for (let p = 0; p < 12; p++) {
+    const t0 = now - 300 - p * 31300; // ~8.7h between passes → ~4.3 days of log
+    const cred = (i) => ["cred_ax91", "cred_bt42", "cred_ck88", "cred_dz17"][(i + p) % 4];
+    const [a, b, c, d] = [cred(0), cred(1), cred(2), cred(3)];
+    const convA = ROUTING_CONVS[p % ROUTING_CONVS.length];
+    const convB = ROUTING_CONVS[(p + 2) % ROUTING_CONVS.length];
+    const ev = (ts, o) => evs.push({ ts, ...o });
+
+    // Live rebalance that ran to completion: announced, then switched once
+    // the source's in-flight responses drained. Reasons alternate between
+    // operator sentences and backend tokens so both render paths are visible.
+    ev(t0 - 2060, {
+      policy: "rebalance", mode: "live", kind: "pending", conversation: convA,
+      source_id: a, target_id: b, evidence: {},
+      reason: p % 2 ? "destination qualifies at ≥4× effective score" : "destination-qualifies-4x",
+    });
+    ev(t0 - 1900, {
+      policy: "rebalance", mode: "live", kind: "switched", conversation: convA,
+      source_id: a, target_id: b, evidence: {},
+      reason: p % 2 ? "destination revalidated after drain" : "drained-and-revalidated",
+    });
+    // Announced, but in-flight responses never drained in time: pin kept.
+    ev(t0 - 3700, {
+      policy: "rebalance", mode: "live", kind: "pending", conversation: convB,
+      source_id: c, target_id: d, reason: "destination-qualifies-4x", evidence: {},
+    });
+    ev(t0 - 3540, {
+      policy: "rebalance", mode: "live", kind: "deferred", conversation: convB,
+      source_id: c, target_id: d, reason: "drain-timeout", evidence: {},
+    });
+    // Announced, then the destination stopped qualifying before the switch.
+    ev(t0 - 5200, {
+      policy: "rebalance", mode: "live", kind: "pending", conversation: convA,
+      source_id: b, target_id: c, evidence: {},
+      reason: "target effective score ≥ 4× source with fresh snapshots",
+    });
+    ev(t0 - 5000, {
+      policy: "rebalance", mode: "live", kind: "cancelled", conversation: convA,
+      source_id: b, target_id: c, reason: "no-longer-eligible", evidence: {},
+    });
+    // The announcement window lapsed with no eligible follow-up request.
+    ev(t0 - 6800, {
+      policy: "rebalance", mode: "live", kind: "cancelled", conversation: convB,
+      source_id: a, target_id: b, reason: "notice-expired", evidence: {},
+    });
+    // Shadow: expiry policy — the only shadow producer. Never executes
+    // moves: per-destination evaluations only (conversation/source empty),
+    // each marked not executable with the unknowns that rule out a real
+    // proposal. Evidence follows the nested destination-opportunity
+    // contract; forecast is omitted when quota is unknown, workload when
+    // workload is unknown.
+    ev(t0 - 7600, {
+      policy: "expiry", mode: "shadow", kind: "shadow_decision",
+      conversation: "", source_id: "", target_id: d,
+      reason: ["expiry-opportunity", "no-expiry-opportunity", "quota-unknown", "workload-unknown"][p % 4],
+      evidence: {
+        executable: false,
+        confidence: p % 2 ? "heuristic" : "unknown",
+        scope_knowledge: "max_only",
+        measurement: "destination_opportunity",
+        baseline: ["unknown", "outside_horizon", "no_need", "spare_weekly_capacity", "uncertain_spare_capacity"][p % 5],
+        blockers: ["scope_eligibility_unknown", "incremental_demand_unknown", "cache_cost_unknown", "stream_success_unknown"],
+        ...(p % 4 === 2
+          ? {}
+          : {
+              forecast: {
+                sample_times: [t0 - 600, t0 - 360, t0 - 120],
+                sample_age_seconds: 120,
+                reset_at: t0 + 5400,
+                horizon_seconds: 5520,
+                five_hour_pct_per_hour: { min: 2 + (p % 3), max: 5 + (p % 3) },
+                weekly_pct_per_hour: { min: 0.4 + (p % 3) * 0.1, max: 0.9 + (p % 3) * 0.1 },
+                unused_weekly_pct: { min: 18 + (p % 3) * 6, max: 52 + (p % 3) * 7 },
+              },
+            }),
+        ...(p % 4 === 3
+          ? {}
+          : {
+              workload_last_hour: {
+                requests: 180 + p * 7,
+                output_tokens: 42000 + p * 1100,
+                cache_creation_tokens: 5200 + p * 90,
+                cache_read_tokens: 640000 + p * 9000,
+                previous_requests_per_hour: 140 + p * 5,
+                recent_requests_per_hour: 205 + p * 6,
+                request_rate_trend: p % 2 ? "rising" : "steady",
+                requests_after_sample: 12 + p,
+                arrivals_after_sample: 9 + p,
+                pending_targets: 1 + (p % 3),
+                inflight: p % 4,
+                complete: true,
+              },
+            }),
+      },
+    });
+  }
+  evs.sort((x, y) => y.ts - x.ts);
+  // Ids descend with the sort so `before` cursor paging is stable.
+  return evs.map((e, i) => ({ id: 1600 - i, ...e }));
+})();
+
+function routingEventsPage(q) {
+  const limit = Math.min(Math.max(parseInt(q.get("limit"), 10) || 50, 1), 200);
+  const before = parseInt(q.get("before"), 10);
+  const pool = Number.isFinite(before) ? ROUTING_EVENTS.filter((e) => e.id < before) : ROUTING_EVENTS;
+  const items = pool.slice(0, limit);
+  return {
+    items,
+    next_before: pool.length > limit ? items[items.length - 1].id : null,
+    retention_days: 7,
+  };
+}
+
 const DB = {
   "/overview": (q) => {
     // Follows the selected window: scale totals vs a 24h baseline.
@@ -382,6 +512,7 @@ const DB = {
       key: "conv_" + (1000 + i), credential_id: CREDS[i % 3].id, credential_label: CREDS[i % 3].label,
       last_seen: now - 60 * i, requests: 3 + (i % 7),
     })),
+  "/routing/events": (q) => routingEventsPage(q),
 };
 
 // ---------- v3: prompts, conversations, messages ----------

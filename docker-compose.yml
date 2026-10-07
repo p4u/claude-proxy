@@ -26,6 +26,7 @@ services:
       CLAUDE_PROXY_MODELS_1M: "${MODELS_1M:-}"
       # Proactive Anthropic long-session rebalance; 0 disables it.
       CLAUDE_PROXY_REBALANCE_SESSIONS: "${REBALANCE_SESSIONS:-1}"
+      CLAUDE_PROXY_EXPIRY_POLICY: "${EXPIRY_POLICY:-shadow}"
       # Days to retain captured user prompts (last user message only, never
       # responses). Default 7; 0 disables prompt capture.
       CLAUDE_PROXY_PROMPT_RETENTION_DAYS: "${PROMPT_RETENTION_DAYS:-}"
