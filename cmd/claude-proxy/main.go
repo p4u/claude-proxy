@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/p4u/claude-proxy/internal/admin"
+	"github.com/p4u/claude-proxy/internal/claudioapi"
 	"github.com/p4u/claude-proxy/internal/codexgateway"
 	"github.com/p4u/claude-proxy/internal/creds"
 	"github.com/p4u/claude-proxy/internal/ingest"
@@ -262,6 +263,10 @@ func runServe(args []string) {
 	adminH := admin.New(db)
 
 	mux := http.NewServeMux()
+	// The claudio API must be registered before the /v1/ catch-all so that
+	// ServeMux's longest-prefix rule routes /v1/claudio/* to the local handler
+	// instead of the forwarding proxy.
+	claudioapi.New(mux, db, proxyH)
 	mux.Handle("/v1/", proxyH)
 	mux.Handle("/admin/", adminH)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {

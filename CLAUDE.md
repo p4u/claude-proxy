@@ -918,3 +918,61 @@ for the full contract (auth model, endpoints, response shapes).
 GitHub Actions (`.github/workflows/ci.yml`): lint → test → multi-arch Docker image (`linux/amd64` + `linux/arm64`) pushed to GHCR.
 
 Image tags: `:latest` and `:sha-<short>` on `main`; semver tags on `v*.*.*` pushes.
+
+
+## Claudio API (`internal/claudioapi`)
+
+The `claudioapi` package implements the session-manager API consumed by the
+[claudio](https://github.com/p4u/claudio) TUI client. It is mounted on the same
+`http.ServeMux` as the rest of the proxy, **before** the `/v1/` catch-all, so
+ServeMux's longest-prefix rule routes the entire subtree locally.
+
+### Routes
+
+| Method | Path | Auth required | Notes |
+|--------|------|---------------|-------|
+| `GET` | `/v1/claudio` | same as /v1/* | Discovery — `{version, capabilities}` |
+| `GET` | `/v1/claudio/config` | same as /v1/* | Recommended client env vars |
+| `GET` | `/v1/claudio/models` | same as /v1/* | Augmented model catalogue |
+| `GET` | `/v1/claudio/me/stats` | user token only | Per-user stats (24h/7d/30d) |
+| `GET` | `/v1/claudio/pool/health` | same as /v1/* | Coarse provider availability |
+
+Unknown paths return a local 404; wrong methods return 405. Neither is written
+to `request_log`.
+
+### Isolation guarantees
+
+1. **No upstream forwarding.** `claudioapi.Handler` never calls `pool.Bind`,
+   never selects a credential, and never makes an outbound HTTP request.
+2. **No `request_log` writes.** The handler does not call `logRequest`. A test
+   asserts zero rows after hitting all endpoints.
+3. **`/me/stats` identity check.** Admin tokens and anonymous callers (nil or
+   empty `UserTokenID`) receive 403. Queries are scoped by `user_token_id` so
+   user A cannot see user B's data.
+4. **`/pool/health` opacity.** Only a coarse status string per provider is
+   returned (`ok|busy|saturated|unavailable`). No credential IDs, labels, raw
+   percentages or counts are exposed. A 30 s in-memory cache prevents probing.
+5. **Rate limiting.** A per-identity token bucket (1 req/s, burst 10) prevents
+   enumeration.
+
+### Model catalogue sharing
+
+`proxy.Handler.GetCatalogue()` exposes the already-cached `/v1/models` body as
+parsed `[]map[string]any` entries. `claudioapi` calls this method directly
+instead of making a synthetic HTTP request through the forwarding path. The
+`modelsCache` struct gained a `refreshedAt` field to track when the current
+body was fetched from upstream.
+
+### Default model IDs
+
+`/v1/claudio/config` derives `ANTHROPIC_DEFAULT_*_MODEL` values by scanning the
+augmented catalogue for the **first `[1m]` entry per family** (fable, opus,
+sonnet, haiku). "First" means catalogue order, which is newest-first: Anthropic
+returns models sorted newest-first, and `augment1M` inserts `[1m]` rows before
+their base entry, preserving that order. A family with no `[1m]` entry is
+omitted from the env — model IDs are never hardcoded.
+
+### Registration
+
+`cmd/claude-proxy/main.go` calls `claudioapi.New(mux, db, proxyH)` **before**
+`mux.Handle("/v1/", proxyH)`. No other change to the mux is needed.

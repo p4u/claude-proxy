@@ -444,10 +444,11 @@ func augmentModels(raw []byte) []byte {
 // requests answer well inside Claude Code's 3-second timeout, and so a stale
 // copy can be served when upstream is unreachable.
 type modelsCache struct {
-	mu   sync.Mutex
-	body []byte
-	ct   string
-	exp  time.Time
+	mu          sync.Mutex
+	body        []byte
+	ct          string
+	exp         time.Time
+	refreshedAt time.Time // when the current body was fetched from upstream
 }
 
 func (c *modelsCache) get(now time.Time) ([]byte, string, bool) {
@@ -468,7 +469,26 @@ func (c *modelsCache) getStale() ([]byte, string, bool) {
 func (c *modelsCache) set(body []byte, ct string, now time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.body, c.ct, c.exp = body, ct, now.Add(modelsCacheTTL)
+	c.body, c.ct, c.exp, c.refreshedAt = body, ct, now.Add(modelsCacheTTL), now
+}
+
+// GetCatalogue implements claudioapi.CatalogueSource. It parses the cached
+// /v1/models JSON body into individual entries. The claudio API uses this to
+// derive per-family default model IDs without making a synthetic HTTP request.
+// Returns ok=false when no catalogue has been fetched yet.
+func (h *Handler) GetCatalogue() (entries []map[string]any, refreshedAt time.Time, ok bool) {
+	h.modelsCache.mu.Lock()
+	body := h.modelsCache.body
+	refreshedAt = h.modelsCache.refreshedAt
+	h.modelsCache.mu.Unlock()
+	if body == nil {
+		return nil, time.Time{}, false
+	}
+	entries, eok := parseModelEntries(body)
+	if !eok {
+		return nil, time.Time{}, false
+	}
+	return entries, refreshedAt, true
 }
 
 // bufferedRW captures a forward() response instead of streaming it to the client.
