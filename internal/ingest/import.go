@@ -18,6 +18,7 @@ type oauthBlock struct {
 	ExpiresAt        int64    `json:"expiresAt"` // milliseconds
 	Scopes           []string `json:"scopes"`
 	SubscriptionType string   `json:"subscriptionType"`
+	RateLimitTier    string   `json:"rateLimitTier"`
 }
 
 type credFile struct {
@@ -39,6 +40,12 @@ func parseCredBytes(raw []byte, who string) (oauthBlock, error) {
 	if !creds.HasOATMarker(o.AccessToken) {
 		return oauthBlock{}, fmt.Errorf("%s: access token does not look like a Claude Code OAuth token (no sk-ant-oat marker)", who)
 	}
+	// Validate metadata before the liveness check rotates the refresh token.
+	tier, err := creds.NormalizeRateLimitTier(o.RateLimitTier)
+	if err != nil {
+		return oauthBlock{}, fmt.Errorf("%s: %w", who, err)
+	}
+	o.RateLimitTier = tier
 	return o, nil
 }
 
@@ -81,7 +88,7 @@ func insertVerified(ctx context.Context, db *store.DB, o oauthBlock, label strin
 	if label == "" {
 		label = o.SubscriptionType
 	}
-	return creds.Insert(ctx, db, label, o.SubscriptionType, accessToken, refreshToken, expires, weight)
+	return creds.InsertWithRateLimitTier(ctx, db, label, o.SubscriptionType, accessToken, refreshToken, expires, weight, o.RateLimitTier)
 }
 
 // Import reads a Claude Code .credentials.json and inserts it into the pool.
@@ -143,7 +150,7 @@ func updateVerified(ctx context.Context, db *store.DB, id string, o oauthBlock) 
 	if err != nil {
 		return nil, fmt.Errorf("credential is not alive: %w", err)
 	}
-	if err := creds.UpdateTokens(ctx, db, id, accessToken, refreshToken, expires); err != nil {
+	if err := creds.UpdateTokensWithSubscription(ctx, db, id, accessToken, refreshToken, expires, o.SubscriptionType, o.RateLimitTier); err != nil {
 		return nil, err
 	}
 	return creds.Get(ctx, db, id)
@@ -168,7 +175,7 @@ func ImportOAuth(ctx context.Context, db *store.DB, t *claudeoauth.Tokens, label
 	if label == "" {
 		label = t.SubscriptionType
 	}
-	return creds.Insert(ctx, db, label, t.SubscriptionType, t.AccessToken, t.RefreshToken, t.ExpiresAt, weight)
+	return creds.InsertWithRateLimitTier(ctx, db, label, t.SubscriptionType, t.AccessToken, t.RefreshToken, t.ExpiresAt, weight, t.RateLimitTier)
 }
 
 // UpdateFromOAuth re-points an existing credential at a fresh OAuth sign-in,
@@ -181,14 +188,8 @@ func UpdateFromOAuth(ctx context.Context, db *store.DB, id string, t *claudeoaut
 	if c.Provider != provider.Anthropic {
 		return nil, fmt.Errorf("%s is not an Anthropic subscription", id)
 	}
-	if err := creds.UpdateTokens(ctx, db, id, t.AccessToken, t.RefreshToken, t.ExpiresAt); err != nil {
+	if err := creds.UpdateTokensWithSubscription(ctx, db, id, t.AccessToken, t.RefreshToken, t.ExpiresAt, t.SubscriptionType, t.RateLimitTier); err != nil {
 		return nil, err
-	}
-	// The profile just verified the plan; keep it current if it changed.
-	if t.SubscriptionType != "" && t.SubscriptionType != c.SubscriptionType {
-		if err := creds.SetSubscriptionType(ctx, db, id, t.SubscriptionType); err != nil {
-			return nil, err
-		}
 	}
 	return creds.Get(ctx, db, id)
 }

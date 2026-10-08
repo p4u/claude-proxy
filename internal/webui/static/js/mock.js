@@ -7,8 +7,8 @@ import { API_BASE } from "./api.js";
 // defaulting here keeps the fixtures readable). The GLM entry exercises the
 // API-key rendering path: no usage meters, no expiry, no refresh action.
 const CREDS = [
-  { id: "cred_ax91", label: "max-personal", type: "max", weight: 5, status: "active" },
-  { id: "cred_bt42", label: "team-eu", type: "team", weight: 5, status: "active" },
+  { id: "cred_ax91", label: "max-personal", type: "max", tier: "20x", weight: 5, status: "active" },
+  { id: "cred_bt42", label: "team-eu", type: "team", tier: "5x", weight: 5, status: "active" },
   { id: "cred_ck88", label: "pro-backup", type: "pro", weight: 1, status: "limited" },
   { id: "cred_dz17", label: "enterprise-01", type: "enterprise", weight: 5, status: "active" },
   { id: "cred_er05", label: "pro-old", type: "pro", weight: 1, status: "disabled" },
@@ -113,7 +113,7 @@ const rand = (seed) => {
 };
 
 function periodSpan(p) {
-  return { "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800, "30d": 2592000 }[p] || 86400;
+  return { "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800, "30d": 2592000, "90d": 7776000 }[p] || 86400;
 }
 
 // Resolve the requested window from query params: a custom from/to range (unix
@@ -312,7 +312,143 @@ function routingEventsPage(q) {
   };
 }
 
+// Subscription value fixtures deliberately use synthetic metadata, not routing
+// weights. Traffic reconciles across accounts, cohorts, daily rows and models.
+// Gateway traffic never acquires a plan or an account-level quota estimate.
+function subscriptionReport(q) {
+  const query = new URLSearchParams(q);
+  if (!query.has("period") && !query.has("from")) query.set("period", "30d");
+  const range = resolveWindow(query);
+  const five = query.get("quota_window") === "five_hour";
+  const windowSeconds = five ? 18000 : 604800;
+  const tokenKeys = ["input", "output", "cache_creation", "cache_read"];
+  const tokens = (values = {}) => {
+    const result = Object.fromEntries(tokenKeys.map((key) => [key, Math.max(0, Math.round(values[key] || 0))]));
+    result.total = tokenKeys.reduce((sum, key) => sum + result[key], 0);
+    return result;
+  };
+  const add = (rows) => tokens(Object.fromEntries(tokenKeys.map((key) => [key, rows.reduce((sum, row) => sum + row[key], 0)])));
+  const scaled = (value, factor) => tokens(Object.fromEntries(tokenKeys.map((key) => [key, value[key] * factor])));
+  const providerNames = { anthropic: "Anthropic", glm: "Z.AI GLM", custom_openai: "Custom OpenAI", codex: "OpenAI Codex", gemini: "Google Gemini" };
+  const normalizedTier = (value) => {
+    const tier = (value || "").trim().toLowerCase();
+    if (!tier) return "unknown";
+    if (tier === "5x" || tier.endsWith("_5x")) return "5x";
+    if (tier === "20x" || tier.endsWith("_20x")) return "20x";
+    return tier;
+  };
+  const sources = [
+    ...CREDS.map((cred) => ({ id: cred.id, name: cred.label, provider: providerOf(cred), plan: cred.type.trim().toLowerCase() || "unknown", tier: normalizedTier(cred.tier), attribution: "credential" })),
+    { id: "gateway_codex", name: "Codex gateway", provider: "codex", plan: "all", tier: "unknown", attribution: "gateway" },
+    { id: "gateway_gemini", name: "Gemini gateway", provider: "gemini", plan: "all", tier: "unknown", attribution: "gateway" },
+    { id: "cred_retired_demo", name: "Unknown or deleted credential", provider: "unknown", plan: "unknown", tier: "unknown", attribution: "unknown" },
+  ];
+  const day = 86400;
+  const today = Math.floor(now / day) * day;
+  function usage(index, from, to) {
+    const rows = [];
+    let requests = 0;
+    for (let ts = Math.floor(from / day) * day; ts < to; ts += day) {
+      const part = Math.max(0, Math.min(ts + day, to) - Math.max(ts, from)) / day;
+      const age = (today - ts) / day;
+      const pace = [650, 390, 68, 140, 7, 190, 45, 310, 130, 13][index] || 40;
+      const r = Math.round(pace * part * (0.76 + 0.25 * Math.sin(age / 3 + index) + 0.25 * rand(ts / day + index)));
+      const cache = 14000 + 9000 * (0.5 + 0.5 * Math.sin(age / 9 + index));
+      requests += r;
+      rows.push(tokens({ input: r * (1600 + index * 140), output: r * (520 + 180 * Math.sin(age / 6 + index)), cache_creation: r * 650, cache_read: r * cache }));
+    }
+    return { requests, tokens: add(rows) };
+  }
+  const groups = new Map();
+  const accounts = [];
+  const dailyMap = new Map();
+  const modelMap = new Map();
+  const capacity_history = [];
+  sources.forEach((source, index) => {
+    const key = [source.provider, source.plan, source.tier, source.attribution].map(encodeURIComponent).join("/");
+    const providerLabel = providerNames[source.provider] || "Unknown provider";
+    const planLabel = source.plan === "unknown" ? "Plan unknown" : source.plan[0].toUpperCase() + source.plan.slice(1);
+    const label = source.attribution === "gateway" ? `${providerLabel} / All plans (gateway)` : source.attribution === "unknown" ? "Unknown or deleted credential" : `${providerLabel} / ${planLabel}` + (source.tier !== "unknown" ? ` (${source.tier})` : source.provider === "anthropic" ? " (tier unknown)" : "");
+    if (!groups.has(key)) groups.set(key, { key, provider: source.provider, provider_name: providerNames[source.provider] || "Unknown provider", plan: source.plan, tier: source.tier, label, attribution: source.attribution, credentials: 0, requests: 0, tokens: tokens(), estimate: null, estimate_samples: 0, estimate_low: null, estimate_high: null });
+    const group = groups.get(key);
+    if (source.attribution !== "unknown") group.credentials++;
+    const observed = usage(index, range.start, range.end);
+    group.requests += observed.requests;
+    group.tokens = add([group.tokens, observed.tokens]);
+    const account = { ...source, group_key: key, ...observed, current: null };
+    accounts.push(account);
+    for (let ts = Math.floor(range.start / day) * day; ts < range.end; ts += day) {
+      const value = usage(index, Math.max(ts, range.start), Math.min(ts + day, range.end));
+      const dailyKey = JSON.stringify([key, ts]);
+      const row = dailyMap.get(dailyKey) || { ts, group_key: key, requests: 0, tokens: tokens() };
+      row.requests += value.requests;
+      row.tokens = add([row.tokens, value.tokens]);
+      dailyMap.set(dailyKey, row);
+    }
+    const modelIDs = source.provider === "anthropic" ? ["claude-opus-4-7", "claude-sonnet-4-6"] : source.provider === "codex" ? ["gpt-5.4", "gpt-5.4-mini"] : source.provider === "gemini" ? ["gemini-3.1-pro", "gemini-3-flash"] : source.provider === "glm" ? ["glm-4.7", "glm-5"] : ["demo-model", "demo-small"];
+    const split = scaled(observed.tokens, 0.63 + index * 0.02);
+    modelIDs.forEach((model, modelIndex) => {
+      const modelKey = JSON.stringify([key, model]);
+      const row = modelMap.get(modelKey) || { group_key: key, model, requests: 0, tokens: tokens() };
+      const part = modelIndex === 0 ? split : tokens(Object.fromEntries(tokenKeys.map((name) => [name, observed.tokens[name] - split[name]])));
+      row.tokens = add([row.tokens, part]);
+      const firstRequests = Math.round(observed.requests * 0.67);
+      row.requests += modelIndex === 0 ? firstRequests : observed.requests - firstRequests;
+      modelMap.set(modelKey, row);
+    });
+    if (source.provider !== "anthropic") return;
+    // Fixed reset cadence per account gives full-window current tokens and a
+    // separate aligned interval for the estimate. The pro fixture lacks delta;
+    // enterprise has intermittent observations and the disabled row none.
+    const elapsed = five ? 10800 + index * 420 : day * (3.5 + index * 0.22);
+    const start = now - elapsed;
+    const observedAt = now - (index === 4 ? 10 * day : 240);
+    const reset = start + windowSeconds;
+    const used = [58, 63, 4, 29, 0][index] || 0;
+    account.current = { start, reset_at: reset, observed_at: observedAt, used_pct: used, ...usage(index, start, Math.max(start, observedAt)), estimate: null, delta_pct: index === 2 ? 4 : 0, samples: index === 4 ? 0 : 2, reason: index === 2 ? "insufficient-delta" : index === 4 ? "insufficient-samples" : "" };
+    if (index === 4) {
+      // Backend placeholder object, not a genuine observed 0% reading.
+      account.current = { start: 0, reset_at: 0, observed_at: 0, used_pct: 0, requests: 0, tokens: tokens(), estimate: null, delta_pct: 0, samples: 0, reason: "missing_quota" };
+    }
+    if (![0, 1, 3].includes(index)) return;
+    const cadence = five ? day : windowSeconds;
+    for (let end = observedAt, sequence = 0; end >= range.start; end -= cadence, sequence++) {
+      if (end > range.end || (index === 3 && sequence % 3 === 1)) continue;
+      const nominalStart = five ? end - 10800 : start - sequence * windowSeconds;
+      const matchedStart = nominalStart + (five ? 1200 : 3600);
+      if (matchedStart < range.start || end - matchedStart < 1800) continue;
+      const interval = usage(index, matchedStart, end);
+      const age = (now - end) / day;
+      // Increasing Max throughput per quota point, decreasing Team; neither
+      // direction is called a better entitlement. Cache mix changes as well.
+      const trend = index === 0 ? 1.5 - age / 80 : index === 1 ? 0.55 + age / 40 : 1;
+      const delta = Math.round(Math.min(used - 2, Math.max(11, (index === 0 ? 31 : index === 1 ? 37 : 21) / trend)) * 10) / 10;
+      const estimate = tokens(Object.fromEntries(tokenKeys.map((key) => [key, interval.tokens[key] * 100 / delta])));
+      const sample = { group_key: key, credential_id: source.id, start: matchedStart, end, reset_at: nominalStart + windowSeconds, observed_at: end, tokens: interval.tokens, estimate, delta_pct: Math.round(delta * 10) / 10, samples: Math.max(2, Math.floor((end - matchedStart) / 600)) };
+      capacity_history.push(sample);
+      if (sequence === 0) Object.assign(account.current, { estimate, delta_pct: sample.delta_pct, samples: sample.samples });
+    }
+  });
+  // Component-wise summaries mirror the server's token bundle representation.
+  const quantile = (values, fraction) => {
+    const sorted = values.slice().sort((a, b) => a - b);
+    const position = (sorted.length - 1) * fraction;
+    const low = Math.floor(position);
+    return sorted[low] + (sorted[Math.ceil(position)] - sorted[low]) * (position - low);
+  };
+  for (const group of groups.values()) {
+    const samples = capacity_history.filter((sample) => sample.group_key === group.key);
+    group.estimate_samples = samples.length;
+    if (!samples.length) continue;
+    const summary = (fraction) => tokens(Object.fromEntries(tokenKeys.map((key) => [key, quantile(samples.map((sample) => sample.estimate[key]), fraction)])));
+    group.estimate = summary(0.5); group.estimate_low = summary(0.25); group.estimate_high = summary(0.75);
+  }
+  const list = [...groups.values()];
+  return { from: range.start, to: range.end, as_of: now, window: five ? "five_hour" : "seven_day", requests: list.reduce((sum, group) => sum + group.requests, 0), tokens: add(list.map((group) => group.tokens)), groups: list, accounts, daily: [...dailyMap.values()].sort((a, b) => a.ts - b.ts), capacity_history: capacity_history.sort((a, b) => a.end - b.end), models: [...modelMap.values()], notes: ["Synthetic offline examples: Max20x and Team5x are explicitly stored metadata, never inferred from weight.", "Estimates cover only matched intervals. Some credentials have too little quota movement, missing readings, or no quota API."], truncated: false };
+}
+
 const DB = {
+  "/stats/subscriptions": (q) => subscriptionReport(q),
   "/overview": (q) => {
     // Follows the selected window: scale totals vs a 24h baseline.
     const scale = Math.max(0.1, resolveWindow(q).span / 86400);
@@ -486,7 +622,7 @@ const DB = {
   },
   "/credentials": () =>
     CREDS.map((c, i) => ({
-      id: c.id, label: c.label, subscription_type: c.type, status: c.status, weight: c.weight,
+      id: c.id, label: c.label, subscription_type: c.type, rate_limit_tier: c.tier || "", status: c.status, weight: c.weight,
       provider: providerOf(c), has_usage_api: hasUsageAPI(c),
       endpoint: endpointOf(c), endpoint_name: endpointNameOf(c),
       endpoint_editable: !hasUsageAPI(c),
@@ -717,6 +853,17 @@ window.fetch = async (input, init = {}) => {
         type: "max", weight: Number.isInteger(b.weight) ? b.weight : 5, status: "active" };
       CREDS.push(c);
       return json({ ok: true, id: c.id, label: c.label, status: "active", subscription_type: c.type, weight: c.weight });
+    }
+    const tierMatch = path.match(/^\/credentials\/([^/]+)\/tier$/);
+    if (tierMatch && method === "POST") {
+      const b = JSON.parse(init.body || "{}");
+      const c = CREDS.find((row) => row.id === decodeURIComponent(tierMatch[1]));
+      if (!c) return json({ error: "credential not found" }, 404);
+      if (typeof b.tier !== "string" || new TextEncoder().encode(b.tier).length > 128 || /[\p{Cc}]/u.test(b.tier)) {
+        return json({ error: "tier must be at most 128 UTF-8 bytes without control characters" }, 400);
+      }
+      c.tier = b.tier.trim();
+      return json({ ok: true });
     }
     const settings = path.match(/^\/credentials\/([^/]+)\/settings$/);
     if (settings && method === "POST") {

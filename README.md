@@ -813,6 +813,15 @@ mounted).
 - **Subscriptions** — live 5h/7d utilization per credential with reset-time
   countdowns, plus historical utilization charts (the same data driving the
   usage-aware selection algorithm above).
+- **Subscription value** — recorded input, output, cache-write and cache-read
+  tokens grouped by provider and subscription tier (such as Max 20× or Team 5×),
+  current quota-window totals, daily trends and model mix over 7/30/90 days.
+  Matched changes in quota percentage estimate a workload-dependent
+  **100%-quota equivalent**, with evidence counts and interquartile ranges—not
+  a published token allowance. Only proxy-observed traffic is counted; Codex
+  and Gemini remain gateway-level totals without per-account attribution.
+  New Anthropic sign-ins/imports retain the reported tier; existing labels can
+  be corrected here without changing routing weights.
 - **Credentials** — the same actions as the TUI (import, enable/disable,
   refresh, re-weight, update tokens, delete), plus OpenAI Codex OAuth account
   connection and management, from a browser.

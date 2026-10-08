@@ -65,6 +65,74 @@ the selected window into equal intervals.
      bytes_sent,bytes_received,avg_latency_ms,conversations}]`.
 - `GET /api/stats/latency?period&buckets` → `{buckets:[...], avg_ms:[...], p95_ms:[...]}`.
 
+### Subscription value (recorded tokens and quota-equivalent estimates)
+
+The separate `#/subscription-value` page compares providers and subscription
+cohorts without treating quota percentage as a fixed token ledger.
+
+- `GET /api/stats/subscriptions?period=30d&quota_window=seven_day` →
+  `{from,to,as_of,window,requests,tokens,groups,accounts,daily,capacity_history,models,notes,truncated}`.
+  This endpoint defaults to **30d**, also accepts **90d** in addition to the
+  common periods, and supports custom `from`+`to`. The quota window is
+  `seven_day` (default) or `five_hour`. Historical totals use `[from,to)`;
+  current-window figures are independent of that historical selection. Bounds
+  must be nonnegative, ordered and not in the future. Responses are `no-store`;
+  interrupted/over-budget queries return `503` rather than fabricated empty data.
+- `tokens` always has integer fields
+  `{input,output,cache_creation,cache_read,total}`. Input means uncached input:
+  for custom OpenAI hosts the cached subset is subtracted from the inclusive
+  stored prompt count **in this report only**. Categories and total are additive
+  for recorded totals and individual estimates.
+- `groups[]`: `{key,provider,provider_name,plan,tier,label,attribution,credentials,
+  requests,tokens,estimate,estimate_samples,estimate_low,estimate_high}`.
+  Groups use **current** provider/plan/tier metadata, never selection weight.
+  `attribution` is `credential`, `gateway` or `unknown`. Estimate/low/high are
+  per-field median/Q1/Q3 across valid account-cycle samples; the median total
+  need not equal the sum of category medians. Missing estimates are `null`,
+  not zero. Raw future tiers remain distinct; recognized 5×/20× tiers normalize.
+- `accounts[]`: `{id,name,provider,plan,tier,group_key,attribution,requests,tokens,current}`.
+  `current`, when available, contains
+  `{start,reset_at,observed_at,used_pct,requests,tokens,estimate,delta_pct,samples,reason}`.
+  Its recorded tokens cover the nominal quota-window start through the quota
+  observation, inclusive, so the percentage and tokens have the **same as-of
+  timestamp**. The estimate uses a separate matched observation interval.
+  Reasons explain absent evidence, stale readings or partial coverage.
+  **`observed_at == 0` is an unavailable-data placeholder**: clients must not
+  render its zero percentage/counters as measurements. A genuine observed 0%
+  has a positive timestamp. When an older valid reading is retained behind an
+  invalid or stale latest observation, the UI labels it "Last observed" and
+  marks current quota unknown.
+- `daily[]`: `{ts,group_key,requests,tokens}` (UTC days).
+  `models[]`: `{group_key,model,requests,tokens}`. Model mix is descriptive:
+  an all-model quota delta does not establish a per-model allowance.
+- `capacity_history[]`: `{group_key,credential_id,start,end,reset_at,observed_at,
+  tokens,estimate,delta_pct,samples}`. Each sample is the longest qualifying
+  contiguous interval in one account/reset cycle, with endpoints in the report
+  range. The inference is **recorded tokens in `(start,end]` × 100 / percentage
+  points consumed**. It requires at least two valid distinct observations,
+  10 percentage points and 30 minutes. There is no invented zero baseline;
+  reset changes, decreases, invalid/unobserved readings and conflicting
+  timestamps break continuity. Reset jitter is tolerated only within 2 seconds
+  of a canonical reset. Current estimates are suppressed after reset or when
+  the latest reading is older than 30 minutes.
+
+All counters are **proxy-observed**, not a provider billing ledger. External
+traffic is invisible, old zero counters may mean missing accounting, and
+interrupted streams can retain only partial usage. Request timestamps are
+response-log times, not exact upstream billing timestamps. Historical quota
+rows without valid observation flags are not calibration evidence. Changes in
+model/cache mix or unseen traffic can change estimates without a plan change.
+
+Codex/Gemini requests are attributed only to their shared gateway; no local
+per-account token correlation or stored quota history exists, so these cohorts
+show all-plan provider totals, never an invented account allocation. Other
+providers without quota history show recorded tokens only. Deleted credentials
+remain explicit unknown cohorts rather than disappearing. History is grouped
+retrospectively using current metadata, not plan-at-request-time snapshots.
+`truncated` and `notes` disclose bounded/incomplete evidence. The report does
+not change routing, selection weights, quotas or limits and makes no monetary
+value claims.
+
 ### Subscription usage (remote limits)
 - `GET /api/usage/current` → per credential, latest snapshot + live counters:
   `[{credential_id,label,subscription_type,provider,has_usage_api,status,weight,
@@ -99,12 +167,21 @@ the selected window into equal intervals.
 ### Credential management (wraps `internal/creds`, `internal/ingest`)
 - `GET /api/credentials` → extended `credView` (reuse fields from `internal/admin`),
   including `provider` (`anthropic` | `glm` | `mimo` | `custom` |
-  `custom_openai`) and `has_usage_api`. The latter is
+  `custom_openai`), optional `rate_limit_tier`, and `has_usage_api`. The latter is
   false for providers publishing no utilization endpoint; the UI uses it to hide
   the usage meters, the expiry date and the OAuth-only row actions (Refresh,
   Update tokens) rather than showing 0% and a synthetic far-future date.
 - `POST /api/credentials` `{credentials_json, label, weight?}` → import pasted
   `.credentials.json` (use `ingest.ImportFromJSON`; verifies liveness, rejects dupes).
+- `POST /api/credentials/{id}/tier` `{tier:string}` → `{ok:true}`. Updates only
+  the statistics label (such as `5x` or `20x`), never weight/status/quota. Empty
+  clears it. Labels must be valid UTF-8, at most 128 trimmed bytes, without
+  control characters; invalid input returns `400`, unknown credentials `404`,
+  and synthetic sidecar gateways `409`. New Anthropic imports retain
+  `claudeAiOauth.rateLimitTier`; browser sign-in reads
+  `organization.rate_limit_tier`. Same-plan reconnects retain known metadata
+  when a tier is missing; a changed plan clears an obsolete tier unless the
+  new login supplies a replacement. JSONL backups preserve the tier.
 - `POST /api/credentials/keys` `{provider, api_key, endpoint?, label?, plan?, weight?}`
   → add a static API key (`ingest.ImportKey`). `provider` is `glm` or `mimo`.
   `endpoint` is a short name from the provider's endpoint list (`sgp`, `ams`,

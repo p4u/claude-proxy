@@ -63,6 +63,8 @@ func Open(path string) (*DB, error) {
 	}
 	for _, alter := range []string{
 		`ALTER TABLE credentials ADD COLUMN subscription_type TEXT`,
+		// Legacy subscriptions lack a verified tier; never infer it from weight.
+		`ALTER TABLE credentials ADD COLUMN rate_limit_tier TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE credentials ADD COLUMN last_request_at INTEGER`,
 		`ALTER TABLE credentials ADD COLUMN request_count INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE credentials ADD COLUMN success_count INTEGER NOT NULL DEFAULT 0`,

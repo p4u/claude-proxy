@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -21,6 +22,7 @@ import (
 type fakeAnthropic struct {
 	challenge string
 	orgType   string
+	tier      any // nil omits the field; json.RawMessage("null") publishes null
 	scope     string
 	tokenCode int
 	exchanges int
@@ -57,9 +59,13 @@ func (f *fakeAnthropic) serve(t *testing.T) *httptest.Server {
 				w.WriteHeader(http.StatusUnauthorized)
 				return
 			}
+			org := map[string]any{"organization_type": f.orgType}
+			if f.tier != nil {
+				org["rate_limit_tier"] = f.tier
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"account":      map[string]string{"email": "owner@example.com"},
-				"organization": map[string]string{"organization_type": f.orgType},
+				"organization": org,
 			})
 		default:
 			http.NotFound(w, r)
@@ -122,6 +128,44 @@ func TestExchangeHappyPath(t *testing.T) {
 	if _, err := f.Exchange(context.Background(), id, "the-code#"+state); err == nil ||
 		!strings.Contains(err.Error(), "expired or unknown") {
 		t.Fatalf("second exchange = %v, want the session to be single-use", err)
+	}
+}
+
+func TestExchangeRateLimitTier(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		tier    any
+		want    string
+		invalid bool
+	}{
+		{name: "absent"},
+		{name: "null", tier: json.RawMessage("null")},
+		{name: "max 20x", tier: "default_claude_max_20x", want: "default_claude_max_20x"},
+		{name: "max 5x", tier: "default_claude_max_5x", want: "default_claude_max_5x"},
+		{name: "future", tier: " future:Plan/未定 ", want: "future:Plan/未定"},
+		{name: "too long", tier: strings.Repeat("x", 129), invalid: true},
+		{name: "control", tier: "bad\ntier", invalid: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := &fakeAnthropic{orgType: "claude_max", tier: tt.tier, scope: "user:inference"}
+			fake.serve(t)
+			f := New()
+			id, state, challenge := start(t, f)
+			fake.challenge = challenge
+			tok, err := f.Exchange(context.Background(), id, "the-code#"+state)
+			if tt.invalid {
+				if !errors.Is(err, creds.ErrInvalidRateLimitTier) {
+					t.Fatalf("invalid profile tier error = %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tok.RateLimitTier != tt.want || tok.SubscriptionType != "max" {
+				t.Fatalf("tier=%q plan=%q", tok.RateLimitTier, tok.SubscriptionType)
+			}
+		})
 	}
 }
 

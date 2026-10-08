@@ -687,6 +687,7 @@ type exportLine struct {
 		ExpiresAt        int64    `json:"expiresAt"` // milliseconds
 		Scopes           []string `json:"scopes"`
 		SubscriptionType string   `json:"subscriptionType"`
+		RateLimitTier    string   `json:"rateLimitTier"`
 	} `json:"claudeAiOauth"`
 }
 
@@ -716,6 +717,7 @@ func credsExport(ctx context.Context, args []string) {
 		line.ClaudeAiOauth.ExpiresAt = c.ExpiresAt.UnixMilli()
 		line.ClaudeAiOauth.Scopes = []string{"user:inference", "user:profile"}
 		line.ClaudeAiOauth.SubscriptionType = c.SubscriptionType
+		line.ClaudeAiOauth.RateLimitTier = c.RateLimitTier
 		if err := enc.Encode(line); err != nil {
 			fmt.Fprintf(os.Stderr, "export: encode %s: %v\n", c.ID, err)
 			os.Exit(1)

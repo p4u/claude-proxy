@@ -63,6 +63,7 @@ type Tokens struct {
 	RefreshToken     string
 	ExpiresAt        time.Time
 	SubscriptionType string // "max", "pro", "team", "enterprise"
+	RateLimitTier    string // profile metadata; empty when not published
 	Email            string
 }
 
@@ -179,6 +180,10 @@ func (f *Flow) Exchange(ctx context.Context, id, pasted string) (*Tokens, error)
 	if err != nil {
 		return nil, err
 	}
+	tier, err := creds.NormalizeRateLimitTier(prof.Organization.RateLimitTier)
+	if err != nil {
+		return nil, fmt.Errorf("account profile: %w", err)
+	}
 	email := prof.Account.Email
 	if email == "" {
 		email = tok.Account.Email
@@ -189,6 +194,7 @@ func (f *Flow) Exchange(ctx context.Context, id, pasted string) (*Tokens, error)
 		// Same safety margin the refresher applies to every expiry it stores.
 		ExpiresAt:        f.now().Add(time.Duration(tok.ExpiresIn)*time.Second - 5*time.Minute),
 		SubscriptionType: sub,
+		RateLimitTier:    tier,
 		Email:            email,
 	}, nil
 }
@@ -247,6 +253,9 @@ type profileResp struct {
 	} `json:"account"`
 	Organization struct {
 		OrganizationType string `json:"organization_type"`
+		// Claude Code 2.1.280 reads this exact field from /api/oauth/profile
+		// into claudeAiOauth.rateLimitTier. Omitted/null stays unknown.
+		RateLimitTier string `json:"rate_limit_tier"`
 	} `json:"organization"`
 }
 

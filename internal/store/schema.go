@@ -5,6 +5,8 @@ CREATE TABLE IF NOT EXISTS credentials (
   id                TEXT PRIMARY KEY,
   label             TEXT,
   subscription_type TEXT,
+  -- Imported or operator-supplied tier label; empty means unknown, not 5x.
+  rate_limit_tier   TEXT NOT NULL DEFAULT '',
   -- Upstream this credential authenticates against; see internal/provider.
   -- Examples: 'anthropic', 'glm', 'custom', or 'custom_openai'.
   provider          TEXT NOT NULL DEFAULT 'anthropic',
@@ -85,6 +87,7 @@ CREATE TABLE IF NOT EXISTS request_log (
   cache_read_tokens     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_request_log_user_ts ON request_log(user_token_id, ts);
+CREATE INDEX IF NOT EXISTS idx_request_log_cred_ts ON request_log(credential_id, ts);
 CREATE INDEX IF NOT EXISTS idx_request_log_ts      ON request_log(ts);
 
 -- One row per captured user prompt (see internal/proxy prompt capture). Only

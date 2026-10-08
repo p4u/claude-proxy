@@ -21,6 +21,7 @@ type credView struct {
 	ID               string `json:"id"`
 	Label            string `json:"label,omitempty"`
 	SubscriptionType string `json:"subscription_type,omitempty"`
+	RateLimitTier    string `json:"rate_limit_tier,omitempty"`
 	Provider         string `json:"provider"`
 	// HasUsageAPI is false for providers that publish no utilization endpoint.
 	// The dashboard uses it to render "—" rather than 0%, which would otherwise
@@ -134,6 +135,8 @@ func (s *Server) credAction(w http.ResponseWriter, r *http.Request, id, action s
 			return
 		}
 		writeJSON(w, map[string]any{"ok": true, "id": id, "weight": body.Weight})
+	case action == "tier" && r.Method == http.MethodPost:
+		s.setCredentialTier(w, r, id)
 	case action == "settings" && r.Method == http.MethodPost:
 		var body struct {
 			Label  string `json:"label"`
@@ -209,6 +212,7 @@ func (s *Server) listCreds(w http.ResponseWriter, r *http.Request) {
 		v := credView{
 			ID: c.ID, Label: c.Label,
 			SubscriptionType: c.SubscriptionType,
+			RateLimitTier:    c.RateLimitTier,
 			Provider:         string(provider.Get(c.Provider).ID),
 			HasUsageAPI:      provider.Get(c.Provider).PollsUsage,
 			Endpoint:         provider.ResolveBaseURL(c.Provider, c.BaseURL),

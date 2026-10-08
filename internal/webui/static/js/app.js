@@ -6,6 +6,7 @@ import { applyTheme, getTheme, setTheme } from "./store.js";
 import { renderLogin } from "./pages/login.js";
 import * as dashboard from "./pages/dashboard.js";
 import * as usage from "./pages/usage.js";
+import * as subscriptionValue from "./pages/subscription-value.js";
 import * as credentials from "./pages/credentials.js";
 import * as users from "./pages/users.js";
 import { seriesColors } from "./charts.js";
@@ -15,6 +16,7 @@ window.__seriesColors = seriesColors;
 const ROUTES = {
   dashboard: { label: "Control room", icon: "grid", mod: dashboard },
   usage: { label: "Subscriptions", icon: "gauge", mod: usage },
+  "subscription-value": { label: "Subscription value", icon: "value", mod: subscriptionValue },
   credentials: { label: "Credentials", icon: "key", mod: credentials },
   users: { label: "Users", icon: "users", mod: users },
 };
@@ -163,6 +165,7 @@ function sigBars() {
 }
 
 const ICONS = {
+  value: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 3v17h17M8 15l4-5 4 2 5-7"/><path d="M17 5h4v4"/></svg>',
   grid: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>',
   gauge: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 15a8 8 0 0 1 16 0"/><path d="M12 15l4-4"/><circle cx="12" cy="15" r="1.3" fill="currentColor" stroke="none"/></svg>',
   key: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v4M21 12v3"/></svg>',

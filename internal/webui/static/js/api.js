@@ -90,6 +90,9 @@ export const api = {
   statsLatency: (win, buckets) =>
     request("GET", `/stats/latency?${winParams(win)}&buckets=${buckets}`),
   statsUsers: (win) => request("GET", `/stats/users?${winParams(win)}`),
+  statsSubscriptions: (win = "30d", quotaWindow = "seven_day") =>
+    request("GET", `/stats/subscriptions?${winParams(win)}&quota_window=${enc(quotaWindow)}`),
+  setCredentialTier: (id, tier) => request("POST", `/credentials/${enc(id)}/tier`, { tier }),
   statsSelection: (win, buckets) =>
     request("GET", `/stats/selection?${winParams(win)}&buckets=${buckets}`),
   usageCurrent: () => request("GET", "/usage/current"),

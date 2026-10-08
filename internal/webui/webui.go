@@ -128,6 +128,8 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, rest string) {
 		s.handleStatsTotals(w, r)
 	case rest == "/stats/selection" && r.Method == http.MethodGet:
 		s.handleStatsSelection(w, r)
+	case rest == "/stats/subscriptions" && r.Method == http.MethodGet:
+		s.handleSubscriptionValue(w, r)
 	case rest == "/usage/current" && r.Method == http.MethodGet:
 		s.handleUsageCurrent(w, r)
 	case rest == "/usage/history" && r.Method == http.MethodGet:
