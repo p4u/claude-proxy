@@ -589,7 +589,7 @@ func (h *Handler) serveModels(w http.ResponseWriter, r *http.Request, start time
 		}
 
 		rec := newBufferedRW()
-		result := h.forward(rec, r, nil, cred, true, false)
+		result := h.forward(rec, r, nil, cred, true, false, false)
 		status := result.status
 		h.logRequest(r.Context(), r.URL.Path, "", cred.ID, status, 0, result.rxBytes, time.Since(start), tokenUsage{})
 

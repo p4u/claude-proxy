@@ -570,6 +570,41 @@ In-flight tracking is local to one pool/process — a single serving instance
 is recommended (not cross-process safe). The headers are not necessarily
 displayed by Claude Code, and no account IDs/names/usage are exposed in them.
 
+**Compaction-aware handoffs** (`proxy/compaction.go`, `proxy/compaction_response.go`,
+`pool/compaction.go`): both gateway hint headers and headerless inference actively
+prefer the first compacted main request for an otherwise eligible elective move.
+A summary request can prepare/announce a plan but never execute it. It gives
+ordinary requests a fixed 60-second preference hold, and all elective execution
+is suppressed while a summary lease is in flight; ordinary fallback then resumes
+without changing existing thresholds. A confirmed boundary bypasses only the
+one-minute evaluation debounce and preference hold, not quota checks, durable
+cooldown, completed notice, affinity, or bounded draining. A boundary without a
+previously completed notice does not create an immediate move.
+
+The header path recognizes `x-claude-code-request-class: compaction` plus
+`x-claude-code-compaction: manual|auto|reactive`, then `class: main` plus
+`x-claude-code-context-compacted`. Gateway clients can optionally enable these
+with **client-side** `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`; the body path needs no
+client setup. Explicit helper classes, Haiku and count-only calls never consume
+evidence. Both paths require stable `router.SourceHeader`/`SourceMetadataUID`;
+never join content-derived keys by IP, user, or similar summaries.
+
+Body inference recognizes the known CLI summary template only in the final
+user message, validates the completed normal-stop assistant summary (JSON/SSE,
+including gzip), applies the CLI's analysis/summary-tag and whitespace
+normalization, and matches its SHA-256 digest and byte length to the leading
+compacted user wrapper with a changed history prefix. The detector is independent
+of full capture, keeps no raw summary in correlation state, and fails closed on
+unsupported templates/protocol shapes or outputs above its 1 MiB cap. Evidence
+publication and lease release share the pool mutex; older completions cannot
+overwrite newer generations. The one-use boundary is consumed at dispatch, not
+response success, so repeated hints/retries cannot rearm it. Evidence is capped
+at 4,096 records with a 15-minute TTL; losing it on eviction/restart only loses
+the optimization. Compaction never clears durable `account_bound`. Transactional
+switch audit reasons distinguish `compaction-header` and `compaction-inferred`.
+No client commands, prompts, or responses are injected or rewritten by this
+feature; Codex/Gemini and shared scoring are untouched.
+
 **Routing history and expiry shadow observations** (`pool/routing.go`, `pool/expiry.go`):
 `EXPIRY_POLICY=shadow` (`--expiry-policy`, `CLAUDE_PROXY_EXPIRY_POLICY`) records
 per-account forecasts once a minute; `off` disables the forecasts, not live

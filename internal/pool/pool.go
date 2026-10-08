@@ -29,6 +29,7 @@ type Pool struct {
 	mu  sync.Mutex // guards selection and request-lease atomicity
 
 	sessions       map[string]*sessionState
+	compactions    map[compactionKey]*compactionRecord // bounded, optional request evidence; guarded by mu
 	destinations   map[string]time.Time
 	now            func() time.Time
 	routingEvents  chan store.RoutingEvent
@@ -38,6 +39,7 @@ type Pool struct {
 func New(db *store.DB) *Pool {
 	return &Pool{db: db, log: slog.Default(), now: time.Now,
 		sessions: make(map[string]*sessionState), destinations: make(map[string]time.Time),
+		compactions:   make(map[compactionKey]*compactionRecord),
 		routingEvents: make(chan store.RoutingEvent, 256)}
 }
 
@@ -94,6 +96,12 @@ func (p *Pool) bindLocked(ctx context.Context, convID string, prov provider.ID, 
 		c, isNew, err = p.bindOnce(ctx, convID, prov, scope, allowed, touch)
 		return err
 	})
+	if err == nil {
+		if s := p.sessions[KeyScoped(convID, prov, scope)]; s != nil && s.compaction != nil &&
+			(isNew || s.compaction.source != c.ID) {
+			s.compaction = nil // emergency rebinding invalidates proof, never the live leases
+		}
+	}
 	return c, isNew, err
 }
 

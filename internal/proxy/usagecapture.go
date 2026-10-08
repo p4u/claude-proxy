@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"io"
 	"strings"
+
+	"github.com/p4u/claude-proxy/internal/pool"
 )
 
 // tokenUsage holds the token counters parsed out of an Anthropic Messages
@@ -57,6 +59,7 @@ func (u tokenUsage) apply(model string, b usageBlock, isStart bool) tokenUsage {
 type capturedResponse struct {
 	usage     tokenUsage
 	text      string
+	summary   pool.SummaryProof
 	complete  bool
 	errorType string
 }
@@ -64,14 +67,21 @@ type capturedResponse struct {
 // parseSSEUsage extracts usage and opt-in visible text from an Anthropic SSE
 // stream. Malformed data is skipped for usage, but cannot establish successful
 // completion. Only message_stop with no error event/read/parse failure does.
-func parseSSEUsage(r io.Reader, captureText bool) capturedResponse {
+func parseSSEUsage(r io.Reader, captureText, captureSummary bool) capturedResponse {
 	var result capturedResponse
 	var text strings.Builder
+	var summary *summarySSE
+	if captureSummary {
+		summary = &summarySSE{}
+	}
 	var failed, errorEvent bool
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20) // up to 1 MiB per SSE data line
 	for sc.Scan() {
 		line := sc.Bytes()
+		if summary != nil {
+			summary.line(line)
+		}
 		if len(line) == 0 {
 			errorEvent = false
 			continue
@@ -131,12 +141,15 @@ func parseSSEUsage(r io.Reader, captureText bool) capturedResponse {
 	}
 	result.complete = result.complete && !failed && sc.Err() == nil
 	result.text = text.String()
+	if summary != nil {
+		result.summary = summary.finish(result.complete)
+	}
 	return result
 }
 
 // parseJSONUsage extracts model, usage and opt-in visible text. Successful
 // completion requires a valid JSON object rather than a truncated/error body.
-func parseJSONUsage(b []byte, captureText bool) capturedResponse {
+func parseJSONUsage(b []byte, captureText, captureSummary bool) capturedResponse {
 	b = bytes.TrimSpace(b)
 	if len(b) == 0 || b[0] != '{' {
 		return capturedResponse{}
@@ -175,6 +188,9 @@ func parseJSONUsage(b []byte, captureText bool) capturedResponse {
 		}
 		result.text = strings.Join(parts, "\n\n")
 	}
+	if captureSummary && result.complete {
+		result.summary = parseJSONSummary(b)
+	}
 	return result
 }
 
@@ -204,6 +220,10 @@ type usageCapture struct {
 	// when the request's user opted into full conversation capture.
 	captureText bool
 
+	// captureSummary is independent of full conversation capture. It retains
+	// only a proof of a complete, narrowly validated compaction response.
+	captureSummary bool
+
 	result capturedResponse
 }
 
@@ -219,8 +239,8 @@ func isGzip(contentEncoding string) bool {
 // newUsageCapture builds a capture for the given response headers. For SSE it
 // spins up a background parser reading through an io.Pipe (so gzip can stream);
 // for non-stream JSON it buffers up to 1 MiB and parses on Close.
-func newUsageCapture(contentType, contentEncoding string, captureText bool) *usageCapture {
-	c := &usageCapture{gzip: isGzip(contentEncoding), captureText: captureText}
+func newUsageCapture(contentType, contentEncoding string, captureText, captureSummary bool) *usageCapture {
+	c := &usageCapture{gzip: isGzip(contentEncoding), captureText: captureText, captureSummary: captureSummary}
 	if isEventStream(contentType) {
 		c.stream = true
 		pr, pw := io.Pipe()
@@ -245,7 +265,7 @@ func (c *usageCapture) runSSE(pr *io.PipeReader) {
 		defer zr.Close()
 		r = zr
 	}
-	c.result = parseSSEUsage(r, c.captureText)
+	c.result = parseSSEUsage(r, c.captureText, c.captureSummary)
 }
 
 // Write feeds response bytes to the parser. It never returns an error to the
@@ -281,18 +301,38 @@ func (c *usageCapture) Text() string { return c.result.text }
 // client-write success are separate requirements checked by the relay.
 func (c *usageCapture) Complete() bool { return c.closed && c.result.complete }
 
+// Summary returns only the normalized text's digest and byte length, after a
+// fully parsed Close. Relay/client success must still be checked by the caller.
+func (c *usageCapture) Summary() pool.SummaryProof {
+	if !c.Complete() {
+		return pool.SummaryProof{}
+	}
+	return c.result.summary
+}
+
 // ErrorType returns only a sanitized error type observed during parsing.
 func (c *usageCapture) ErrorType() string { return c.result.errorType }
 
 // Close finalizes parsing and returns the extracted usage. Safe to call once.
 func (c *usageCapture) Close() tokenUsage {
-	defer func() { c.closed = true }()
+	defer func() {
+		c.closed = true
+		if c.captureSummary {
+			clear(c.buf.Bytes())
+			c.buf.Reset()
+		}
+	}()
 	if c.stream {
 		_ = c.pw.Close()
 		<-c.done
 		return c.result.usage
 	}
 	raw := c.buf.Bytes()
+	defer func() {
+		if c.captureSummary {
+			clear(raw)
+		}
+	}()
 	if c.gzip {
 		zr, err := gzip.NewReader(bytes.NewReader(raw))
 		if err != nil {
@@ -308,7 +348,10 @@ func (c *usageCapture) Close() tokenUsage {
 			raw = raw[:usageJSONCap]
 		}
 	}
-	c.result = parseJSONUsage(raw, c.captureText)
+	c.result = parseJSONUsage(raw, c.captureText, c.captureSummary)
 	c.result.complete = c.result.complete && !c.truncated
+	if !c.result.complete {
+		c.result.summary = pool.SummaryProof{}
+	}
 	return c.result.usage
 }

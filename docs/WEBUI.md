@@ -250,7 +250,11 @@ meter.
   final page may be followed by an empty page). Responses are `no-store`.
 - `policy=rebalance,mode=live`: `pending`, `switched`, `deferred`, `cancelled`.
   Only `switched` confirms a pin change; it commits in the same transaction as
-  the binding. Pending records mean a plan was prepared, not client acknowledgement.
+  the binding. A switched event's `reason=compaction-header` or
+  `compaction-inferred` identifies an elective move at a confirmed compacted
+  request; `usage-advantage` is the ordinary handoff path. No summary text or
+  client transcript path is recorded by compaction detection. Pending records
+  mean a plan was prepared, not client acknowledgement.
   Other events use a bounded best-effort queue; shutdown/overflow/write failure can
   leave gaps. `coverage_gap` reports observed queue overflow.
 - `policy=expiry,mode=shadow,kind=shadow_decision`: per-account unused-weekly-quota

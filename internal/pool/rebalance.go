@@ -33,6 +33,7 @@ type RequestOptions struct {
 	// AccountBound permanently disables elective handoffs for this binding,
 	// including later requests that omit account-scoped objects.
 	AccountBound bool
+	Compaction   CompactionRequest
 }
 
 type rebalancePlan struct {
@@ -54,6 +55,9 @@ type sessionState struct {
 	lastUsed     time.Time
 	drainWait    time.Duration // zero uses rebalanceDrainWait; test-only override
 	accountBound bool          // sticky; bindLocked hydrates/persists the durable flag
+
+	compaction      *compactionRecord // latest summary generation, owned by bounded evidence cache
+	summaryInflight int               // safety state: cannot be evicted with optional evidence
 }
 
 // finishPlan wakes every waiter, even when the source still has live streams.
@@ -85,17 +89,25 @@ type Lease struct {
 	Rebalance       string // empty, "pending", "switched", "deferred", or "cancelled"
 	RebalanceReason string // bounded, account-neutral diagnostic for deferred/cancelled
 
-	pool  *Pool
-	state *sessionState
-	plan  *rebalancePlan
-	once  sync.Once
+	pool       *Pool
+	state      *sessionState
+	plan       *rebalancePlan
+	once       sync.Once
+	summary    bool
+	generation *compactionRecord
 }
 
 // Release reports whether the pending notice was emitted on a completed,
 // successful response without a detected upstream, parser, or client write
 // failure. It is NOT a client acknowledgment: HTTP cannot prove the client read
 // the headers. Idempotent.
-func (l *Lease) Release(notified bool) {
+func (l *Lease) Release(notified bool) { l.ReleaseSummary(notified, SummaryProof{}) }
+
+// ReleaseSummary additionally records the digest of a completed successful
+// summary response. A valid proof certifies success independently of notified,
+// which only acknowledges a pending notice actually emitted on that response.
+// Pass a zero proof on every failure. Proof, notice, and drain update atomically.
+func (l *Lease) ReleaseSummary(notified bool, proof SummaryProof) {
 	l.once.Do(func() {
 		p := l.pool
 		p.mu.Lock()
@@ -104,8 +116,10 @@ func (l *Lease) Release(notified bool) {
 		if notified && l.plan != nil && s.pending == l.plan {
 			s.pending.notified = true
 		}
+		now := p.now()
+		p.completeSummary(l, proof, now)
 		s.inflight--
-		s.lastUsed = p.now()
+		s.lastUsed = now
 		if s.inflight == 0 {
 			close(s.drained)
 		}
@@ -125,6 +139,7 @@ func (p *Pool) AcquireScoped(ctx context.Context, convID string, prov provider.I
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	key := KeyScoped(convID, prov, scope)
+	compactionKey := compactionRequestKey(key, opts.Compaction)
 	s := p.sessions[key]
 	if s == nil {
 		s = &sessionState{}
@@ -153,7 +168,8 @@ func (p *Pool) AcquireScoped(ctx context.Context, convID string, prov provider.I
 		touch = false // a drain wait must not count the request twice
 		now := p.now()
 		s.lastUsed = now
-		eligible := opts.Rebalance && !opts.ObserveOnly && !s.accountBound && provider.Get(prov).PollsUsage && scope == "" && allowed == nil
+		trackCompaction := !opts.ObserveOnly && !s.accountBound && provider.Get(prov).PollsUsage && scope == "" && allowed == nil
+		eligible := opts.Rebalance && trackCompaction
 		switch {
 		case s.accountBound:
 			p.finishPlan(s, "account-bound")
@@ -167,6 +183,10 @@ func (p *Pool) AcquireScoped(ctx context.Context, convID string, prov provider.I
 			p.finishPlan(s, "notice-expired")
 		}
 		l := &Lease{Credential: c, IsNew: isNew, pool: p, state: s}
+		gate := compactionGate{allowSwitch: true, allowCheck: true, reason: "usage-advantage"}
+		if trackCompaction {
+			gate = p.compactionFor(s, compactionKey, c.ID, opts.Compaction, now)
+		}
 		// A waiter belongs to one plan, never a replacement. Other waiters may
 		// already have switched the pin; in that case just join the new pin.
 		planEnded := waited != nil && s.pending != waited
@@ -176,7 +196,7 @@ func (p *Pool) AcquireScoped(ctx context.Context, convID string, prov provider.I
 		if waited != nil && !time.Now().Before(deadline) {
 			budgetExpired = true
 		}
-		if eligible && !planEnded && !budgetExpired && s.pending != nil && s.pending.notified && s.inflight > 0 {
+		if eligible && gate.allowSwitch && !planEnded && !budgetExpired && s.pending != nil && s.pending.notified && s.inflight > 0 {
 			if waited == nil {
 				waited = s.pending
 				budget := s.drainWait
@@ -196,13 +216,14 @@ func (p *Pool) AcquireScoped(ctx context.Context, convID string, prov provider.I
 			}
 			continue // re-run emergency failover and revalidate after every wake
 		}
-		if eligible && !planEnded && !isNew && c.Status == creds.StatusActive &&
-			(s.pending != nil || now.Sub(s.lastCheck) >= rebalanceCheckEvery) {
+		if eligible && gate.allowCheck && !planEnded && !isNew && c.Status == creds.StatusActive &&
+			(s.pending != nil || gate.forceCheck || now.Sub(s.lastCheck) >= rebalanceCheckEvery) {
 			s.lastCheck = now
+			allowSwitch := gate.allowSwitch && !budgetExpired
 			var target *creds.Credential
 			err := store.Retry(ctx, func() error {
 				var err error
-				target, err = p.rebalanceOnce(ctx, key, c, s.pending, now, !budgetExpired)
+				target, err = p.rebalanceOnce(ctx, key, c, s.pending, now, allowSwitch, gate.reason)
 				return err
 			})
 			if err != nil {
@@ -224,7 +245,7 @@ func (p *Pool) AcquireScoped(ctx context.Context, convID string, prov provider.I
 						p.recordRouting(s.pending.routingEvent("deferred", "drain-timeout", now))
 						s.pending.lastDeferred = now
 					}
-				} else {
+				} else if allowSwitch {
 					l.Credential, l.IsNew, l.Rebalance = target, true, "switched"
 					p.destinations[target.ID] = now
 					p.finishPlan(s, "switched")
@@ -242,6 +263,9 @@ func (p *Pool) AcquireScoped(ctx context.Context, convID string, prov provider.I
 		}
 		if err := ctx.Err(); err != nil {
 			return nil, err
+		}
+		if trackCompaction {
+			p.dispatchCompaction(l, compactionKey, c.ID, opts.Compaction, gate, now)
 		}
 		if s.inflight == 0 {
 			s.drained = make(chan struct{})
@@ -357,7 +381,7 @@ func rebalanceAdvantage(oldWeight int, old rebalanceSample, weight int, target r
 // rebalanceOnce revalidates an announced destination in the same short write
 // transaction that changes the pin. Unlike normal new-binding selection, it has
 // no limited-credential fallback and never bootstraps missing usage as 0%.
-func (p *Pool) rebalanceOnce(ctx context.Context, key string, current *creds.Credential, plan *rebalancePlan, now time.Time, allowSwitch bool) (*creds.Credential, error) {
+func (p *Pool) rebalanceOnce(ctx context.Context, key string, current *creds.Credential, plan *rebalancePlan, now time.Time, allowSwitch bool, reason string) (*creds.Credential, error) {
 	// Discovery and timeout validation need no SQLite write lock. Only an
 	// acknowledged plan with a drained source may change the pin, rechecking
 	// everything inside an immediate transaction.
@@ -421,7 +445,7 @@ func (p *Pool) rebalanceOnce(ctx context.Context, key string, current *creds.Cre
 			return nil, err
 		}
 		if err := store.AppendRoutingEvent(ctx, tx, store.RoutingEvent{
-			TS: now.Unix(), Policy: "rebalance", Mode: "live", Kind: "switched", Reason: "usage-advantage",
+			TS: now.Unix(), Policy: "rebalance", Mode: "live", Kind: "switched", Reason: reason,
 			Conversation: store.ConversationReference(key), SourceID: current.ID, TargetID: target.ID,
 		}); err != nil {
 			return nil, err // an unauditable elective move must roll back
@@ -470,6 +494,7 @@ func rebalanceCandidates(ctx context.Context, reader rebalanceReader, prov provi
 func (p *Pool) pruneRebalances(now time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.pruneCompactions(now)
 	for key, s := range p.sessions {
 		if s.inflight == 0 && s.waiting == 0 && now.Sub(s.lastUsed) > rebalancePreviousAge {
 			p.finishPlan(s, "notice-expired")

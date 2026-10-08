@@ -672,6 +672,52 @@ credential that expires or gets revoked) are unchanged.
   recommended (not cross-process safe). Claude Code does not necessarily
   display the header, and no account ID/name/usage is exposed.
 
+### Prefer a handoff after compaction
+
+A recognized `/compact` or automatic compaction is a preferred opportunity to
+complete an **already justified** rebalance. The summary request stays on the
+current account (unless emergency failover is necessary), so its full history
+can still use that account's cache. It can prepare and announce a handoff; the
+first confirmed compacted main request can then switch after revalidation and
+in-flight draining. Compaction alone never justifies a rotation, bypasses the
+one-hour cooldown, or removes a conversation's account-resource affinity.
+
+Both detection paths are active:
+
+- **Explicit hints:** `x-claude-code-request-class: compaction` with
+  `x-claude-code-compaction: manual|auto|reactive`, followed by a `main` request
+  with `x-claude-code-context-compacted`. On clients supporting gateway hints,
+  optionally set `export CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` **where Claude Code
+  runs**, not on the proxy. No hook or client modification is required.
+- **Without hints:** recognize the known Claude Code summary prompt, validate
+  the successfully delivered summary, and match its normalized SHA-256 digest
+  and byte length to the leading continuation wrapper on the same binding.
+  A quoted marker, shorter body, failed summary, or inherited summary without
+  the observed generation is not sufficient. This is conservative recognition
+  of known templates (verified with Claude Code 2.1.280), not support for every
+  historical or future compaction format.
+
+Both require stable identity from `X-Router-Conversation-ID` or
+`metadata.user_id`; content-hash fallback sessions are never joined across a
+compaction. Helpers (`count_tokens`, Haiku, and explicitly classified auxiliary,
+subagent or workflow requests) do not consume the opportunity. Retries cannot
+rearm it. If no pending notice completed before the first compacted request,
+the proxy keeps the pin rather than inventing an immediate move.
+
+A summary attempt gives the resumed request a fixed **60-second preference**;
+ordinary elective switching is also held while that summary is in flight.
+Afterward, ordinary requests can use the existing policy, so a failed or
+abandoned compaction does not stall balancing forever. Clients without detected
+compaction retain ordinary rebalancing. Correlation is in memory, capped at
+4,096 records and 15 minutes; restart or eviction loses only the optimization.
+The detector retains hashes, not summary text, and works with prompt/full
+capture disabled. Existing capture settings remain independent.
+
+Routing activity identifies completed handoffs as `compaction-header` or
+`compaction-inferred`. A smaller compacted history can reduce the new account's
+cold-cache rebuild, but does not guarantee token or subscription-quota savings.
+Codex/Gemini balancing and emergency failover are unchanged.
+
 ## Usage-aware weighted selection
 
 Each credential carries an integer `weight`. Defaults derive from the

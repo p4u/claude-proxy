@@ -36,7 +36,7 @@ func gzipBytes(t *testing.T, b []byte) []byte {
 }
 
 func TestParseSSEUsage(t *testing.T) {
-	u := parseSSEUsage(bytes.NewReader([]byte(sseFixture)), false).usage
+	u := parseSSEUsage(bytes.NewReader([]byte(sseFixture)), false, false).usage
 	if u.Model != "claude-sonnet-4" {
 		t.Errorf("model = %q, want claude-sonnet-4", u.Model)
 	}
@@ -55,7 +55,7 @@ func TestParseSSEUsage(t *testing.T) {
 }
 
 func TestParseJSONUsage(t *testing.T) {
-	u := parseJSONUsage([]byte(jsonFixture), false).usage
+	u := parseJSONUsage([]byte(jsonFixture), false, false).usage
 	if u.Model != "claude-opus-4" {
 		t.Errorf("model = %q, want claude-opus-4", u.Model)
 	}
@@ -70,14 +70,14 @@ func TestParseJSONUsage(t *testing.T) {
 func TestParseMalformed(t *testing.T) {
 	// Malformed SSE data lines are skipped, yielding zero usage.
 	bad := "event: message_start\ndata: {not json}\n\ndata: \n\nnot-a-data-line\n"
-	if u := parseSSEUsage(bytes.NewReader([]byte(bad)), false).usage; u != (tokenUsage{}) {
+	if u := parseSSEUsage(bytes.NewReader([]byte(bad)), false, false).usage; u != (tokenUsage{}) {
 		t.Errorf("expected zero usage on malformed SSE, got %+v", u)
 	}
 	// Malformed JSON body → zero usage.
-	if u := parseJSONUsage([]byte("{broken"), false).usage; u != (tokenUsage{}) {
+	if u := parseJSONUsage([]byte("{broken"), false, false).usage; u != (tokenUsage{}) {
 		t.Errorf("expected zero usage on malformed JSON, got %+v", u)
 	}
-	if u := parseJSONUsage(nil, false).usage; u != (tokenUsage{}) {
+	if u := parseJSONUsage(nil, false, false).usage; u != (tokenUsage{}) {
 		t.Errorf("expected zero usage on empty JSON, got %+v", u)
 	}
 }
@@ -114,7 +114,7 @@ func TestUsageCaptureCompletion(t *testing.T) {
 		{"JSON gzip expanded cap", "application/json", "gzip", gzipBytes(t, []byte(jsonFixture+strings.Repeat(" ", usageJSONCap))), false, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			c := newUsageCapture(tc.contentType, tc.encoding, false)
+			c := newUsageCapture(tc.contentType, tc.encoding, false, false)
 			if c.Complete() {
 				t.Fatal("capture claims completion before Close")
 			}
@@ -134,7 +134,7 @@ func TestUsageCaptureGzipTrailerRequiredForCompletion(t *testing.T) {
 	} {
 		t.Run(tc.contentType, func(t *testing.T) {
 			raw := gzipBytes(t, []byte(tc.body))
-			c := newUsageCapture(tc.contentType, "gzip", false)
+			c := newUsageCapture(tc.contentType, "gzip", false, false)
 			c.Write(raw[:len(raw)-4]) // decoded body is present, gzip trailer is not
 			c.Close()
 			if c.Complete() {
@@ -145,7 +145,7 @@ func TestUsageCaptureGzipTrailerRequiredForCompletion(t *testing.T) {
 }
 
 func TestUsageCaptureSSE(t *testing.T) {
-	c := newUsageCapture("text/event-stream; charset=utf-8", "", false)
+	c := newUsageCapture("text/event-stream; charset=utf-8", "", false, false)
 	// Feed in chunks to exercise streaming.
 	data := []byte(sseFixture)
 	for i := 0; i < len(data); i += 7 {
@@ -162,7 +162,7 @@ func TestUsageCaptureSSE(t *testing.T) {
 }
 
 func TestUsageCaptureSSEGzip(t *testing.T) {
-	c := newUsageCapture("text/event-stream", "gzip", false)
+	c := newUsageCapture("text/event-stream", "gzip", false, false)
 	c.Write(gzipBytes(t, []byte(sseFixture)))
 	u := c.Close()
 	if u.Model != "claude-sonnet-4" || u.OutputTokens != 42 {
@@ -173,7 +173,7 @@ func TestUsageCaptureSSEGzip(t *testing.T) {
 func TestUsageCaptureSSEBadGzipDoesNotBlock(t *testing.T) {
 	// Content-Encoding says gzip but bytes are plain: parser must drain and
 	// return zero usage without blocking Close.
-	c := newUsageCapture("text/event-stream", "gzip", false)
+	c := newUsageCapture("text/event-stream", "gzip", false, false)
 	c.Write([]byte(sseFixture))
 	u := c.Close()
 	if u != (tokenUsage{}) {
@@ -182,7 +182,7 @@ func TestUsageCaptureSSEBadGzipDoesNotBlock(t *testing.T) {
 }
 
 func TestUsageCaptureJSON(t *testing.T) {
-	c := newUsageCapture("application/json", "", false)
+	c := newUsageCapture("application/json", "", false, false)
 	c.Write([]byte(jsonFixture))
 	u := c.Close()
 	if u.Model != "claude-opus-4" || u.InputTokens != 7 || u.OutputTokens != 13 {
@@ -191,7 +191,7 @@ func TestUsageCaptureJSON(t *testing.T) {
 }
 
 func TestUsageCaptureJSONGzip(t *testing.T) {
-	c := newUsageCapture("application/json", "gzip", false)
+	c := newUsageCapture("application/json", "gzip", false, false)
 	c.Write(gzipBytes(t, []byte(jsonFixture)))
 	u := c.Close()
 	if u.Model != "claude-opus-4" || u.OutputTokens != 13 {
@@ -202,7 +202,7 @@ func TestUsageCaptureJSONGzip(t *testing.T) {
 func TestUsageCaptureJSONCap(t *testing.T) {
 	// A body larger than the cap should still parse if the model/usage appear
 	// early, and must not panic. Here we prepend valid JSON then junk padding.
-	c := newUsageCapture("application/json", "", false)
+	c := newUsageCapture("application/json", "", false, false)
 	c.Write([]byte(jsonFixture))
 	c.Write(bytes.Repeat([]byte("x"), 2<<20)) // exceeds 1 MiB cap; truncated
 	u := c.Close()

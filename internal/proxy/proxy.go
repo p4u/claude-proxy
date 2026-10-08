@@ -153,9 +153,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var (
-		cred    *creds.Credential
-		convID  string
-		convSrc router.Source
+		cred           *creds.Credential
+		convID         string
+		convSrc        router.Source
+		captureSummary bool
+		summaryProof   pool.SummaryProof
 	)
 	if needsSticky(r) {
 		dr := router.Derive(r, body)
@@ -175,17 +177,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Account affinity is safety state, not an elective-rebalance setting:
 		// latch it even while rebalancing is disabled, before emergency binding.
 		accountBound := directSubscription && !portableRebalanceRequest(body)
-		lease, err := h.pool.AcquireScoped(r.Context(), dr.ConvID, prov, custom.Model, custom.CredIDs, pool.RequestOptions{
+		opts := pool.RequestOptions{
 			Rebalance:    h.RebalanceSessions && directSubscription && !accountBound,
 			ObserveOnly:  r.URL.Path == "/v1/messages/count_tokens" || strings.Contains(requestModel(body), "haiku"),
 			AccountBound: accountBound,
-		})
+		}
+		if opts.Rebalance {
+			opts.Compaction, opts.ObserveOnly = classifyCompaction(r, body, dr.Source)
+			captureSummary = opts.Compaction.Phase == pool.CompactionSummary && opts.Compaction.Request != ([32]byte{})
+		}
+		lease, err := h.pool.AcquireScoped(r.Context(), dr.ConvID, prov, custom.Model, custom.CredIDs, opts)
 		if err != nil {
 			h.log.Warn("bind failed", "err", err, "conv", convID, "src", string(convSrc), "provider", string(prov))
 			h.failBind(w, err, prov)
 			return
 		}
-		defer func() { lease.Release(notice.pendingEmitted() && r.Context().Err() == nil) }()
+		defer func() {
+			if r.Context().Err() != nil {
+				summaryProof = pool.SummaryProof{}
+			}
+			lease.ReleaseSummary(notice.pendingEmitted() && r.Context().Err() == nil, summaryProof)
+		}()
 		notice.state = lease.Rebalance
 		cred = lease.Credential
 		h.log.Info("bind",
@@ -222,9 +234,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	result := h.forward(w, r, body, cred, true, captureReply)
+	result := h.forward(w, r, body, cred, true, captureReply, captureSummary)
 	result.complete = result.complete && !notice.failed && r.Context().Err() == nil
 	notice.complete = result.complete
+	if captureSummary && result.status == http.StatusOK && result.complete {
+		summaryProof = result.summary
+	}
 	usage := result.usage
 	if usage.Model == "" {
 		usage.Model = requestedModel
@@ -338,7 +353,8 @@ type forwardResult struct {
 	status    int // upstream status, or -1 on local failure
 	rxBytes   int64
 	usage     tokenUsage
-	text      string // opt-in assistant text capture only
+	text      string            // opt-in assistant text capture only
+	summary   pool.SummaryProof // digest only; independent of conversation capture
 	complete  bool
 	errorType string // sanitized upstream error type, never the error message
 }
@@ -346,7 +362,7 @@ type forwardResult struct {
 // forward sends the request upstream and streams the response back. If
 // allowRetry is true and upstream returns 401, it refreshes the credential and
 // retries once, before any response bytes have been sent to the client.
-func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, cred *creds.Credential, allowRetry, captureText bool) (result forwardResult) {
+func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, cred *creds.Credential, allowRetry, captureText, captureSummary bool) (result forwardResult) {
 	// The upstream is a property of the credential, not of the proxy. GLM's
 	// base URL carries a path prefix (/api/anthropic), so this concatenates
 	// onto the base rather than swapping a host.
@@ -504,7 +520,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 			return forwardResult{status: http.StatusUnauthorized, errorType: errorType}
 		}
 		h.log.Info("refresh succeeded; retrying upstream", "cred", cred.ID)
-		return h.forward(w, r, body, fresh, false, captureText)
+		return h.forward(w, r, body, fresh, false, captureText, captureSummary)
 	}
 
 	if resp.StatusCode == http.StatusTooManyRequests {
@@ -553,7 +569,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 	// responses; other statuses carry no billable usage worth parsing.
 	var cap *usageCapture
 	if resp.StatusCode == http.StatusOK {
-		cap = newUsageCapture(resp.Header.Get("Content-Type"), resp.Header.Get("Content-Encoding"), captureText)
+		cap = newUsageCapture(resp.Header.Get("Content-Type"), resp.Header.Get("Content-Encoding"), captureText, captureSummary)
 	}
 
 	result.status = resp.StatusCode
@@ -562,6 +578,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 		if cap != nil {
 			result.usage = cap.Close()
 			result.text = cap.Text()
+			result.summary = cap.Summary()
 			result.complete = result.complete && cap.Complete()
 			result.errorType = cap.ErrorType()
 		} else if resp.StatusCode >= 400 {
