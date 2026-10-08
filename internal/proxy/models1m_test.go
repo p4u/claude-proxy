@@ -191,3 +191,58 @@ func TestEntry1MRejectsBelowThreshold(t *testing.T) {
 		t.Error("entry without an id must not be augmented")
 	}
 }
+
+// TestStartCatalogueRefreshPopulatesOnColdStart verifies that
+// StartCatalogueRefresh fetches the catalogue immediately at startup so
+// that GetCatalogue returns ok=true before any client sends GET /v1/models.
+// This is finding 3: the catalogue must initialise independently of client
+// traffic even when Augment1M is enabled (finding 3).
+func TestStartCatalogueRefreshPopulatesOnColdStart(t *testing.T) {
+	// Build a fake upstream that answers GET /v1/models with a minimal JSON.
+	const modelsJSON = `{"data":[{"id":"claude-opus-5","display_name":"Claude Opus 5","type":"model","max_input_tokens":1048576}],"has_more":false,"first_id":"claude-opus-5","last_id":"claude-opus-5"}`
+	var upstreamHits int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(modelsJSON))
+	}))
+	defer ts.Close()
+
+	h, _, _, _ := setupProxy(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(modelsJSON))
+	})
+
+	// Confirm GetCatalogue returns ok=false before any refresh.
+	_, _, ok := h.GetCatalogue()
+	if ok {
+		t.Fatal("GetCatalogue should return ok=false on a cold start (no client traffic yet)")
+	}
+
+	// Trigger a synchronous refresh (not via the background goroutine so we
+	// can assert the result without sleeps).
+	testCtx := t.Context()
+	h.refreshCatalogueOnce(testCtx)
+
+	entries, _, ok2 := h.GetCatalogue()
+	if !ok2 {
+		t.Fatal("GetCatalogue returned ok=false after refreshCatalogueOnce")
+	}
+	if len(entries) == 0 {
+		t.Fatal("GetCatalogue returned empty entries after refresh")
+	}
+	// The [1m] variant must be in the catalogue (Augment1M is true by default).
+	var found1M bool
+	for _, e := range entries {
+		if id, _ := e["id"].(string); id == "claude-opus-5[1m]" {
+			found1M = true
+		}
+	}
+	if !found1M {
+		t.Errorf("augmented [1m] entry not present; entries: %v", entries)
+	}
+	_ = ts
+}

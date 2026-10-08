@@ -260,6 +260,10 @@ func runServe(args []string) {
 		go proxy.PromptJanitor(ctx, db, *promptRetentionDays, logger)
 		logger.Info("prompt logging enabled", "retention_days", *promptRetentionDays)
 	}
+	// Warm the model catalogue immediately so the claudio API can serve
+	// /v1/claudio/models and /v1/claudio/config without waiting for the first
+	// client GET /v1/models request.  The goroutine refreshes on every TTL.
+	proxyH.StartCatalogueRefresh(ctx)
 	adminH := admin.New(db)
 
 	mux := http.NewServeMux()

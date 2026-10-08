@@ -491,6 +491,53 @@ func (h *Handler) GetCatalogue() (entries []map[string]any, refreshedAt time.Tim
 	return entries, refreshedAt, true
 }
 
+// refreshCatalogueOnce fetches a fresh model catalogue from upstream providers
+// (exactly as GET /v1/models would) and stores the result in the shared cache.
+// It is a no-op when the cache is still fresh.
+//
+// The request is synthetic and never forwarded from a client: the claudio API
+// can therefore serve /v1/claudio/models and /v1/claudio/config on a cold
+// start without waiting for any /v1/models client traffic.
+func (h *Handler) refreshCatalogueOnce(ctx context.Context) {
+	if _, _, ok := h.modelsCache.get(time.Now()); ok {
+		return // already fresh — nothing to do
+	}
+	// Build a minimal synthetic GET /v1/models request. forward() needs the
+	// request to construct the upstream URL; the URL host is overwritten by
+	// the pool-selected credential's base URL, so the host here is only a
+	// placeholder.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"https://api.anthropic.com/v1/models", nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	rec := newBufferedRW()
+	h.serveModels(rec, req, time.Now())
+}
+
+// StartCatalogueRefresh refreshes the model catalogue immediately (so it is
+// available to the claudio API before any client sends GET /v1/models), then
+// repeats on the catalogue TTL so Augment1M-generated entries remain fresh.
+//
+// It must be called after New() and before accepting traffic.  It launches a
+// background goroutine that exits when ctx is cancelled.
+func (h *Handler) StartCatalogueRefresh(ctx context.Context) {
+	go func() {
+		h.refreshCatalogueOnce(ctx)
+		ticker := time.NewTicker(modelsCacheTTL)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				h.refreshCatalogueOnce(ctx)
+			}
+		}
+	}()
+}
+
 // bufferedRW captures a forward() response instead of streaming it to the client.
 type bufferedRW struct {
 	header http.Header
