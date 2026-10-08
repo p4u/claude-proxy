@@ -73,22 +73,77 @@ type CatalogueSource interface {
 //
 // mux must be the same http.ServeMux that the proxy already uses so that
 // /v1/claudio and /v1/claudio/ are resolved before the /v1/ catch-all.
+//
+// IMPORTANT: registering on the mux is NOT sufficient to prevent bypass.
+// ServeMux canonicalises paths before matching, so percent-encoded slashes
+// (/v1/claudio%2Fmodels), dot segments (/v1/claudio/../messages) and
+// /v1/claudiox all fall through to the /v1/ catch-all.  Callers must wrap
+// the mux with WrapHandler so that any raw/escaped path that starts with
+// "/v1/claudio" is intercepted before ServeMux sees it.
 func New(mux *http.ServeMux, db *store.DB, cat CatalogueSource) *Handler {
 	h := &Handler{
 		db:       db,
 		cat:      cat,
 		rateBkts: make(map[string]*bucket),
 	}
-	// Register both the bare prefix and the slash-terminated prefix.
-	// ServeMux routes /v1/claudio and everything under /v1/claudio/ to h,
-	// which means the forwarding handler on /v1/ never sees these paths.
+	// Belt-and-suspenders: also register on the mux for the plain (non-encoded)
+	// case so that any path-through the guard reaches the correct handler.
 	mux.Handle("/v1/claudio", h)
 	mux.Handle("/v1/claudio/", h)
 	return h
 }
 
+// WrapHandler returns an http.Handler that intercepts ALL requests whose
+// raw/escaped path starts with "/v1/claudio" BEFORE http.ServeMux sees them.
+//
+// This is necessary because ServeMux canonicalises paths (cleans dot segments,
+// decodes percent-encoded slashes) before route matching, which causes:
+//
+//   - /v1/claudio%2Fmodels  — %2F is an encoded slash; ServeMux never matches
+//     the /v1/claudio/ pattern and falls through to /v1/
+//   - /v1/claudiox          — starts with the reserved prefix but has no
+//     matching pattern; ServeMux routes it to /v1/
+//   - /v1/claudio/../messages — ServeMux redirects to /v1/messages (dot-clean)
+//   - //v1/claudio/config    — ServeMux redirects to /v1/claudio/config
+//
+// Any path whose raw/escaped form starts with "/v1/claudio" is considered
+// reserved and handled locally.  The claudio ServeHTTP returns a local 404
+// for unrecognised paths and rejects encoded characters and dot segments with
+// 404 as well — none of these requests reach the forwarding proxy.
+//
+// WrapHandler must be applied to the mux BEFORE it is passed to
+// proxy.AuthMiddleware so that auth still runs first.
+func (h *Handler) WrapHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// EscapedPath returns RawPath when set (i.e. the path contains
+		// percent-encoding), otherwise it returns Path.  This lets us see
+		// the path as the client actually sent it, before any canonicalisation.
+		if strings.HasPrefix(r.URL.EscapedPath(), "/v1/claudio") {
+			h.ServeHTTP(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // ServeHTTP dispatches to the appropriate sub-handler or returns 404/405.
+//
+// Raw path validation: percent-encoding in the path and dot segments are
+// rejected with 404.  These are potential bypass attempts; a legitimate client
+// always sends a clean ASCII path such as /v1/claudio/models.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Reject any request whose path has percent-encoding or dot segments.
+	// r.URL.RawPath is only set when the path contains characters that required
+	// encoding, so a non-empty RawPath means something like %2F was present.
+	// Dot segments (".." or "." components) in the decoded path cover the
+	// redirect-based bypass (/v1/claudio/../messages → ServeMux 301).
+	if r.URL.RawPath != "" ||
+		strings.Contains(r.URL.Path, "..") ||
+		strings.Contains(r.URL.Path, "//") {
+		writeJSON(w, http.StatusNotFound, apiError("not_found", "claudio: invalid path encoding"))
+		return
+	}
+
 	// Strip trailing slash for matching (GET /v1/claudio/ == GET /v1/claudio).
 	path := strings.TrimRight(r.URL.Path, "/")
 
@@ -111,7 +166,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/v1/claudio/pool/health":
 		h.methodOnly(w, r, http.MethodGet, h.servePoolHealth)
 	default:
-		writeJSON(w, http.StatusNotFound, apiError("not_found", "claudio: unknown endpoint "+r.URL.Path))
+		// Includes /v1/claudiox and any other path that starts with
+		// /v1/claudio but does not match a known route.
+		writeJSON(w, http.StatusNotFound, apiError("not_found", "claudio: unknown endpoint"))
 	}
 }
 

@@ -9,10 +9,12 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/p4u/claude-proxy/internal/claudioapi"
+	"github.com/p4u/claude-proxy/internal/proxy"
 	"github.com/p4u/claude-proxy/internal/store"
 	"github.com/p4u/claude-proxy/internal/usertoken"
 )
@@ -625,5 +627,146 @@ func TestTrailingSlashNormalised(t *testing.T) {
 	mux.ServeHTTP(rw, req)
 	if rw.Code != http.StatusOK {
 		t.Fatalf("expected 200 for /v1/claudio/, got %d", rw.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Namespace bypass (finding 1)
+//
+// Tests run against the full production stack:
+//   AuthMiddleware → WrapHandler → ServeMux (with fake upstream)
+//
+// For every bypass path and every method, the fake upstream counter must
+// stay at 0 and request_log must stay empty.  A normal /v1/messages
+// request asserts the upstream counter reaches 1 (forward works).
+// ---------------------------------------------------------------------------
+
+// setupBypassStack builds the complete production handler chain used in
+// bypass tests.  Returns the top-level handler, the DB, the upstream hit
+// counter, and the bearer token of the created user.
+func setupBypassStack(t *testing.T) (http.Handler, *store.DB, *atomic.Int64, string) {
+	t.Helper()
+	db, err := store.Open(filepath.Join(t.TempDir(), "bypass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	// Create a real user token.
+	ut, err := usertoken.Create(context.Background(), db, "bypass-tester")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var hits atomic.Int64
+	fakeUpstream := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+
+	cat := &fakeCatalogue{ok: false}
+	mux := http.NewServeMux()
+	claudioH := claudioapi.New(mux, db, cat)
+	mux.Handle("/v1/", fakeUpstream)
+
+	// AuthMiddleware → WrapHandler → mux  (the real production order).
+	handler := proxy.AuthMiddleware(
+		"", // no admin token — matching the vulnerability's precondition
+		db,
+		false,
+		claudioH.WrapHandler(mux),
+	)
+	return handler, db, &hits, ut.Token
+}
+
+// TestNamespaceBypassPathsNeverForward is the security regression test for
+// finding 1 (HIGH): bypass paths must never reach the upstream handler and
+// must never write a request_log row.
+func TestNamespaceBypassPathsNeverForward(t *testing.T) {
+	handler, db, hits, token := setupBypassStack(t)
+
+	// Paths that are bypass candidates — each must return a local response
+	// (4xx) and must NOT increment the upstream counter.
+	bypassPaths := []string{
+		"/v1/claudio",
+		"/v1/claudio/",
+		"/v1/claudio/x",
+		"/v1/claudio%2Fmodels",
+		"/v1/claudiox",
+		"/v1/claudio/../messages",
+		"/v1/claudio/%2e%2e/messages",
+	}
+	methods := []string{
+		http.MethodGet,
+		http.MethodPost,
+		http.MethodHead,
+		http.MethodOptions,
+		http.MethodDelete,
+	}
+
+	for _, path := range bypassPaths {
+		for _, method := range methods {
+			t.Run(method+" "+path, func(t *testing.T) {
+				before := hits.Load()
+				req := httptest.NewRequest(method, path, nil)
+				req.Header.Set("Authorization", "Bearer "+token)
+				rw := httptest.NewRecorder()
+				handler.ServeHTTP(rw, req)
+
+				after := hits.Load()
+				if after != before {
+					t.Errorf("upstream was hit for %s %s (counter %d→%d)",
+						method, path, before, after)
+				}
+				// Must not be 5xx (not an internal error we caused).
+				if rw.Code >= 500 && rw.Code != http.StatusServiceUnavailable {
+					t.Errorf("got unexpected %d for %s %s: %s",
+						rw.Code, method, path, rw.Body.String())
+				}
+			})
+		}
+	}
+
+	// //v1/claudio/config has a double slash; ServeMux redirects it locally
+	// (301) — the upstream counter must stay 0.
+	t.Run("double-slash //v1/claudio/config", func(t *testing.T) {
+		before := hits.Load()
+		req := httptest.NewRequest(http.MethodGet, "//v1/claudio/config", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rw := httptest.NewRecorder()
+		handler.ServeHTTP(rw, req)
+		after := hits.Load()
+		if after != before {
+			t.Errorf("upstream hit for //v1/claudio/config (counter %d→%d)", before, after)
+		}
+	})
+
+	// Sanity: a normal /v1/messages request DOES reach the fake upstream.
+	t.Run("normal /v1/messages forwards", func(t *testing.T) {
+		before := hits.Load()
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages",
+			strings.NewReader(`{"model":"claude-test","messages":[]}`))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		rw := httptest.NewRecorder()
+		handler.ServeHTTP(rw, req)
+		after := hits.Load()
+		if after == before {
+			t.Errorf("/v1/messages was NOT forwarded to upstream (counter stayed at %d)", before)
+		}
+	})
+
+	// Assert no request_log rows were written for bypass attempts.
+	var logCount int
+	if err := db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM request_log`).Scan(&logCount); err != nil {
+		t.Fatal(err)
+	}
+	// Only the /v1/messages forward may have produced a log row (it's OK if it did).
+	// The bypass paths must contribute 0 rows.  We can't easily distinguish
+	// rows by path here, but the forward only produces 1 hit so at most 1 row.
+	if logCount > 1 {
+		t.Errorf("expected at most 1 request_log row (the forwarded /v1/messages), got %d", logCount)
 	}
 }

@@ -263,10 +263,13 @@ func runServe(args []string) {
 	adminH := admin.New(db)
 
 	mux := http.NewServeMux()
-	// The claudio API must be registered before the /v1/ catch-all so that
-	// ServeMux's longest-prefix rule routes /v1/claudio/* to the local handler
-	// instead of the forwarding proxy.
-	claudioapi.New(mux, db, proxyH)
+	// The claudio API is registered before the /v1/ catch-all so that
+	// ServeMux's longest-prefix rule routes /v1/claudio/* to the local handler.
+	// WrapHandler adds a pre-routing guard that intercepts requests whose
+	// raw/escaped path starts with "/v1/claudio" BEFORE ServeMux canonicalises
+	// the path — this prevents bypasses via percent-encoded slashes, dot
+	// segments, and adjacent-prefix paths such as /v1/claudiox.
+	claudioH := claudioapi.New(mux, db, proxyH)
 	mux.Handle("/v1/", proxyH)
 	mux.Handle("/admin/", adminH)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
@@ -292,9 +295,11 @@ func runServe(args []string) {
 		logger.Warn("downstream auth disabled — anyone reaching this proxy can use your credentials")
 	}
 
+	// AuthMiddleware wraps the namespace guard, which in turn wraps the mux.
+	// Request flow: AuthMiddleware → WrapHandler (raw-path guard) → ServeMux.
 	srv := &http.Server{
 		Addr:    *addr,
-		Handler: proxy.AuthMiddleware(*authToken, db, uiEnabled, mux),
+		Handler: proxy.AuthMiddleware(*authToken, db, uiEnabled, claudioH.WrapHandler(mux)),
 	}
 	go func() {
 		<-ctx.Done()
