@@ -311,21 +311,12 @@ func pickDefaults(entries []map[string]any) map[string]bool {
 	return defaults
 }
 
-// providerFromID guesses a provider string from the model ID prefix or content.
+// providerFromID returns the provider string for a model ID by delegating to
+// provider.ForModel, which already handles advertised aliases (e.g.
+// "claude-glm-*" → glm, "claude-gemini-*" → gemini) without duplicating
+// the routing table here.
 func providerFromID(id string) string {
-	switch {
-	case strings.HasPrefix(id, "claude-"):
-		return "anthropic"
-	case strings.HasPrefix(id, "glm-") || strings.HasPrefix(id, "anthropic/glm-"):
-		return "glm"
-	case strings.HasPrefix(id, "mimo-") || strings.HasPrefix(id, "anthropic/mimo-"):
-		return "mimo"
-	case strings.Contains(id, "gemini"):
-		return "gemini"
-	case strings.Contains(id, "gpt") || strings.Contains(id, "codex"):
-		return "codex"
-	}
-	return ""
+	return string(provider.ForModel(id))
 }
 
 // maxInputTokensEntry reads max_input_tokens from a catalogue entry.
@@ -501,7 +492,7 @@ func queryByModel(ctx context.Context, db *store.DB, userID string, since time.T
 	}
 	defer rows.Close()
 
-	var out []statsModel
+	out := make([]statsModel, 0)
 	for rows.Next() {
 		var m statsModel
 		if err := rows.Scan(&m.Model, &m.Requests, &m.Errors,
