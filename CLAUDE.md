@@ -923,9 +923,9 @@ Image tags: `:latest` and `:sha-<short>` on `main`; semver tags on `v*.*.*` push
 ## Claudio API (`internal/claudioapi`)
 
 The `claudioapi` package implements the session-manager API consumed by the
-[claudio](https://github.com/p4u/claudio) TUI client. It is mounted on the same
-`http.ServeMux` as the rest of the proxy, **before** the `/v1/` catch-all, so
-ServeMux's longest-prefix rule routes the entire subtree locally.
+[claudio](https://github.com/p4u/claudio) TUI client. It is guarded by a
+**namespace reservation layer** that intercepts requests before `http.ServeMux`
+sees them (see "Namespace reservation" below).
 
 ### Routes
 
@@ -940,28 +940,80 @@ ServeMux's longest-prefix rule routes the entire subtree locally.
 Unknown paths return a local 404; wrong methods return 405. Neither is written
 to `request_log`.
 
+### Namespace reservation
+
+Any path whose **raw/escaped** form (before ServeMux canonicalises it) starts
+with `/v1/claudio` is reserved and handled locally — it is **never** forwarded
+to an upstream provider, logged to `request_log`, or forwarded to the `/v1/`
+catch-all.
+
+This covers the following bypass vectors that ServeMux would otherwise
+misroute:
+
+| Path | ServeMux behaviour without guard | Guard result |
+|------|----------------------------------|--------------|
+| `/v1/claudio%2Fmodels` | falls to `/v1/` catch-all | local 404 |
+| `/v1/claudiox` | falls to `/v1/` catch-all | local 404 |
+| `/v1/claudio/../messages` | 301 redirect → `/v1/messages` | local 404 |
+| `/v1/claudio/%2e%2e/messages` | local mux match after decode | local 404 |
+| `//v1/claudio/config` | 301 redirect (double slash) | mux redirect (count=0) |
+| `HEAD /v1/claudio/*` | not covered by mux patterns | local 405 |
+
+The guard is implemented as `Handler.WrapHandler(next http.Handler)`, which
+checks `r.URL.EscapedPath()` before delegating to `next`. `ServeHTTP` adds a
+second layer: it rejects any request whose `RawPath` is non-empty (encoded
+chars in path) or whose decoded path contains `..` or `//`.
+
+**Deliberate decision on `/v1/claudiox`**: any path whose first two segments
+are `v1` and `claudio*` (i.e. the raw escaped path starts with `/v1/claudio`)
+is treated as reserved. A client probing `/v1/claudiox` gets a local 404
+rather than reaching the upstream. This is intentional: the namespace is
+claimed in full to prevent future collisions and enumeration attacks.
+
+### Authentication change (pre-existing fix)
+
+When `adminToken` is empty, the `AuthMiddleware` previously allowed an
+explicitly-supplied but disabled/revoked/unknown user token to pass through as
+anonymous.  The fix:
+
+1. Any bearer/x-api-key credential that fails both the admin and user-token
+   checks is **always rejected with 401**, even when `adminToken == ""`.
+2. The anonymous passthrough now additionally requires that **no user tokens
+   exist in the database** — once any token is created, unauthenticated
+   requests require a valid credential.
+
 ### Isolation guarantees
 
 1. **No upstream forwarding.** `claudioapi.Handler` never calls `pool.Bind`,
    never selects a credential, and never makes an outbound HTTP request.
 2. **No `request_log` writes.** The handler does not call `logRequest`. A test
-   asserts zero rows after hitting all endpoints.
+   asserts zero rows after hitting all endpoints (including bypass paths).
 3. **`/me/stats` identity check.** Admin tokens and anonymous callers (nil or
    empty `UserTokenID`) receive 403. Queries are scoped by `user_token_id` so
    user A cannot see user B's data.
 4. **`/pool/health` opacity.** Only a coarse status string per provider is
    returned (`ok|busy|saturated|unavailable`). No credential IDs, labels, raw
    percentages or counts are exposed. A 30 s in-memory cache prevents probing.
+   Cache is only updated on a fully successful DB query (failed queries keep
+   the last good snapshot). Concurrent refreshes are coalesced.
 5. **Rate limiting.** A per-identity token bucket (1 req/s, burst 10) prevents
    enumeration.
+6. **Limited credentials.** A credential with `status='limited'` and a
+   `retry_after` deadline in the future is always counted as saturated —
+   absent usage_history snapshots never imply health for limited credentials.
+7. **`by_model` serialisation.** Always emits an array (`[]`), never `null`.
 
 ### Model catalogue sharing
 
 `proxy.Handler.GetCatalogue()` exposes the already-cached `/v1/models` body as
 parsed `[]map[string]any` entries. `claudioapi` calls this method directly
-instead of making a synthetic HTTP request through the forwarding path. The
-`modelsCache` struct gained a `refreshedAt` field to track when the current
-body was fetched from upstream.
+instead of making a synthetic HTTP request through the forwarding path.
+
+`proxy.Handler.StartCatalogueRefresh(ctx)` is called at startup to warm the
+cache before any client sends GET /v1/models.  It calls `refreshCatalogueOnce`
+immediately and then repeats on `modelsCacheTTL` (5 min). The background fetch
+uses a provider credential (exactly as `/v1/models` does); claudio requests
+never trigger upstream forwarding of their own request.
 
 ### Default model IDs
 
@@ -972,7 +1024,22 @@ returns models sorted newest-first, and `augment1M` inserts `[1m]` rows before
 their base entry, preserving that order. A family with no `[1m]` entry is
 omitted from the env — model IDs are never hardcoded.
 
+### Provider labels
+
+`/v1/claudio/models` determines the `provider` field for each entry via
+`provider.ForModel(id)`, which handles advertised aliases (`claude-glm-*` →
+`glm`, `claude-gemini-*` → `gemini`, etc.) using the canonical routing table
+rather than a hand-rolled prefix switch.
+
 ### Registration
 
-`cmd/claude-proxy/main.go` calls `claudioapi.New(mux, db, proxyH)` **before**
-`mux.Handle("/v1/", proxyH)`. No other change to the mux is needed.
+`cmd/claude-proxy/main.go` wires things up in this order:
+
+```go
+claudioH := claudioapi.New(mux, db, proxyH)   // registers on mux + returns *Handler
+proxyH.StartCatalogueRefresh(ctx)              // warm catalogue at startup
+// ...
+srv.Handler = proxy.AuthMiddleware(..., claudioH.WrapHandler(mux))
+```
+
+Request flow: `AuthMiddleware` → `WrapHandler` (raw-path guard) → `ServeMux`.
