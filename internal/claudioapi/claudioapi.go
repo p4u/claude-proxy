@@ -48,7 +48,7 @@ type Handler struct {
 
 	// poolHealth cache: lastGood is only replaced on a successful refresh;
 	// inFlight gates concurrent refreshes so only one query runs at a time.
-	poolMu      sync.Mutex
+	poolMu       sync.Mutex
 	poolLastGood []providerHealth // last successful result (nil = never computed)
 	poolCachedAt time.Time
 	poolInFlight bool
@@ -695,9 +695,9 @@ func (h *Handler) computePoolHealth(ctx context.Context) ([]providerHealth, erro
 	defer rows.Close()
 	for rows.Next() {
 		var (
-			provID     provider.ID
-			credStatus string
-			retryAfter *int64
+			provID       provider.ID
+			credStatus   string
+			retryAfter   *int64
 			fhPct, sdPct float64
 		)
 		if err := rows.Scan(&provID, &credStatus, &retryAfter, &fhPct, &sdPct); err != nil {
