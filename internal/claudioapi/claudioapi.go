@@ -46,10 +46,13 @@ type Handler struct {
 	db  *store.DB
 	cat CatalogueSource
 
-	// poolHealth cache
-	poolMu          sync.Mutex
-	poolHealthCache []providerHealth
-	poolCachedAt    time.Time
+	// poolHealth cache: lastGood is only replaced on a successful refresh;
+	// inFlight gates concurrent refreshes so only one query runs at a time.
+	poolMu      sync.Mutex
+	poolLastGood []providerHealth // last successful result (nil = never computed)
+	poolCachedAt time.Time
+	poolInFlight bool
+	poolDone     chan struct{} // non-nil while a refresh is in flight
 
 	// per-identity rate limiter
 	rateMu   sync.Mutex
@@ -538,30 +541,72 @@ type poolHealthResponse struct {
 }
 
 func (h *Handler) servePoolHealth(w http.ResponseWriter, r *http.Request) {
+	// Fast path: return the cached result if it is fresh enough.
 	h.poolMu.Lock()
-	if time.Since(h.poolCachedAt) < poolHealthCacheTTL && h.poolHealthCache != nil {
-		cached := h.poolHealthCache
+	if time.Since(h.poolCachedAt) < poolHealthCacheTTL && h.poolLastGood != nil {
+		cached := h.poolLastGood
 		h.poolMu.Unlock()
 		writeJSON(w, http.StatusOK, poolHealthResponse{Version: 1, Providers: cached})
 		return
 	}
+
+	// Coalesce concurrent refreshes: only the first goroutine that sees an
+	// expired cache starts a DB query; the others wait on its channel and
+	// share the result.
+	if h.poolInFlight {
+		done := h.poolDone
+		h.poolMu.Unlock()
+		<-done // wait for the in-flight refresh to complete
+		h.poolMu.Lock()
+		cached := h.poolLastGood
+		h.poolMu.Unlock()
+		if cached == nil {
+			writeJSON(w, http.StatusServiceUnavailable, apiError("api_error", "claudio: pool health unavailable"))
+			return
+		}
+		writeJSON(w, http.StatusOK, poolHealthResponse{Version: 1, Providers: cached})
+		return
+	}
+	done := make(chan struct{})
+	h.poolInFlight = true
+	h.poolDone = done
 	h.poolMu.Unlock()
 
-	providers := h.computePoolHealth(r.Context())
+	// Compute outside the lock.
+	fresh, err := h.computePoolHealth(r.Context())
 
 	h.poolMu.Lock()
-	h.poolHealthCache = providers
-	h.poolCachedAt = time.Now()
+	h.poolInFlight = false
+	close(done) // wake any waiters
+	h.poolDone = nil
+	if err == nil {
+		// Only replace the last-good cache on a fully successful query.
+		h.poolLastGood = fresh
+		h.poolCachedAt = time.Now()
+	}
+	result := h.poolLastGood
 	h.poolMu.Unlock()
 
-	writeJSON(w, http.StatusOK, poolHealthResponse{Version: 1, Providers: providers})
+	if result == nil {
+		writeJSON(w, http.StatusServiceUnavailable, apiError("api_error", "claudio: pool health unavailable"))
+		return
+	}
+	writeJSON(w, http.StatusOK, poolHealthResponse{Version: 1, Providers: result})
 }
 
 // computePoolHealth queries the DB for per-provider credential health using
 // the same saturation signals the pool uses (latest usage_history entry per
 // credential). Only provider names are exposed; credential IDs, labels,
 // emails and raw percentages are not included in the result.
-func (h *Handler) computePoolHealth(ctx context.Context) []providerHealth {
+//
+// A "limited" credential (429-blocked by upstream) is always counted as
+// saturated when its retry_after deadline is in the future, regardless of
+// its usage_history snapshot.  Absent snapshots (COALESCE → 0) do NOT
+// imply health for limited credentials.
+//
+// Returns a non-nil error if the DB query fails or rows.Err() is set; in
+// that case the caller must NOT update the cache.
+func (h *Handler) computePoolHealth(ctx context.Context) ([]providerHealth, error) {
 	// For each well-known provider, count active credentials and how many are
 	// saturated according to their most recent usage_history snapshot.
 	type provStats struct {
@@ -573,8 +618,11 @@ func (h *Handler) computePoolHealth(ctx context.Context) []providerHealth {
 		stats[p.ID] = &provStats{}
 	}
 
+	now := time.Now().Unix()
 	rows, err := h.db.QueryContext(ctx, `
 		SELECT c.provider,
+		       c.status,
+		       c.retry_after,
 		       COALESCE(u.five_hour_pct, 0),
 		       COALESCE(u.seven_day_pct, 0)
 		FROM credentials c
@@ -584,23 +632,37 @@ func (h *Handler) computePoolHealth(ctx context.Context) []providerHealth {
 		        SELECT MAX(captured_at) FROM usage_history WHERE credential_id = c.id
 		      )
 		WHERE c.status IN ('active', 'limited')`)
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var provID provider.ID
-			var fhPct, sdPct float64
-			if err := rows.Scan(&provID, &fhPct, &sdPct); err != nil {
-				continue
-			}
-			ps := stats[provID]
-			if ps == nil {
-				continue
-			}
-			ps.active++
-			if pool.Saturated(fhPct, sdPct) {
-				ps.saturated++
-			}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			provID     provider.ID
+			credStatus string
+			retryAfter *int64
+			fhPct, sdPct float64
+		)
+		if err := rows.Scan(&provID, &credStatus, &retryAfter, &fhPct, &sdPct); err != nil {
+			return nil, err
 		}
+		ps := stats[provID]
+		if ps == nil {
+			continue
+		}
+		ps.active++
+		// A limited credential whose retry deadline is still in the future is
+		// always saturated — absent snapshots never imply health.
+		if credStatus == "limited" && (retryAfter == nil || *retryAfter > now) {
+			ps.saturated++
+			continue
+		}
+		if pool.Saturated(fhPct, sdPct) {
+			ps.saturated++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
 	out := make([]providerHealth, 0, len(provider.All()))
@@ -619,7 +681,7 @@ func (h *Handler) computePoolHealth(ctx context.Context) []providerHealth {
 		}
 		out = append(out, providerHealth{Name: string(p.ID), Status: status})
 	}
-	return out
+	return out, nil
 }
 
 // ---------------------------------------------------------------------------
