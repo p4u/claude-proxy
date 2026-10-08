@@ -28,7 +28,9 @@ func (s *Server) handleSubscriptionValue(w http.ResponseWriter, r *http.Request)
 		writeErr(w, http.StatusBadRequest, "quota_window must be seven_day or five_hour")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	// Large historical reports need headroom for live traffic on small hosts;
+	// cancellation still propagates from the browser to the read-only scan.
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 	report, err := subscriptionstats.Build(ctx, s.db.DB, time.Unix(from, 0), time.Unix(to, 0), now, window)
 	if err != nil {

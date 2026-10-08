@@ -77,7 +77,9 @@ cohorts without treating quota percentage as a fixed token ledger.
   `seven_day` (default) or `five_hour`. Historical totals use `[from,to)`;
   current-window figures are independent of that historical selection. Bounds
   must be nonnegative, ordered and not in the future. Responses are `no-store`;
-  interrupted/over-budget queries return `503` rather than fabricated empty data.
+  queries have a **10-second** server budget and stop when the request is
+  canceled. Interrupted/over-budget queries return `503` rather than fabricated
+  empty data.
 - `tokens` always has integer fields
   `{input,output,cache_creation,cache_read,total}`. Input means uncached input:
   for custom OpenAI hosts the cached subset is subtracted from the inclusive

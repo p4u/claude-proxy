@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -56,6 +57,23 @@ func TestSubscriptionValueAuthenticationAndEmpty(t *testing.T) {
 	}
 	if w := do(t, h, http.MethodPost, "/api/stats/subscriptions", "", cookie); w.Code != http.StatusNotFound {
 		t.Fatalf("read-only statistics accepted POST: %d", w.Code)
+	}
+}
+
+func TestSubscriptionValueRequestCancellation(t *testing.T) {
+	_, h := newTestServer(t)
+	cookie := loginCookie(t, h)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	r := httptest.NewRequest(http.MethodGet, "/api/stats/subscriptions?period=90d", nil).WithContext(ctx)
+	r.AddCookie(cookie)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "statistics query interrupted") {
+		t.Fatalf("canceled report: %d %s", w.Code, w.Body.String())
+	}
+	if w.Header().Get("Cache-Control") != "no-store" {
+		t.Fatal("canceled report must not be cached")
 	}
 }
 
