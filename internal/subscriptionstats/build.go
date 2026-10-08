@@ -93,7 +93,7 @@ func Build(ctx context.Context, db *sql.DB, from, to, timeNow time.Time, window 
 			},
 		},
 	}
-	if err := b.readActuals(ctx); err != nil {
+	if err := b.readAll(ctx); err != nil {
 		return nil, fmt.Errorf("subscription stats: traffic: %w", err)
 	}
 	if err := b.readCapacity(ctx); err != nil {
