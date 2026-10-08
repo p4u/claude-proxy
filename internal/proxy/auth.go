@@ -19,8 +19,11 @@ import (
 //  3. adminToken match — admin identity, all routes allowed.
 //  4. user token DB match — user identity, /v1/* and /health only;
 //     /admin/* requests are rejected with 403.
-//  5. No auth configured (adminToken=="" and no user tokens) — passthrough.
-//  6. Otherwise — 401.
+//  5. A bearer/x-api-key credential that was presented but failed steps 3–4
+//     is always rejected with 401, even when adminToken is empty.
+//  6. No auth configured (adminToken=="" AND no user tokens in DB) AND no
+//     credential presented — passthrough (backward compat).
+//  7. Otherwise — 401.
 func AuthMiddleware(adminToken string, db *store.DB, uiEnabled bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" {
@@ -73,8 +76,23 @@ func AuthMiddleware(adminToken string, db *store.DB, uiEnabled bool, next http.H
 			}
 		}
 
-		// No auth configured → passthrough (backward compat).
-		if adminToken == "" {
+		// A credential was presented but failed both checks — reject with 401.
+		// A supplied bearer that does not validate is never treated as anonymous,
+		// even when no admin token is configured; otherwise a disabled or deleted
+		// token would silently fall through as an unauthenticated request.
+		if bearer != "" {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="claude-proxy"`)
+			http.Error(w,
+				`{"type":"error","error":{"type":"authentication_error","message":"proxy: invalid or missing bearer token"}}`,
+				http.StatusUnauthorized)
+			return
+		}
+
+		// No credential presented. Passthrough only when auth is completely
+		// unconfigured: no admin token and no user tokens in the database.
+		// As soon as any user token is created, unauthenticated requests require
+		// a valid token.
+		if adminToken == "" && (db == nil || !usertoken.HasAny(r.Context(), db)) {
 			next.ServeHTTP(w, r)
 			return
 		}

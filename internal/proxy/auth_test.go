@@ -1,10 +1,26 @@
 package proxy
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
+
+	"github.com/p4u/claude-proxy/internal/store"
+	"github.com/p4u/claude-proxy/internal/usertoken"
 )
+
+// openDB opens a temporary SQLite store for the auth tests.
+func openDB(t *testing.T) *store.DB {
+	t.Helper()
+	db, err := store.Open(filepath.Join(t.TempDir(), "auth_test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
 
 func TestAuthMiddleware(t *testing.T) {
 	hit := false
@@ -62,4 +78,132 @@ func TestAuthMiddleware(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAuthMiddlewareRevokedTokenWithNoAdminToken is the security regression
+// test for finding 2 (SECURITY, pre-existing): a disabled, deleted or unknown
+// bearer token must never pass through as anonymous when any auth mechanism
+// is configured — even when adminToken is empty.
+func TestAuthMiddlewareRevokedTokenWithNoAdminToken(t *testing.T) {
+	ctx := context.Background()
+	inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
+
+	// -------------------------------------------------------------------------
+	// Sub-case 1: disabled token with adminToken="" must get 401.
+	// -------------------------------------------------------------------------
+	t.Run("disabled token, no admin token", func(t *testing.T) {
+		db := openDB(t)
+		ut, err := usertoken.Create(ctx, db, "alice")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Disable the token.
+		if err := usertoken.SetStatus(ctx, db, ut.ID, usertoken.StatusDisabled); err != nil {
+			t.Fatal(err)
+		}
+		h := AuthMiddleware("", db, false, inner)
+		req := httptest.NewRequest("GET", "/v1/messages", nil)
+		req.Header.Set("Authorization", "Bearer "+ut.Token)
+		rw := httptest.NewRecorder()
+		h.ServeHTTP(rw, req)
+		if rw.Code != http.StatusUnauthorized {
+			t.Fatalf("disabled token: got %d, want 401; body=%s", rw.Code, rw.Body)
+		}
+	})
+
+	// -------------------------------------------------------------------------
+	// Sub-case 2: completely unknown bearer with adminToken="" and user
+	// tokens in DB must get 401.
+	// -------------------------------------------------------------------------
+	t.Run("unknown token, user tokens exist, no admin token", func(t *testing.T) {
+		db := openDB(t)
+		if _, err := usertoken.Create(ctx, db, "bob"); err != nil {
+			t.Fatal(err)
+		}
+		h := AuthMiddleware("", db, false, inner)
+		req := httptest.NewRequest("GET", "/v1/messages", nil)
+		req.Header.Set("Authorization", "Bearer totally-unknown-token")
+		rw := httptest.NewRecorder()
+		h.ServeHTTP(rw, req)
+		if rw.Code != http.StatusUnauthorized {
+			t.Fatalf("unknown token: got %d, want 401; body=%s", rw.Code, rw.Body)
+		}
+	})
+
+	// -------------------------------------------------------------------------
+	// Sub-case 3: rotated (deleted) token with adminToken="" must get 401.
+	// -------------------------------------------------------------------------
+	t.Run("rotated token, no admin token", func(t *testing.T) {
+		db := openDB(t)
+		ut, err := usertoken.Create(ctx, db, "charlie")
+		if err != nil {
+			t.Fatal(err)
+		}
+		oldToken := ut.Token
+		if _, err := usertoken.Refresh(ctx, db, ut.ID); err != nil {
+			t.Fatal(err)
+		}
+		h := AuthMiddleware("", db, false, inner)
+		req := httptest.NewRequest("GET", "/v1/messages", nil)
+		req.Header.Set("Authorization", "Bearer "+oldToken)
+		rw := httptest.NewRecorder()
+		h.ServeHTTP(rw, req)
+		if rw.Code != http.StatusUnauthorized {
+			t.Fatalf("rotated token: got %d, want 401; body=%s", rw.Code, rw.Body)
+		}
+	})
+
+	// -------------------------------------------------------------------------
+	// Sub-case 4: disabled token WITH adminToken configured must also get 401
+	// (existing behaviour — unchanged).
+	// -------------------------------------------------------------------------
+	t.Run("disabled token, admin token configured", func(t *testing.T) {
+		db := openDB(t)
+		ut, err := usertoken.Create(ctx, db, "dave")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := usertoken.SetStatus(ctx, db, ut.ID, usertoken.StatusDisabled); err != nil {
+			t.Fatal(err)
+		}
+		h := AuthMiddleware("admin-secret", db, false, inner)
+		req := httptest.NewRequest("GET", "/v1/messages", nil)
+		req.Header.Set("Authorization", "Bearer "+ut.Token)
+		rw := httptest.NewRecorder()
+		h.ServeHTTP(rw, req)
+		if rw.Code != http.StatusUnauthorized {
+			t.Fatalf("disabled token+admin: got %d, want 401; body=%s", rw.Code, rw.Body)
+		}
+	})
+
+	// -------------------------------------------------------------------------
+	// Sub-case 5: no user tokens and no admin token → passthrough still works.
+	// -------------------------------------------------------------------------
+	t.Run("no tokens, no admin token → passthrough", func(t *testing.T) {
+		db := openDB(t)
+		h := AuthMiddleware("", db, false, inner)
+		req := httptest.NewRequest("GET", "/v1/messages", nil)
+		rw := httptest.NewRecorder()
+		h.ServeHTTP(rw, req)
+		if rw.Code != http.StatusOK {
+			t.Fatalf("no-auth passthrough: got %d, want 200; body=%s", rw.Code, rw.Body)
+		}
+	})
+
+	// -------------------------------------------------------------------------
+	// Sub-case 6: user tokens exist, no bearer, no admin token → 401.
+	// -------------------------------------------------------------------------
+	t.Run("user tokens exist, no bearer, no admin token → 401", func(t *testing.T) {
+		db := openDB(t)
+		if _, err := usertoken.Create(ctx, db, "eve"); err != nil {
+			t.Fatal(err)
+		}
+		h := AuthMiddleware("", db, false, inner)
+		req := httptest.NewRequest("GET", "/v1/messages", nil)
+		rw := httptest.NewRecorder()
+		h.ServeHTTP(rw, req)
+		if rw.Code != http.StatusUnauthorized {
+			t.Fatalf("no-bearer+tokens: got %d, want 401; body=%s", rw.Code, rw.Body)
+		}
+	})
 }
