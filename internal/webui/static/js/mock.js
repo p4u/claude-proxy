@@ -493,7 +493,10 @@ const DB = {
     // Trailing 0s are the GLM key: providers with no usage API report no
     // percentages at all, and the frontend hides the meters for them.
     const fives = [72, 41, 100, 18, 0, 0];
-    const sevens = [58, 63, 92, 22, 0, 0];
+    // Team seats publish no general weekly limit: the usage API returns
+    // seven_day: null, which the server reports as `unreported`.
+    const sevens = [58, 0, 92, 22, 0, 0];
+    const weeklyUnreported = (c) => c.type === "team";
     const scopeds = [44, 51, 78, 15, 0, 0];
     // Score mirrors the pool: weight × room_5h × room_7d^1.5 × (1 + urgency),
     // urgency = max(0, room_7d / remaining_fraction_7d − 1). Disabled creds and
@@ -505,7 +508,7 @@ const DB = {
       const saturated = five >= 100 || seven >= 100;
       const active = c.status !== "disabled" && !saturated;
       const remaining7d = (2 + i) / 7; // matches seven_day.resets_at below
-      const urgency = hasUsageAPI(c) ? Math.max(0, room7 / remaining7d - 1) : 0;
+      const urgency = hasUsageAPI(c) && !weeklyUnreported(c) ? Math.max(0, room7 / remaining7d - 1) : 0;
       const score = active ? c.weight * room5 * Math.pow(room7, 1.5) * (1 + urgency) : 0;
       return { c, i, five, seven, scoped: scopeds[i], room5, room7, urgency, saturated, score };
     });
@@ -517,7 +520,9 @@ const DB = {
       credential_id: c.id, label: c.label, subscription_type: c.type, status: c.status, weight: c.weight,
       provider: providerOf(c), has_usage_api: hasUsageAPI(c),
       five_hour: { pct: five, resets_at: now + (3600 * (1 + i)) },
-      seven_day: { pct: seven, resets_at: now + (86400 * (2 + i)) },
+      seven_day: weeklyUnreported(c)
+        ? { pct: 0, resets_at: null, unreported: true }
+        : { pct: seven, resets_at: now + (86400 * (2 + i)) },
       seven_day_scoped: hasUsageAPI(c) ? { pct: scoped, resets_at: now + (86400 * (2 + i)), label: "Fable" } : undefined,
       captured_at: hasUsageAPI(c) ? now - 300 - i * 90 : null,
       metered: hasUsageAPI(c) ? undefined : {
@@ -597,7 +602,7 @@ const DB = {
       return {
         credential_id: c.id, label: c.label,
         five_hour_pct: nulls(five),
-        seven_day_pct: nulls(seven),
+        seven_day_pct: c.type === "team" ? seven.map(() => null) : nulls(seven),
         seven_day_scoped_pct: nulls(scoped),
         seven_day_scoped_label: "Fable",
       };

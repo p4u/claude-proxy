@@ -145,6 +145,12 @@ value claims.
   `weekly_scoped` entry in the usage API's `limits[]` — `label` names the model
   (`"Fable"` today). It is omitted when the plan has none. It replaces
   `seven_day_sonnet`, which the usage API now always returns as `null`.
+  A window Anthropic returned as `null` carries `unreported: true` with a
+  placeholder `pct: 0`. Team seats are the common case: they publish only a
+  5-hour session and the model-scoped weekly cap, so `seven_day` is unreported
+  and the UI says so instead of drawing 0%. The scoped cap is not substituted
+  for it, since it counts only that model's traffic. Selection scoring is
+  unchanged and still reads the stored 0 (full weekly room).
   Credentials with `has_usage_api: false` never have a snapshot, so their
   percentages are 0 and `captured_at` is null. They instead carry
   `metered:{five_hour,seven_day}` — each `{requests,input_tokens,output_tokens,
@@ -436,7 +442,8 @@ queries must use the indexes on `request_log(ts)` / `usage_history(credential_id
   multi-credential chart): `{buckets:[ts...], series:[{credential_id,label,
   five_hour_pct:[...], seven_day_pct:[...], seven_day_scoped_pct:[...],
   seven_day_scoped_label?}]}` — one value
-  per bucket per series, `null` where a credential has no snapshot in that bucket;
+  per bucket per series, `null` where a credential has no snapshot in that bucket
+  or its snapshot had no reading for that window (`unreported`, see above);
   buckets downsampled to ≤200.
 - **Prompt logging**: new table `prompt_log(id, user_token_id→SET NULL, conv_id, ts,
   model, prompt)` — the proxy stores the LAST `role:"user"` text (string or first text

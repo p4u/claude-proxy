@@ -20,6 +20,19 @@ type usageWindow struct {
 	// "prolite" has no 5-hour limit), as opposed to a null ResetsAt, which
 	// only means the next reset is not known yet.
 	Absent bool `json:"absent,omitempty"`
+	// Unreported marks an Anthropic window the usage API returned as null:
+	// Team seats publish no general weekly limit, only a 5-hour session and a
+	// model-scoped weekly cap. Pct is then a placeholder 0, not a measurement,
+	// and must not be drawn as "0% used".
+	Unreported bool `json:"unreported,omitempty"`
+}
+
+// unreported reports whether a stored reading is a placeholder for a missing
+// bucket. The poller stores null as 0 with observed=0. Rows written before the
+// observed columns existed also read observed=0, but those carry their real
+// value, so only a zero is treated as missing.
+func unreported(pct float64, observed bool) bool {
+	return !observed && pct == 0
 }
 
 // scopedWindow is a model-scoped weekly limit ("weekly_scoped" in the usage
@@ -158,23 +171,25 @@ func (s *Server) handleUsageCurrent(w http.ResponseWriter, r *http.Request) {
 		var fhReset, sdReset, scReset sql.NullInt64
 		var scPct sql.NullFloat64
 		var scLabel sql.NullString
-		var capValid bool
+		var capValid, fhObserved, sdObserved bool
 		row := s.db.QueryRowContext(ctx, `
 			SELECT captured_at,
-			       five_hour_pct, five_hour_resets_at,
-			       seven_day_pct, seven_day_resets_at,
+			       five_hour_pct, five_hour_resets_at, five_hour_observed,
+			       seven_day_pct, seven_day_resets_at, seven_day_observed,
 			       seven_day_scoped_pct, seven_day_scoped_resets_at, seven_day_scoped_label
 			FROM usage_history WHERE credential_id = ?
 			ORDER BY captured_at DESC LIMIT 1`, c.ID)
 		if err := row.Scan(&capturedAt,
-			&uc.FiveHour.Pct, &fhReset,
-			&uc.SevenDay.Pct, &sdReset,
+			&uc.FiveHour.Pct, &fhReset, &fhObserved,
+			&uc.SevenDay.Pct, &sdReset, &sdObserved,
 			&scPct, &scReset, &scLabel); err == nil {
 			capValid = true
 		}
 		if capValid {
 			uc.FiveHour.ResetsAt = rfc3339Ptr(fhReset)
 			uc.SevenDay.ResetsAt = rfc3339Ptr(sdReset)
+			uc.FiveHour.Unreported = unreported(uc.FiveHour.Pct, fhObserved)
+			uc.SevenDay.Unreported = unreported(uc.SevenDay.Pct, sdObserved)
 			if scPct.Valid {
 				uc.SevenDayScoped = &scopedWindow{
 					usageWindow: usageWindow{Pct: scPct.Float64, ResetsAt: rfc3339Ptr(scReset)},
@@ -192,7 +207,8 @@ func (s *Server) handleUsageCurrent(w http.ResponseWriter, r *http.Request) {
 		}
 		// Selection scoring mirrors the pool exactly, urgency included. With
 		// no snapshot the pcts are 0 and the reset unknown → rooms 1,
-		// urgency 0 → score = weight (the pool's bootstrap headroom).
+		// urgency 0 → score = weight (the pool's bootstrap headroom). An
+		// unreported window scores the same way: the pool reads its stored 0.
 		uc.Selection = selectionView{
 			Room5h:    pool.Room(uc.FiveHour.Pct),
 			Room7d:    pool.Room(uc.SevenDay.Pct),
@@ -314,6 +330,8 @@ type usagePoint struct {
 	TS                  int64
 	FiveHourPct         float64
 	SevenDayPct         float64
+	FiveHourObserved    bool
+	SevenDayObserved    bool
 	SevenDayScopedPct   *float64
 	SevenDayScopedLabel string
 }
@@ -405,12 +423,19 @@ func (s *Server) handleUsageHistory(w http.ResponseWriter, r *http.Request) {
 			SevenDayPct:       make([]*float64, len(buckets)),
 			SevenDayScopedPct: make([]*float64, len(buckets)),
 		}
+		// Buckets whose snapshot had no reading for a window: they stay null
+		// and stop forward-filling, so a missing bucket is never drawn as 0%
+		// nor as an older measurement carried forward.
+		fhGap := make([]bool, len(buckets))
+		sdGap := make([]bool, len(buckets))
 		for _, p := range perCred[cid] {
 			i, ok := idx[p.TS]
 			if !ok {
 				continue // dropped by downsampling
 			}
 			fh, sd := p.FiveHourPct, p.SevenDayPct
+			fhGap[i] = unreported(fh, p.FiveHourObserved)
+			sdGap[i] = unreported(sd, p.SevenDayObserved)
 			g.FiveHourPct[i] = &fh
 			g.SevenDayPct[i] = &sd
 			if p.SevenDayScopedPct != nil {
@@ -423,8 +448,8 @@ func (s *Server) handleUsageHistory(w http.ResponseWriter, r *http.Request) {
 		// value is the correct estimate until the next snapshot. Leading
 		// nulls (before the first snapshot) stay null — a newly-added
 		// credential must not appear to have existed retroactively.
-		forwardFill(g.FiveHourPct)
-		forwardFill(g.SevenDayPct)
+		forwardFillGaps(g.FiveHourPct, fhGap)
+		forwardFillGaps(g.SevenDayPct, sdGap)
 		forwardFill(g.SevenDayScopedPct)
 		out = append(out, g)
 	}
@@ -441,6 +466,23 @@ func forwardFill(arr []*float64) {
 			continue
 		}
 		if last != nil {
+			v := *last
+			arr[i] = &v
+		}
+	}
+}
+
+// forwardFillGaps is forwardFill for a series whose gap buckets hold a
+// snapshot without a reading: each gap becomes null and ends the carry.
+func forwardFillGaps(arr []*float64, gap []bool) {
+	var last *float64
+	for i := range arr {
+		switch {
+		case gap[i]:
+			arr[i], last = nil, nil
+		case arr[i] != nil:
+			last = arr[i]
+		case last != nil:
 			v := *last
 			arr[i] = &v
 		}
@@ -464,6 +506,7 @@ func downsample(ts []int64, maxN int) []int64 {
 func (s *Server) usageHistoryPoints(ctx context.Context, credID string, since, until time.Time) ([]usagePoint, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT captured_at, five_hour_pct, seven_day_pct,
+		       five_hour_observed, seven_day_observed,
 		       seven_day_scoped_pct, COALESCE(seven_day_scoped_label, '')
 		FROM usage_history
 		WHERE credential_id = ? AND captured_at >= ? AND captured_at < ?
@@ -475,7 +518,8 @@ func (s *Server) usageHistoryPoints(ctx context.Context, credID string, since, u
 	out := []usagePoint{}
 	for rows.Next() {
 		var p usagePoint
-		if err := rows.Scan(&p.TS, &p.FiveHourPct, &p.SevenDayPct, &p.SevenDayScopedPct, &p.SevenDayScopedLabel); err != nil {
+		if err := rows.Scan(&p.TS, &p.FiveHourPct, &p.SevenDayPct,
+			&p.FiveHourObserved, &p.SevenDayObserved, &p.SevenDayScopedPct, &p.SevenDayScopedLabel); err != nil {
 			return nil, err
 		}
 		out = append(out, p)

@@ -127,6 +127,18 @@ function meteredRows(m) {
   ]);
 }
 
+// unreportedRow takes a meter's slot for a window the upstream sent no reading
+// for. Same label and value position, no bar: a bar would imply a measurement.
+function unreportedRow(label, note) {
+  return el("div", { class: "metered" }, [
+    el("div", { class: "meter__top" }, [
+      el("span", { class: "meter__label", text: label }),
+      el("span", { class: "meter__pct", text: "not reported" }),
+    ]),
+    el("div", { class: "metered__break", text: note }),
+  ]);
+}
+
 function subCard(r) {
   const five = r.five_hour || {};
   const seven = r.seven_day || {};
@@ -181,9 +193,20 @@ function quotaMeters(r, five, seven, scoped) {
     return [meter({ label: "Gemini quota", value: five.pct, resets })];
   }
   if (r.provider !== "codex") {
+    // A window Anthropic returned as null (`unreported`) has no reading at
+    // all — Team seats publish no general weekly limit — so it gets a row with
+    // no bar instead of a meter stuck at 0%. The model-scoped cap is not
+    // substituted for it: it only counts that model's traffic.
+    const sevenNote = scoped
+      ? `no general weekly limit published · only the ${scoped.label || "model"} cap below applies`
+      : "no general weekly limit published";
     return [
-      meter({ label: "5-hour window", value: five.pct, resets: countdown(five.resets_at) }),
-      meter({ label: "7-day window", value: seven.pct, resets: countdown(seven.resets_at) }),
+      five.unreported
+        ? unreportedRow("5-hour window", "not published for this plan")
+        : meter({ label: "5-hour window", value: five.pct, resets: countdown(five.resets_at) }),
+      seven.unreported
+        ? unreportedRow("7-day window", sevenNote)
+        : meter({ label: "7-day window", value: seven.pct, resets: countdown(seven.resets_at) }),
       scoped ? meter({ label: `7-day ${scoped.label || "model"}`, value: scoped.pct, resets: countdown(scoped.resets_at) }) : null,
     ].filter(Boolean);
   }

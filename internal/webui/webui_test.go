@@ -538,6 +538,92 @@ func TestUsageHistoryAlignedGrid(t *testing.T) {
 	}
 }
 
+// A Team seat's usage API returns seven_day: null. The poller stores that as
+// 0 with seven_day_observed = 0; the API must flag it rather than present 0%.
+func TestUsageUnreportedWindows(t *testing.T) {
+	db, h := newTestServer(t)
+	ctx := context.Background()
+	teamCred, _ := creds.Insert(ctx, db, "team", "team", "sk-ant-oat-t", "rt-t", time.Now().Add(time.Hour), 5)
+	maxCred, _ := creds.Insert(ctx, db, "max", "max", "sk-ant-oat-m", "rt-m", time.Now().Add(time.Hour), 5)
+	now := time.Now().Unix()
+	insert := func(cid string, ts int64, fh float64, fhObs int, sd float64, sdObs int) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, `INSERT INTO usage_history
+			(credential_id, captured_at, five_hour_pct, five_hour_observed,
+			 seven_day_pct, seven_day_observed, seven_day_scoped_pct, seven_day_scoped_label)
+			VALUES (?, ?, ?, ?, ?, ?, 12, 'Fable')`, cid, ts, fh, fhObs, sd, sdObs); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert(teamCred.ID, now-120, 7, 1, 0, 0)
+	insert(teamCred.ID, now-60, 0, 1, 0, 0)  // measured 0% five-hour, missing weekly
+	insert(maxCred.ID, now-120, 3, 0, 41, 0) // legacy row: real value, observed unset
+	insert(maxCred.ID, now-60, 4, 1, 42, 1)
+
+	cookie := loginCookie(t, h)
+	w := do(t, h, http.MethodGet, "/api/usage/current", "", cookie)
+	if w.Code != http.StatusOK {
+		t.Fatalf("usage/current = %d: %s", w.Code, w.Body.String())
+	}
+	var rows []struct {
+		CredentialID string      `json:"credential_id"`
+		FiveHour     usageWindow `json:"five_hour"`
+		SevenDay     usageWindow `json:"seven_day"`
+		Selection    struct {
+			Room7d float64 `json:"room_7d"`
+		} `json:"selection"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &rows); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]int{}
+	for i, r := range rows {
+		got[r.CredentialID] = i
+	}
+	tr, mr := rows[got[teamCred.ID]], rows[got[maxCred.ID]]
+	if !tr.SevenDay.Unreported || tr.FiveHour.Unreported {
+		t.Fatalf("team: want weekly unreported and measured 0%% five-hour, got %+v / %+v", tr.FiveHour, tr.SevenDay)
+	}
+	if tr.Selection.Room7d != 1 {
+		t.Fatalf("scoring must be unchanged (full weekly room), got room_7d=%v", tr.Selection.Room7d)
+	}
+	if mr.SevenDay.Unreported || mr.FiveHour.Unreported {
+		t.Fatalf("max: observed readings flagged unreported: %+v / %+v", mr.FiveHour, mr.SevenDay)
+	}
+
+	w = do(t, h, http.MethodGet, "/api/usage/history?period=1h", "", cookie)
+	if w.Code != http.StatusOK {
+		t.Fatalf("usage/history = %d: %s", w.Code, w.Body.String())
+	}
+	var hist struct {
+		Series []struct {
+			CredentialID string     `json:"credential_id"`
+			FiveHourPct  []*float64 `json:"five_hour_pct"`
+			SevenDayPct  []*float64 `json:"seven_day_pct"`
+		} `json:"series"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &hist); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range hist.Series {
+		switch s.CredentialID {
+		case teamCred.ID:
+			for i, v := range s.SevenDayPct {
+				if v != nil {
+					t.Fatalf("teamCred weekly bucket %d = %v, want null", i, *v)
+				}
+			}
+			if last := s.FiveHourPct[len(s.FiveHourPct)-1]; last == nil || *last != 0 {
+				t.Fatalf("teamCred measured 0%% five-hour must stay 0, got %v", last)
+			}
+		case maxCred.ID:
+			if first := s.SevenDayPct[0]; first == nil || *first != 41 {
+				t.Fatalf("legacy weekly reading must be kept, got %v", first)
+			}
+		}
+	}
+}
+
 func TestUsageCurrentSelection(t *testing.T) {
 	db, h := newTestServer(t)
 	ctx := context.Background()
