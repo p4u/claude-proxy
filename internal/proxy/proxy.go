@@ -18,6 +18,7 @@ import (
 	"github.com/p4u/claude-proxy/internal/pool"
 	"github.com/p4u/claude-proxy/internal/provider"
 	"github.com/p4u/claude-proxy/internal/router"
+	"github.com/p4u/claude-proxy/internal/sessionbind"
 	"github.com/p4u/claude-proxy/internal/store"
 	"github.com/p4u/claude-proxy/internal/usertoken"
 )
@@ -52,6 +53,12 @@ type Handler struct {
 	// CLIProxyAPI-backed providers' GET /v1/models rows (see
 	// enrichFromSidecar). Optional: without it those rows are named by ID.
 	Sidecar *codexgateway.Client
+
+	// Sessions remembers which credential served each Claude Code session
+	// (X-Claude-Code-Session-Id), in memory only, for GET /v1/claudio/session.
+	// Never nil for a Handler built by New; recording is best-effort and can
+	// not fail a request.
+	Sessions *sessionbind.Registry
 }
 
 func New(db *store.DB, p *pool.Pool, r *creds.Refresher, log *slog.Logger) *Handler {
@@ -65,6 +72,7 @@ func New(db *store.DB, p *pool.Pool, r *creds.Refresher, log *slog.Logger) *Hand
 		},
 		Augment1M:         true,
 		RebalanceSessions: true,
+		Sessions:          sessionbind.New(sessionbind.DefaultCapacity),
 	}
 }
 
@@ -200,6 +208,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}()
 		notice.state = lease.Rebalance
 		cred = lease.Credential
+		// Observe-only requests (haiku background calls, count_tokens) are
+		// skipped: they may be served by a different provider than the
+		// session's main model and would make the reported credential flap.
+		if !opts.ObserveOnly {
+			h.Sessions.RecordRequest(r, cred.ID)
+		}
 		h.log.Info("bind",
 			"conv", convID, "src", string(convSrc), "new", lease.IsNew,
 			"provider", string(prov),

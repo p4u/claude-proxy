@@ -274,6 +274,7 @@ func runServe(args []string) {
 	// the path — this prevents bypasses via percent-encoded slashes, dot
 	// segments, and adjacent-prefix paths such as /v1/claudiox.
 	claudioH := claudioapi.New(mux, db, proxyH)
+	claudioH.SetSessions(proxyH.Sessions)
 	mux.Handle("/v1/", proxyH)
 	mux.Handle("/admin/", adminH)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {

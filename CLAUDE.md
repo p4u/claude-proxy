@@ -936,9 +936,27 @@ sees them (see "Namespace reservation" below).
 | `GET` | `/v1/claudio/models` | same as /v1/* | Augmented model catalogue |
 | `GET` | `/v1/claudio/me/stats` | user token only | Per-user stats (24h/7d/30d) |
 | `GET` | `/v1/claudio/pool/health` | same as /v1/* | Coarse provider availability |
+| `GET` | `/v1/claudio/session?id=<claude_session_id>` | same as /v1/* | Which credential serves a Claude Code session |
 
 Unknown paths return a local 404; wrong methods return 405. Neither is written
 to `request_log`.
+
+### Session → credential (`/v1/claudio/session`)
+
+Claude Code sends `X-Claude-Code-Session-Id` on every request. After the
+sticky path picks a credential, `proxy.Handler` records
+`(caller identity, session id) → credential` in `internal/sessionbind`, a
+4096-entry in-memory LRU (no DB; lost on restart, refilled by the next request
+of each live session). Invalid headers (not 8-64 chars of `[0-9A-Za-z_-]`) are
+ignored, and observe-only requests (haiku, `count_tokens`) are not recorded
+because they may be served by a different provider than the main model. The
+endpoint returns `{session_id, credential{id,label,provider,plan}, bound_at,
+last_seen, switched_at?, utilization{five_hour_pct,seven_day_pct,captured_at}?}`;
+`utilization` is the latest `usage_history` row and only appears for providers
+that poll usage. 400 for a bad `id`, 404 for an unknown session, a session
+recorded under another user token, or a deleted credential (identical bodies,
+so existence is not leaked). `main.go` wires it with
+`claudioH.SetSessions(proxyH.Sessions)`.
 
 ### Namespace reservation
 

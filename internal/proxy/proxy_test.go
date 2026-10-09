@@ -20,6 +20,7 @@ import (
 	"github.com/p4u/claude-proxy/internal/creds"
 	"github.com/p4u/claude-proxy/internal/pool"
 	"github.com/p4u/claude-proxy/internal/store"
+	"github.com/p4u/claude-proxy/internal/usertoken"
 )
 
 // withUpstream redirects api.anthropic.com to the test server by replacing the
@@ -256,5 +257,80 @@ func TestForward401TriggersRefresh(t *testing.T) {
 	got, _ := creds.Get(ctx, db, c.ID)
 	if got.AccessToken != "sk-ant-oat-refreshed" {
 		t.Fatalf("token not rotated: %s", got.AccessToken)
+	}
+}
+
+// A request carrying X-Claude-Code-Session-Id records which credential served
+// it, scoped to the caller; requests without a (valid) header record nothing.
+func TestSessionBindingRecordedFromHeader(t *testing.T) {
+	h, _, _, _ := setupProxy(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		fmt.Fprintln(w, `{"ok":true}`)
+	})
+	const sid = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
+	body := `{"metadata":{"user_id":"conv-sb"},"messages":[{"role":"user","content":"hi"}]}`
+	send := func(header string) {
+		t.Helper()
+		req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
+		if header != "" {
+			req.Header.Set("X-Claude-Code-Session-Id", header)
+		}
+		req = req.WithContext(usertoken.WithIdentity(req.Context(), &usertoken.Identity{UserTokenID: "ut1"}))
+		rw := httptest.NewRecorder()
+		h.ServeHTTP(rw, req)
+		if rw.Code != 200 {
+			t.Fatalf("status=%d body=%s", rw.Code, rw.Body.String())
+		}
+	}
+
+	send("")
+	send("not valid!")
+	if n := h.Sessions.Len(); n != 0 {
+		t.Fatalf("recorded %d bindings without a valid header", n)
+	}
+
+	send(sid)
+	b, ok := h.Sessions.Lookup("user:ut1", sid)
+	if !ok {
+		t.Fatal("binding not recorded")
+	}
+	var credID string
+	if err := h.db.QueryRow(`SELECT credential_id FROM conversations`).Scan(&credID); err != nil {
+		t.Fatal(err)
+	}
+	if b.CredentialID != credID {
+		t.Fatalf("recorded %q, request was served by %q", b.CredentialID, credID)
+	}
+	if _, ok := h.Sessions.Lookup("user:other", sid); ok {
+		t.Fatal("binding visible to another user")
+	}
+
+	// Sticky routing: a second request keeps the credential and only refreshes last_seen.
+	send(sid)
+	b2, _ := h.Sessions.Lookup("user:ut1", sid)
+	if b2.CredentialID != b.CredentialID || !b2.SwitchedAt.IsZero() {
+		t.Fatalf("unexpected change: %+v -> %+v", b, b2)
+	}
+}
+
+// Observe-only traffic (haiku background calls) must not be recorded: it can be
+// served by a different provider than the session's main model.
+func TestSessionBindingSkipsObserveOnly(t *testing.T) {
+	h, _, _, _ := setupProxy(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		fmt.Fprintln(w, `{"ok":true}`)
+	})
+	req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(
+		`{"model":"claude-haiku-4-5","metadata":{"user_id":"conv-h"},"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("X-Claude-Code-Session-Id", "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d")
+	rw := httptest.NewRecorder()
+	h.ServeHTTP(rw, req)
+	if rw.Code != 200 {
+		t.Fatalf("status=%d", rw.Code)
+	}
+	if n := h.Sessions.Len(); n != 0 {
+		t.Fatalf("haiku request recorded a binding (%d)", n)
 	}
 }

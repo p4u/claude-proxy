@@ -14,9 +14,14 @@
 //	GET /v1/claudio/models     — augmented model catalogue
 //	GET /v1/claudio/me/stats   — per-user request/token statistics
 //	GET /v1/claudio/pool/health — coarse per-provider availability
+//	GET /v1/claudio/session?id= — which credential serves a Claude Code session
 //
 // Security isolation
 //
+//   - /session answers only for sessions recorded under the caller's own
+//     identity (user token, admin, or anonymous); anything else is a 404 so
+//     existence is not leaked across users. It exposes the credential's id,
+//     label, provider and plan, never tokens or other secrets.
 //   - /me/stats requires a non-empty, non-admin UserTokenID; anonymous
 //     callers and admin tokens receive 403.
 //   - /pool/health exposes no credential IDs, labels, percentages or counts —
@@ -29,14 +34,18 @@ package claudioapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/p4u/claude-proxy/internal/creds"
 	"github.com/p4u/claude-proxy/internal/pool"
 	"github.com/p4u/claude-proxy/internal/provider"
+	"github.com/p4u/claude-proxy/internal/sessionbind"
 	"github.com/p4u/claude-proxy/internal/store"
+	"github.com/p4u/claude-proxy/internal/usage"
 	"github.com/p4u/claude-proxy/internal/usertoken"
 )
 
@@ -45,6 +54,10 @@ import (
 type Handler struct {
 	db  *store.DB
 	cat CatalogueSource
+
+	// sessions backs GET /v1/claudio/session; nil until SetSessions is called,
+	// in which case every lookup is a 404.
+	sessions *sessionbind.Registry
 
 	// poolHealth cache: lastGood is only replaced on a successful refresh;
 	// inFlight gates concurrent refreshes so only one query runs at a time.
@@ -92,6 +105,11 @@ func New(mux *http.ServeMux, db *store.DB, cat CatalogueSource) *Handler {
 	mux.Handle("/v1/claudio/", h)
 	return h
 }
+
+// SetSessions wires the session-to-credential registry that the proxy request
+// path fills (proxy.Handler.Sessions). Without it GET /v1/claudio/session
+// reports every session as unknown.
+func (h *Handler) SetSessions(r *sessionbind.Registry) { h.sessions = r }
 
 // WrapHandler returns an http.Handler that intercepts ALL requests whose
 // raw/escaped path starts with "/v1/claudio" BEFORE http.ServeMux sees them.
@@ -165,6 +183,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.methodOnly(w, r, http.MethodGet, h.serveStats)
 	case "/v1/claudio/pool/health":
 		h.methodOnly(w, r, http.MethodGet, h.servePoolHealth)
+	case "/v1/claudio/session":
+		h.methodOnly(w, r, http.MethodGet, h.serveSession)
 	default:
 		// Includes /v1/claudiox and any other path that starts with
 		// /v1/claudio but does not match a known route.
@@ -195,7 +215,7 @@ type rootResponse struct {
 func (h *Handler) serveRoot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, rootResponse{
 		Version:      1,
-		Capabilities: []string{"config", "models", "me/stats", "pool/health"},
+		Capabilities: []string{"config", "models", "me/stats", "pool/health", "session"},
 	})
 }
 
@@ -739,6 +759,97 @@ func (h *Handler) computePoolHealth(ctx context.Context) ([]providerHealth, erro
 		out = append(out, providerHealth{Name: string(p.ID), Status: status})
 	}
 	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// GET /v1/claudio/session?id=<claude_session_id>
+// ---------------------------------------------------------------------------
+
+type sessionCredential struct {
+	ID       string `json:"id"`
+	Label    string `json:"label"`
+	Provider string `json:"provider"`
+	Plan     string `json:"plan"`
+}
+
+// sessionUtilization is the credential's latest stored usage snapshot (the
+// same usage_history row the pool uses for saturation), in percent of each
+// quota window. Only present for providers that report utilization.
+type sessionUtilization struct {
+	FiveHourPct float64 `json:"five_hour_pct"`
+	SevenDayPct float64 `json:"seven_day_pct"`
+	CapturedAt  string  `json:"captured_at"`
+}
+
+type sessionResponse struct {
+	SessionID   string              `json:"session_id"`
+	Credential  sessionCredential   `json:"credential"`
+	BoundAt     string              `json:"bound_at"`
+	LastSeen    string              `json:"last_seen"`
+	SwitchedAt  *string             `json:"switched_at,omitempty"`
+	Utilization *sessionUtilization `json:"utilization,omitempty"`
+}
+
+func (h *Handler) serveSession(w http.ResponseWriter, r *http.Request) {
+	sid := r.URL.Query().Get("id")
+	if !sessionbind.ValidID(sid) {
+		writeJSON(w, http.StatusBadRequest, apiError("invalid_request_error",
+			"claudio: id must be a Claude Code session id (8-64 chars of [0-9A-Za-z_-])"))
+		return
+	}
+
+	owner := sessionbind.OwnerKey(usertoken.FromContext(r.Context()))
+	b, ok := h.sessions.Lookup(owner, sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, apiError("not_found", "claudio: unknown session"))
+		return
+	}
+
+	c, err := creds.Get(r.Context(), h.db, b.CredentialID)
+	if err != nil {
+		if errors.Is(err, creds.ErrNotFound) {
+			// The credential was deleted since the binding was recorded.
+			writeJSON(w, http.StatusNotFound, apiError("not_found", "claudio: unknown session"))
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, apiError("api_error", "claudio: credential lookup failed"))
+		return
+	}
+
+	prov := provider.Get(c.Provider)
+	label := c.Label
+	if label == "" {
+		label = c.SubscriptionType
+	}
+	if label == "" {
+		label = c.ID
+	}
+	resp := sessionResponse{
+		SessionID: sid,
+		Credential: sessionCredential{
+			ID:       c.ID,
+			Label:    label,
+			Provider: string(prov.ID),
+			Plan:     c.SubscriptionType,
+		},
+		BoundAt:  b.BoundAt.UTC().Format(time.RFC3339),
+		LastSeen: b.LastSeen.UTC().Format(time.RFC3339),
+	}
+	if !b.SwitchedAt.IsZero() {
+		s := b.SwitchedAt.UTC().Format(time.RFC3339)
+		resp.SwitchedAt = &s
+	}
+	if prov.PollsUsage {
+		// Best effort: a missing snapshot or a failed read just omits the field.
+		if snap, serr := usage.LastSnapshot(r.Context(), h.db, c.ID); serr == nil && snap != nil {
+			resp.Utilization = &sessionUtilization{
+				FiveHourPct: snap.FiveHourPct,
+				SevenDayPct: snap.SevenDayPct,
+				CapturedAt:  snap.CapturedAt.UTC().Format(time.RFC3339),
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // ---------------------------------------------------------------------------
