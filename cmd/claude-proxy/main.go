@@ -275,6 +275,7 @@ func runServe(args []string) {
 	// segments, and adjacent-prefix paths such as /v1/claudiox.
 	claudioH := claudioapi.New(mux, db, proxyH)
 	claudioH.SetSessions(proxyH.Sessions)
+	claudioH.SetPool(p)
 	mux.Handle("/v1/", proxyH)
 	mux.Handle("/admin/", adminH)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {

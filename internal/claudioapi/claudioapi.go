@@ -15,13 +15,15 @@
 //	GET /v1/claudio/me/stats   — per-user request/token statistics
 //	GET /v1/claudio/pool/health — coarse per-provider availability
 //	GET /v1/claudio/session?id= — which credential serves a Claude Code session
+//	POST /v1/claudio/session/switch — move a session to another credential
 //
 // Security isolation
 //
 //   - /session answers only for sessions recorded under the caller's own
 //     identity (user token, admin, or anonymous); anything else is a 404 so
 //     existence is not leaked across users. It exposes the credential's id,
-//     label, provider and plan, never tokens or other secrets.
+//     label, provider and plan, never tokens or other secrets. /session/switch
+//     is scoped the same way.
 //   - /me/stats requires a non-empty, non-admin UserTokenID; anonymous
 //     callers and admin tokens receive 403.
 //   - /pool/health exposes no credential IDs, labels, percentages or counts —
@@ -35,6 +37,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -58,6 +61,10 @@ type Handler struct {
 	// sessions backs GET /v1/claudio/session; nil until SetSessions is called,
 	// in which case every lookup is a 404.
 	sessions *sessionbind.Registry
+
+	// pool executes POST /v1/claudio/session/switch; nil until SetPool is
+	// called, in which case every switch request is a 404.
+	pool *pool.Pool
 
 	// poolHealth cache: lastGood is only replaced on a successful refresh;
 	// inFlight gates concurrent refreshes so only one query runs at a time.
@@ -110,6 +117,10 @@ func New(mux *http.ServeMux, db *store.DB, cat CatalogueSource) *Handler {
 // path fills (proxy.Handler.Sessions). Without it GET /v1/claudio/session
 // reports every session as unknown.
 func (h *Handler) SetSessions(r *sessionbind.Registry) { h.sessions = r }
+
+// SetPool wires the credential pool that POST /v1/claudio/session/switch asks
+// to schedule a switch. Without it every switch request is a 404.
+func (h *Handler) SetPool(p *pool.Pool) { h.pool = p }
 
 // WrapHandler returns an http.Handler that intercepts ALL requests whose
 // raw/escaped path starts with "/v1/claudio" BEFORE http.ServeMux sees them.
@@ -185,6 +196,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.methodOnly(w, r, http.MethodGet, h.servePoolHealth)
 	case "/v1/claudio/session":
 		h.methodOnly(w, r, http.MethodGet, h.serveSession)
+	case "/v1/claudio/session/switch":
+		h.methodOnly(w, r, http.MethodPost, h.serveSessionSwitch)
 	default:
 		// Includes /v1/claudiox and any other path that starts with
 		// /v1/claudio but does not match a known route.
@@ -215,7 +228,7 @@ type rootResponse struct {
 func (h *Handler) serveRoot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, rootResponse{
 		Version:      1,
-		Capabilities: []string{"config", "models", "me/stats", "pool/health", "session"},
+		Capabilities: []string{"config", "models", "me/stats", "pool/health", "session", "session_switch"},
 	})
 }
 
@@ -817,23 +830,11 @@ func (h *Handler) serveSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	prov := provider.Get(c.Provider)
-	label := c.Label
-	if label == "" {
-		label = c.SubscriptionType
-	}
-	if label == "" {
-		label = c.ID
-	}
 	resp := sessionResponse{
-		SessionID: sid,
-		Credential: sessionCredential{
-			ID:       c.ID,
-			Label:    label,
-			Provider: string(prov.ID),
-			Plan:     c.SubscriptionType,
-		},
-		BoundAt:  b.BoundAt.UTC().Format(time.RFC3339),
-		LastSeen: b.LastSeen.UTC().Format(time.RFC3339),
+		SessionID:  sid,
+		Credential: credentialView(c),
+		BoundAt:    b.BoundAt.UTC().Format(time.RFC3339),
+		LastSeen:   b.LastSeen.UTC().Format(time.RFC3339),
 	}
 	if !b.SwitchedAt.IsZero() {
 		s := b.SwitchedAt.UTC().Format(time.RFC3339)
@@ -850,6 +851,103 @@ func (h *Handler) serveSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// credentialView is the public face of a credential: no tokens, no secrets.
+func credentialView(c *creds.Credential) sessionCredential {
+	label := c.Label
+	if label == "" {
+		label = c.SubscriptionType
+	}
+	if label == "" {
+		label = c.ID
+	}
+	return sessionCredential{
+		ID:       c.ID,
+		Label:    label,
+		Provider: string(provider.Get(c.Provider).ID),
+		Plan:     c.SubscriptionType,
+	}
+}
+
+// ---------------------------------------------------------------------------
+// POST /v1/claudio/session/switch  {"id":"<claude_session_id>"}
+// ---------------------------------------------------------------------------
+
+// maxSwitchBody bounds the request body; a valid one is under 100 bytes.
+const maxSwitchBody = 4 << 10
+
+type switchRequest struct {
+	ID string `json:"id"`
+}
+
+// switchResponse is the 202 body. To is null when the destination cannot be
+// determined yet; State is always "pending" — the move happens on the
+// session's next request (see pool.RequestSwitch).
+type switchResponse struct {
+	SessionID string             `json:"session_id"`
+	From      sessionCredential  `json:"from"`
+	To        *sessionCredential `json:"to"`
+	State     string             `json:"state"`
+}
+
+// serveSessionSwitch schedules a user-requested move of a session to another
+// credential, picked by the pool's normal rules with the current one
+// excluded. Nothing moves until the session's next request, which drains the
+// old credential's in-flight requests first and then carries
+// X-Router-Rebalance: switched. Repeating the call while the plan is pending
+// returns the same plan.
+func (h *Handler) serveSessionSwitch(w http.ResponseWriter, r *http.Request) {
+	var req switchRequest
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxSwitchBody+1))
+	if err != nil || len(body) > maxSwitchBody || json.Unmarshal(body, &req) != nil || !sessionbind.ValidID(req.ID) {
+		writeJSON(w, http.StatusBadRequest, apiError("invalid_request_error",
+			`claudio: body must be {"id":"<claude session id>"} (8-64 chars of [0-9A-Za-z_-])`))
+		return
+	}
+	notFound := func() {
+		writeJSON(w, http.StatusNotFound, apiError("not_found", "claudio: unknown session"))
+	}
+
+	owner := sessionbind.OwnerKey(usertoken.FromContext(r.Context()))
+	b, ok := h.sessions.Lookup(owner, req.ID)
+	if !ok || h.pool == nil || b.Route.ConvID == "" {
+		notFound()
+		return
+	}
+	// Same answer as GET /session when the recorded credential was deleted.
+	if _, err := creds.Get(r.Context(), h.db, b.CredentialID); err != nil {
+		if errors.Is(err, creds.ErrNotFound) {
+			notFound()
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, apiError("api_error", "claudio: credential lookup failed"))
+		return
+	}
+
+	plan, err := h.pool.RequestSwitch(r.Context(), b.Route.ConvID, b.Route.Provider, b.Route.Scope, b.Route.Allowed)
+	switch {
+	case errors.Is(err, pool.ErrNotBound):
+		notFound()
+		return
+	case errors.Is(err, pool.ErrNoAlternative):
+		writeJSON(w, http.StatusConflict, apiError("no_alternative",
+			"claudio: no other eligible credential can serve this session"))
+		return
+	case errors.Is(err, pool.ErrAccountBound):
+		writeJSON(w, http.StatusConflict, apiError("no_alternative",
+			"claudio: this session uses account-scoped resources and must keep its credential"))
+		return
+	case err != nil:
+		writeJSON(w, http.StatusInternalServerError, apiError("api_error", "claudio: switch failed"))
+		return
+	}
+	resp := switchResponse{SessionID: req.ID, From: credentialView(plan.From), State: "pending"}
+	if plan.To != nil {
+		to := credentialView(plan.To)
+		resp.To = &to
+	}
+	writeJSON(w, http.StatusAccepted, resp)
 }
 
 // ---------------------------------------------------------------------------

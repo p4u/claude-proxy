@@ -13,7 +13,7 @@ import (
 // either the notice or its explanation. Model output is never modified.
 type rebalanceWriter struct {
 	http.ResponseWriter
-	state, emitted          string
+	state, reason, emitted  string
 	wrote, failed, complete bool
 }
 
@@ -32,7 +32,11 @@ func (w *rebalanceWriter) WriteHeader(status int) {
 				w.Header().Set("X-Router-Message", "A later message may switch subscriptions after current requests finish, if usage still favors it; prompt cache may rebuild.")
 			case "switched":
 				w.Header().Set("X-Router-Rebalance", "switched")
-				w.Header().Set("X-Router-Message", "This message switched subscriptions to rebalance usage; prompt cache may rebuild.")
+				if w.reason == "user" {
+					w.Header().Set("X-Router-Message", "This message switched subscriptions as requested; prompt cache may rebuild.")
+				} else {
+					w.Header().Set("X-Router-Message", "This message switched subscriptions to rebalance usage; prompt cache may rebuild.")
+				}
 			}
 			w.emitted = w.state
 		}

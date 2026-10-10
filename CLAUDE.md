@@ -937,6 +937,7 @@ sees them (see "Namespace reservation" below).
 | `GET` | `/v1/claudio/me/stats` | user token only | Per-user stats (24h/7d/30d) |
 | `GET` | `/v1/claudio/pool/health` | same as /v1/* | Coarse provider availability |
 | `GET` | `/v1/claudio/session?id=<claude_session_id>` | same as /v1/* | Which credential serves a Claude Code session |
+| `POST` | `/v1/claudio/session/switch` | same as /v1/* | Move a Claude Code session to another credential |
 
 Unknown paths return a local 404; wrong methods return 405. Neither is written
 to `request_log`.
@@ -957,6 +958,30 @@ that poll usage. 400 for a bad `id`, 404 for an unknown session, a session
 recorded under another user token, or a deleted credential (identical bodies,
 so existence is not leaked). `main.go` wires it with
 `claudioH.SetSessions(proxyH.Sessions)`.
+
+### User-requested switch (`/v1/claudio/session/switch`)
+
+`POST {"id":"<claude_session_id>"}` (capability `session_switch`) asks the pool
+to move one session to another credential. `sessionbind` also records the pool
+route of each session's latest main request (derived conversation ID, provider,
+custom scope and allowed set), so the handler can find the binding; owner
+scoping and the 404 rules are those of `GET /session`. `pool.RequestSwitch`
+picks the destination with the normal picker (`activeCandidates` +
+`weightedRandPick`: same provider and allowed set, active, not cooling down,
+not saturated) with the current pin excluded, and installs a **user plan**
+(`rebalancePlan.user`, routing reason `user`) that supersedes any elective
+notice. Nothing moves yet: the reply is `202 {session_id, from, to, state:
+"pending"}` (`to` null if the destination is no longer known). The session's
+next generation request executes it through the existing `AcquireScoped`
+drain path — it waits up to 2 s for in-flight requests on the old credential,
+defers on timeout (old streams are never interrupted), then commits the pin
+change and its audit event in one transaction and answers with
+`X-Router-Rebalance: switched` (message "…switched subscriptions as
+requested…"). A user plan skips the elective policy (`REBALANCE_SESSIONS`,
+dwell, usage advantage, notice TTL, Anthropic-only), is not executed by
+count-only/haiku requests, and is idempotent while pending. It is cancelled by a
+pin change, account binding, or no eligible destination at execution time. No
+alternative, or an account-bound conversation, is `409 no_alternative`.
 
 ### Namespace reservation
 

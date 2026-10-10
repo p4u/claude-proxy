@@ -304,43 +304,12 @@ func (p *Pool) bindOnce(ctx context.Context, convID string, prov provider.ID, sc
 // subscription is not a fallback for it (it cannot serve that model at all) and
 // vice versa. Weights and usage scores therefore only ever compare credentials
 // within one provider.
-func (p *Pool) pickActiveLocked(ctx context.Context, tx *sql.Tx, prov provider.ID, allowed []string) (string, error) {
+func (p *Pool) pickActiveLocked(ctx context.Context, tx rebalanceReader, prov provider.ID, allowed []string) (string, error) {
 	if prov == "" {
 		prov = provider.Default
 	}
-	now := time.Now()
-	inClause, inArgs := idFilter(allowed)
-	rows, err := tx.QueryContext(ctx, `
-		SELECT c.id, c.weight FROM credentials c
-		WHERE c.status='active'
-		  AND COALESCE(c.provider,'anthropic') = ?
-		  AND (c.retry_after IS NULL OR c.retry_after < ?)`+inClause+`
-		  AND NOT EXISTS (
-		    SELECT 1 FROM usage_history u
-		    WHERE u.credential_id = c.id
-		      AND u.captured_at = (
-		        SELECT MAX(captured_at) FROM usage_history WHERE credential_id = c.id
-		      )
-		      AND (u.five_hour_pct >= 100 OR u.seven_day_pct >= 100)
-		  )
-		ORDER BY c.id`, append([]any{string(prov), now.Unix()}, inArgs...)...)
+	candidates, err := activeCandidates(ctx, tx, prov, allowed, "", time.Now())
 	if err != nil {
-		return "", err
-	}
-	defer rows.Close()
-
-	var candidates []weightedEntry
-	for rows.Next() {
-		var e weightedEntry
-		if err := rows.Scan(&e.id, &e.weight); err != nil {
-			return "", err
-		}
-		if e.weight < 1 {
-			e.weight = 1
-		}
-		candidates = append(candidates, e)
-	}
-	if err := rows.Err(); err != nil {
 		return "", err
 	}
 
@@ -379,6 +348,50 @@ func (p *Pool) pickActiveLocked(ctx context.Context, tx *sql.Tx, prov provider.I
 	}
 
 	return p.weightedRandPick(ctx, tx, candidates)
+}
+
+// activeCandidates is the picker's eligible set: active credentials of prov
+// (restricted to allowed when non-empty) that are not cooling down after a 429
+// and whose latest usage snapshot is not saturated. exclude, when set, removes
+// one credential — the current pin of a user-requested switch.
+func activeCandidates(ctx context.Context, q rebalanceReader, prov provider.ID, allowed []string, exclude string, now time.Time) ([]weightedEntry, error) {
+	inClause, inArgs := idFilter(allowed)
+	args := append([]any{string(prov), now.Unix()}, inArgs...)
+	if exclude != "" {
+		inClause += " AND c.id <> ?"
+		args = append(args, exclude)
+	}
+	rows, err := q.QueryContext(ctx, `
+		SELECT c.id, c.weight FROM credentials c
+		WHERE c.status='active'
+		  AND COALESCE(c.provider,'anthropic') = ?
+		  AND (c.retry_after IS NULL OR c.retry_after < ?)`+inClause+`
+		  AND NOT EXISTS (
+		    SELECT 1 FROM usage_history u
+		    WHERE u.credential_id = c.id
+		      AND u.captured_at = (
+		        SELECT MAX(captured_at) FROM usage_history WHERE credential_id = c.id
+		      )
+		      AND (u.five_hour_pct >= 100 OR u.seven_day_pct >= 100)
+		  )
+		ORDER BY c.id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var candidates []weightedEntry
+	for rows.Next() {
+		var e weightedEntry
+		if err := rows.Scan(&e.id, &e.weight); err != nil {
+			return nil, err
+		}
+		if e.weight < 1 {
+			e.weight = 1
+		}
+		candidates = append(candidates, e)
+	}
+	return candidates, rows.Err()
 }
 
 type weightedEntry struct {
@@ -490,7 +503,7 @@ func EffectiveScore(weight int, fhPct, sdPct float64, sdResetsUnix int64, now ti
 //
 // The most recent usage snapshot is used regardless of age. headroom=1.0 is
 // used only when no snapshot exists for a credential (newly imported).
-func (p *Pool) weightedRandPick(ctx context.Context, tx *sql.Tx, candidates []weightedEntry) (string, error) {
+func (p *Pool) weightedRandPick(ctx context.Context, tx rebalanceReader, candidates []weightedEntry) (string, error) {
 	type scored struct {
 		id     string
 		weight int

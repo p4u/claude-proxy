@@ -12,6 +12,7 @@ import (
 
 	"github.com/p4u/claude-proxy/internal/claudioapi"
 	"github.com/p4u/claude-proxy/internal/creds"
+	"github.com/p4u/claude-proxy/internal/pool"
 	"github.com/p4u/claude-proxy/internal/proxy"
 	"github.com/p4u/claude-proxy/internal/sessionbind"
 	"github.com/p4u/claude-proxy/internal/store"
@@ -28,6 +29,7 @@ type sessionStack struct {
 	handler  http.Handler
 	db       *store.DB
 	sessions *sessionbind.Registry
+	pool     *pool.Pool
 	tokenA   *usertoken.UserToken
 	tokenB   *usertoken.UserToken
 	cred     *creds.Credential
@@ -56,16 +58,19 @@ func setupSessionStack(t *testing.T, wire bool) *sessionStack {
 	}
 
 	reg := sessionbind.New(16)
+	p := pool.New(db)
 	mux := http.NewServeMux()
 	h := claudioapi.New(mux, db, &fakeCatalogue{})
 	if wire {
 		h.SetSessions(reg)
+		h.SetPool(p)
 	}
 	mux.Handle("/v1/", http.NotFoundHandler())
 	return &sessionStack{
 		handler:  proxy.AuthMiddleware("", db, false, h.WrapHandler(mux)),
 		db:       db,
 		sessions: reg,
+		pool:     p,
 		tokenA:   a,
 		tokenB:   b,
 		cred:     c,

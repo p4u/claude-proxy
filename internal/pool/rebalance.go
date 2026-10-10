@@ -44,6 +44,11 @@ type rebalancePlan struct {
 	lastDeferred   time.Time
 	done           chan struct{} // closed under p.mu when replaced, cancelled, or switched
 	reason         string        // completion reason, also guarded by p.mu
+	// user marks a plan requested through RequestSwitch. It is created
+	// acknowledged, skips the usage-advantage and notice-expiry rules, and
+	// ends only by switching, a pin change, account binding, or no
+	// remaining alternative.
+	user bool
 }
 
 type sessionState struct {
@@ -87,7 +92,7 @@ type Lease struct {
 	Credential      *creds.Credential
 	IsNew           bool
 	Rebalance       string // empty, "pending", "switched", "deferred", or "cancelled"
-	RebalanceReason string // bounded, account-neutral diagnostic for deferred/cancelled
+	RebalanceReason string // bounded, account-neutral diagnostic for deferred/cancelled; "user" for a requested switch
 
 	pool       *Pool
 	state      *sessionState
@@ -175,6 +180,10 @@ func (p *Pool) AcquireScoped(ctx context.Context, convID string, prov provider.I
 			p.finishPlan(s, "account-bound")
 		case isNew || s.pending != nil && s.pending.source != c.ID:
 			p.finishPlan(s, "pin-changed")
+		case s.pending != nil && s.pending.user:
+			// Requested by the user: independent of elective policy, notice
+			// expiry and the source's health (a limited source is a reason
+			// to move, not to cancel).
 		case !opts.Rebalance:
 			p.finishPlan(s, "disabled")
 		case c.Status != creds.StatusActive:
@@ -196,7 +205,11 @@ func (p *Pool) AcquireScoped(ctx context.Context, convID string, prov provider.I
 		if waited != nil && !time.Now().Before(deadline) {
 			budgetExpired = true
 		}
-		if eligible && gate.allowSwitch && !planEnded && !budgetExpired && s.pending != nil && s.pending.notified && s.inflight > 0 {
+		// A user-requested plan is executed by the next generation request;
+		// count-only and background calls join the lease on the current pin.
+		userPlan := s.pending != nil && s.pending.user
+		userSwitch := userPlan && !opts.ObserveOnly && !planEnded
+		if (userSwitch || eligible && gate.allowSwitch && !userPlan) && !planEnded && !budgetExpired && s.pending != nil && s.pending.notified && s.inflight > 0 {
 			if waited == nil {
 				waited = s.pending
 				budget := s.drainWait
@@ -216,7 +229,9 @@ func (p *Pool) AcquireScoped(ctx context.Context, convID string, prov provider.I
 			}
 			continue // re-run emergency failover and revalidate after every wake
 		}
-		if eligible && gate.allowCheck && !planEnded && !isNew && c.Status == creds.StatusActive &&
+		if userSwitch {
+			p.executeUserSwitch(ctx, l, s, key, c, prov, allowed, budgetExpired, now)
+		} else if !userPlan && eligible && gate.allowCheck && !planEnded && !isNew && c.Status == creds.StatusActive &&
 			(s.pending != nil || gate.forceCheck || now.Sub(s.lastCheck) >= rebalanceCheckEvery) {
 			s.lastCheck = now
 			allowSwitch := gate.allowSwitch && !budgetExpired
@@ -280,7 +295,7 @@ func (p *Pool) AcquireScoped(ctx context.Context, convID string, prov provider.I
 // lifetime. No polling, background goroutine, or transaction spans this wait.
 func (p *Pool) waitForDrain(ctx context.Context, s *sessionState, plan *rebalancePlan, deadline, now time.Time) string {
 	delay, reason := time.Until(deadline), "drain-timeout"
-	if ttl := plan.created.Add(rebalanceNoticeTTL).Sub(now); ttl <= delay {
+	if ttl := plan.created.Add(rebalanceNoticeTTL).Sub(now); !plan.user && ttl <= delay {
 		delay, reason = ttl, "notice-expired"
 	}
 	timer := time.NewTimer(max(0, delay))

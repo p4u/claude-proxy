@@ -54,8 +54,9 @@ type Handler struct {
 	// enrichFromSidecar). Optional: without it those rows are named by ID.
 	Sidecar *codexgateway.Client
 
-	// Sessions remembers which credential served each Claude Code session
-	// (X-Claude-Code-Session-Id), in memory only, for GET /v1/claudio/session.
+	// Sessions remembers which credential and pool binding served each Claude
+	// Code session (X-Claude-Code-Session-Id), in memory only, for
+	// GET /v1/claudio/session and POST /v1/claudio/session/switch.
 	// Never nil for a Handler built by New; recording is best-effort and can
 	// not fail a request.
 	Sessions *sessionbind.Registry
@@ -206,13 +207,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			lease.ReleaseSummary(notice.pendingEmitted() && r.Context().Err() == nil, summaryProof)
 		}()
-		notice.state = lease.Rebalance
+		notice.state, notice.reason = lease.Rebalance, lease.RebalanceReason
 		cred = lease.Credential
 		// Observe-only requests (haiku background calls, count_tokens) are
 		// skipped: they may be served by a different provider than the
 		// session's main model and would make the reported credential flap.
+		// The route lets POST /v1/claudio/session/switch find this binding.
 		if !opts.ObserveOnly {
-			h.Sessions.RecordRequest(r, cred.ID)
+			h.Sessions.RecordRequest(r, cred.ID, sessionbind.Route{
+				ConvID: dr.ConvID, Provider: prov, Scope: custom.Model, Allowed: custom.CredIDs})
 		}
 		h.log.Info("bind",
 			"conv", convID, "src", string(convSrc), "new", lease.IsNew,

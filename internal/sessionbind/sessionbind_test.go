@@ -133,7 +133,7 @@ func TestDefaultCapacityAndNilSafety(t *testing.T) {
 	}
 	var r *Registry
 	r.Record("o", sidA, "c1") // must not panic
-	r.RecordRequest(httptest.NewRequest("GET", "/", nil), "c1")
+	r.RecordRequest(httptest.NewRequest("GET", "/", nil), "c1", Route{})
 	if _, ok := r.Lookup("o", sidA); ok || r.Len() != 0 {
 		t.Fatal("nil registry should be empty")
 	}
@@ -179,18 +179,36 @@ func TestRecordRequest(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 	req = req.WithContext(usertoken.WithIdentity(context.Background(), &usertoken.Identity{UserTokenID: "u1"}))
 
-	r.RecordRequest(req, "cred-1") // no header: ignored
+	r.RecordRequest(req, "cred-1", Route{}) // no header: ignored
 	if r.Len() != 0 {
 		t.Fatal("recorded without header")
 	}
 	req.Header.Set(Header, "junk!")
-	r.RecordRequest(req, "cred-1")
+	r.RecordRequest(req, "cred-1", Route{})
 	if r.Len() != 0 {
 		t.Fatal("recorded invalid header")
 	}
 	req.Header.Set(Header, sidA)
-	r.RecordRequest(req, "cred-1")
+	r.RecordRequest(req, "cred-1", Route{})
 	if b, ok := r.Lookup("user:u1", sidA); !ok || b.CredentialID != "cred-1" {
 		t.Fatalf("lookup = %+v, %v", b, ok)
+	}
+}
+
+func TestRecordRouteTracksLatest(t *testing.T) {
+	r := New(8)
+	first := Route{ConvID: "conv-1", Provider: "anthropic"}
+	r.RecordRoute("o", sidA, "c1", first)
+	if b, ok := r.Lookup("o", sidA); !ok || b.Route.ConvID != "conv-1" || b.Route.Provider != "anthropic" {
+		t.Fatalf("lookup = %+v, %v", b, ok)
+	}
+	second := Route{ConvID: "conv-1", Provider: "custom", Scope: "my-model", Allowed: []string{"c2"}}
+	r.RecordRoute("o", sidA, "c2", second)
+	b, _ := r.Lookup("o", sidA)
+	if b.Route.Provider != "custom" || b.Route.Scope != "my-model" || len(b.Route.Allowed) != 1 || b.CredentialID != "c2" {
+		t.Fatalf("route not replaced: %+v", b)
+	}
+	if _, ok := r.Lookup("other", sidA); ok {
+		t.Fatal("route visible to another owner")
 	}
 }

@@ -1,6 +1,7 @@
 // Package sessionbind remembers which credential served each Claude Code
-// session, so the read-only GET /v1/claudio/session endpoint can tell a client
-// "this tab is running on credential X".
+// session, so the GET /v1/claudio/session endpoint can tell a client "this tab
+// is running on credential X", and which pool binding served it, so POST
+// /v1/claudio/session/switch can ask the pool to move that binding.
 //
 // Claude Code stamps every request with X-Claude-Code-Session-Id. The proxy
 // request path calls Registry.Record once the credential for a request is
@@ -22,14 +23,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/p4u/claude-proxy/internal/provider"
 	"github.com/p4u/claude-proxy/internal/usertoken"
 )
 
 // Header is the request header Claude Code uses to identify a session.
 const Header = "X-Claude-Code-Session-Id"
 
-// DefaultCapacity bounds the registry. An entry is roughly 200 bytes, so the
-// default costs about a megabyte at most.
+// DefaultCapacity bounds the registry. An entry is a few hundred bytes, so the
+// default costs a megabyte or two at most.
 const DefaultCapacity = 4096
 
 // maxIDLen is the longest session id accepted from a client.
@@ -48,6 +50,21 @@ type Binding struct {
 	// SwitchedAt is when the credential last changed for this session. Zero
 	// when the session has only ever used one credential.
 	SwitchedAt time.Time
+	// Route is the pool binding behind the latest recorded request. Zero
+	// when recorded without one, in which case the session cannot be
+	// switched.
+	Route Route
+}
+
+// Route identifies a pool binding: the arguments the proxy passed to
+// pool.AcquireScoped (derived conversation ID, provider, and for custom hosts
+// the model scope and allowed credential IDs). Allowed is shared, not copied;
+// callers must not modify it after recording.
+type Route struct {
+	ConvID   string
+	Provider provider.ID
+	Scope    string
+	Allowed  []string
 }
 
 type entry struct {
@@ -115,9 +132,16 @@ func OwnerKey(id *usertoken.Identity) string {
 
 func compose(owner, sessionID string) string { return owner + "\x00" + sessionID }
 
-// Record notes that sessionID (owned by owner) was just served by credID.
-// Invalid ids and empty credential ids are ignored. Safe on a nil Registry.
+// Record notes that sessionID (owned by owner) was just served by credID,
+// without a pool route. Invalid ids and empty credential ids are ignored. Safe
+// on a nil Registry.
 func (r *Registry) Record(owner, sessionID, credID string) {
+	r.RecordRoute(owner, sessionID, credID, Route{})
+}
+
+// RecordRoute is Record that also remembers the pool binding (route) that
+// served the request, replacing any earlier route for the session.
+func (r *Registry) RecordRoute(owner, sessionID, credID string, route Route) {
 	if r == nil || credID == "" || !ValidID(sessionID) {
 		return
 	}
@@ -133,12 +157,13 @@ func (r *Registry) Record(owner, sessionID, credID string) {
 			e.SwitchedAt = now
 		}
 		e.LastSeen = now
+		e.Route = route
 		r.order.MoveToFront(el)
 		return
 	}
 	r.items[k] = r.order.PushFront(&entry{
 		key:     k,
-		Binding: Binding{CredentialID: credID, BoundAt: now, LastSeen: now},
+		Binding: Binding{CredentialID: credID, BoundAt: now, LastSeen: now, Route: route},
 	})
 	for r.order.Len() > r.cap {
 		oldest := r.order.Back()
@@ -148,9 +173,9 @@ func (r *Registry) Record(owner, sessionID, credID string) {
 }
 
 // RecordRequest is the proxy-path convenience: it reads the session header and
-// the caller identity from req and records the binding. Requests without a
-// valid header are ignored.
-func (r *Registry) RecordRequest(req *http.Request, credID string) {
+// the caller identity from req and records the binding and its pool route.
+// Requests without a valid header are ignored.
+func (r *Registry) RecordRequest(req *http.Request, credID string, route Route) {
 	if r == nil {
 		return
 	}
@@ -158,7 +183,7 @@ func (r *Registry) RecordRequest(req *http.Request, credID string) {
 	if sid == "" {
 		return
 	}
-	r.Record(OwnerKey(usertoken.FromContext(req.Context())), sid, credID)
+	r.RecordRoute(OwnerKey(usertoken.FromContext(req.Context())), sid, credID, route)
 }
 
 // Lookup returns the binding for sessionID as recorded under owner. A session
