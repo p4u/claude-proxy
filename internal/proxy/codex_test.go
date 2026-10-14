@@ -10,8 +10,11 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/p4u/claude-proxy/internal/codexgateway"
 	"github.com/p4u/claude-proxy/internal/creds"
 	"github.com/p4u/claude-proxy/internal/pool"
 	"github.com/p4u/claude-proxy/internal/provider"
@@ -222,5 +225,70 @@ func TestGeminiRequestUsesGatewayAndWireModel(t *testing.T) {
 	}
 	if gotModel != "gemini-pro-agent" || gotAuth != "Bearer sidecar-key" {
 		t.Fatalf("wire model/auth = %q / %q", gotModel, gotAuth)
+	}
+}
+
+// The sidecar's catalogue lists Gemini 4 Argon for every Antigravity account,
+// but Google serves it only to some subscriptions and answers 404 to the rest.
+// GET /v1/models must advertise only what a signed-in account is offered, and
+// fall back to the full catalogue when that list cannot be read.
+func TestGeminiCatalogueOmitsModelsNoAccountIsOffered(t *testing.T) {
+	reset := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	var googleDown atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/models":
+			fmt.Fprint(w, `{"data":[
+			 {"id":"gemini-4-argon-high","object":"model","owned_by":"antigravity"},
+			 {"id":"gemini-3.8-flash-high","object":"model","owned_by":"antigravity"}]}`)
+		case "/v0/management/auth-files":
+			fmt.Fprint(w, `{"files":[{"name":"a.json","type":"antigravity","auth_index":"g1"}]}`)
+		case "/v0/management/api-call":
+			if googleDown.Load() {
+				fmt.Fprint(w, `{"status_code":503,"body":"{}"}`)
+				return
+			}
+			body, _ := json.Marshal(`{"models":{"gemini-3.8-flash-high":{"quotaInfo":{"remainingFraction":1,"resetTime":"` + reset + `"}}}}`)
+			fmt.Fprintf(w, `{"status_code":200,"body":%s}`, body)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	advertised := func(t *testing.T) string {
+		t.Helper()
+		db, err := store.Open(filepath.Join(t.TempDir(), "gemini.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { db.Close() })
+		if _, err := creds.InsertKey(context.Background(), db, provider.Gemini, "Gemini gateway", "oauth-sidecar", "sidecar-key", srv.URL, 1); err != nil {
+			t.Fatal(err)
+		}
+		h := New(db, pool.New(db), creds.NewRefresher(db), slog.New(slog.NewTextHandler(io.Discard, nil)))
+		if h.Sidecar, err = codexgateway.New(codexgateway.Config{BaseURL: srv.URL, APIKey: "sidecar-key", ManagementKey: "m"}); err != nil {
+			t.Fatal(err)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("models = %d %s", w.Code, w.Body.String())
+		}
+		return w.Body.String()
+	}
+
+	body := advertised(t)
+	if strings.Contains(body, "argon") {
+		t.Fatalf("a model no account is offered was advertised: %s", body)
+	}
+	if !strings.Contains(body, `"id":"claude-gemini-3.8-flash-high"`) {
+		t.Fatalf("an offered model is missing: %s", body)
+	}
+
+	googleDown.Store(true)
+	if body := advertised(t); !strings.Contains(body, `"id":"claude-gemini-4-argon-high"`) {
+		t.Fatalf("with no readable account list the full catalogue must pass: %s", body)
 	}
 }

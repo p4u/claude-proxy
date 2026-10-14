@@ -449,6 +449,16 @@ the Anthropic-shaped one rewrites IDs into opaque aliases. Every Gemini chat
 model is 1,048,576 tokens, so `Augment1M` gives each a `[1m]` row; without it
 Claude Code would assume 200K for an ID it does not know.
 
+**The sidecar's catalogue is per channel, not per account** (`filterUnoffered`,
+`codexgateway.AvailableModels`). It lists `gemini-4-argon-high` for every
+Antigravity sign-in, but Google serves Argon in Antigravity only to AI Ultra /
+Enterprise and answers `404 Requested entity was not found` to everyone else;
+the sidecar then cools the account down and each retry is a `503
+auth_unavailable`. `GET /v1/models` therefore advertises only the Gemini models
+that `fetchAvailableModels` (already read for quota, so no extra call) lists for
+at least one enabled account. It fails open: no readable account list, or a
+filter that would leave nothing, keeps the full catalogue.
+
 **Quota comes from Google, not response headers.** Antigravity sends nothing
 like `X-Codex-*`. `fetchAvailableModels` reports per-model
 `quotaInfo{remainingFraction,resetTime}`; every `gemini-*` model shares one

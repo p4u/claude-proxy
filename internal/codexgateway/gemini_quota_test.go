@@ -136,3 +136,68 @@ func TestGeminiAccountsReadQuotaThroughSidecar(t *testing.T) {
 		t.Fatalf("codex accounts = %#v, %v", codex, err)
 	}
 }
+
+// AvailableModels is the union of what Google offers each enabled account,
+// taken from the quota fetch, and reports unknown — not empty — when no
+// account's list could be read.
+func TestAvailableModels(t *testing.T) {
+	reset := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	bodies := map[string]string{
+		"g1": `{"models":{"gemini-3.8-flash-high":{"quotaInfo":{"remainingFraction":1,"resetTime":"` + reset + `"}}}}`,
+		"g2": `{"models":{"gemini-pro-agent":{"quotaInfo":{"remainingFraction":1,"resetTime":"` + reset + `"}}}}`,
+		// Disabled: its models must not be advertised.
+		"g3": `{"models":{"gemini-4-argon-high":{"quotaInfo":{"remainingFraction":1,"resetTime":"` + reset + `"}}}}`,
+	}
+	var failing atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{
+				{"name": "a.json", "type": "antigravity", "auth_index": "g1"},
+				{"name": "b.json", "type": "antigravity", "auth_index": "g2"},
+				{"name": "c.json", "type": "antigravity", "auth_index": "g3", "disabled": true},
+			}})
+		case "/v0/management/api-call":
+			var req struct {
+				AuthIndex string `json:"auth_index"`
+				URL       string `json:"url"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if failing.Load() {
+				_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 403, "body": `{}`})
+				return
+			}
+			body := bodies[req.AuthIndex]
+			if strings.HasSuffix(req.URL, ":loadCodeAssist") {
+				body = `{"currentTier":{"id":"free-tier"}}`
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": body})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	failing.Store(true)
+	c, err := New(Config{BaseURL: srv.URL, APIKey: "api", ManagementKey: "management"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if models, known := c.AvailableModels(context.Background(), GeminiChannel); known {
+		t.Fatalf("every fetch failed but the list reads as known: %v", models)
+	}
+
+	failing.Store(false)
+	c, _ = New(Config{BaseURL: srv.URL, APIKey: "api", ManagementKey: "management"})
+	models, known := c.AvailableModels(context.Background(), GeminiChannel)
+	if !known {
+		t.Fatal("available models unknown after successful fetches")
+	}
+	if !models["gemini-3.8-flash-high"] || !models["gemini-pro-agent"] || len(models) != 2 {
+		t.Fatalf("available models = %v, want the union of the two enabled accounts", models)
+	}
+
+	if _, known := c.AvailableModels(context.Background(), CodexChannel); known {
+		t.Fatal("Codex has no per-account model list; it must read as unknown")
+	}
+}

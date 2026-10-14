@@ -289,6 +289,49 @@ func (h *Handler) enrichFromSidecar(ctx context.Context, p provider.Provider, en
 	return out
 }
 
+// filterUnoffered drops the sidecar catalogue entries that the upstream offers
+// to none of the provider's signed-in accounts (see
+// codexgateway.AvailableModels), so the picker does not offer a model that can
+// only 404 — Gemini 4 Argon on an AI Pro account. The account list follows the
+// subscription: once an account gains a model it is advertised again.
+//
+// It fails open. Without a sidecar client, without a known account list, or
+// when the filter would leave nothing (more likely an ID scheme change than an
+// account that serves no models at all), the catalogue passes unchanged.
+func (h *Handler) filterUnoffered(ctx context.Context, p provider.Provider, entries []map[string]any) []map[string]any {
+	if h.Sidecar == nil || len(entries) == 0 {
+		return entries
+	}
+	ch, ok := codexgateway.ChannelFor(p.ID)
+	if !ok {
+		return entries
+	}
+	offered, known := h.Sidecar.AvailableModels(ctx, ch)
+	if !known {
+		return entries
+	}
+	out := make([]map[string]any, 0, len(entries))
+	var dropped []string
+	for _, e := range entries {
+		id, _ := e["id"].(string)
+		if offered[id] {
+			out = append(out, e)
+		} else {
+			dropped = append(dropped, id)
+		}
+	}
+	if len(out) == 0 {
+		h.log.Warn("models: no catalogue entry is offered to any account, keeping the full catalogue",
+			"provider", string(p.ID), "models", len(entries))
+		return entries
+	}
+	if len(dropped) > 0 {
+		h.log.Info("models: omitting models no account is offered",
+			"provider", string(p.ID), "models", dropped)
+	}
+	return out
+}
+
 // filterCatalog keeps only the entries this provider can actually serve, and
 // fills in its default context window where the upstream publishes none.
 //
@@ -672,7 +715,7 @@ func (h *Handler) serveModels(w http.ResponseWriter, r *http.Request, start time
 				"provider", string(p.ID), "bytes", rec.body.Len())
 			continue
 		}
-		entries = filterCatalog(h.enrichFromSidecar(r.Context(), p, entries), p)
+		entries = h.filterUnoffered(r.Context(), p, filterCatalog(h.enrichFromSidecar(r.Context(), p, entries), p))
 		if p.Augment1M {
 			entries = augment1M(entries)
 		}

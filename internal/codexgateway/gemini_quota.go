@@ -33,6 +33,10 @@ type cachedQuota struct {
 	at     time.Time
 	tier   string
 	tierAt time.Time
+	// models is every model ID Google offers the account, from the same
+	// fetchAvailableModels response the quota is read from (see
+	// AvailableModels).
+	models map[string]bool
 }
 
 // geminiQuota returns the account's current quota, cached for a minute so the
@@ -50,7 +54,7 @@ func (c *Client) geminiQuota(ctx context.Context, acc Account, now time.Time) Co
 		return cached.quota
 	}
 
-	q, err := c.fetchGeminiQuota(ctx, acc.AuthIndex, now)
+	q, models, err := c.fetchGeminiQuota(ctx, acc.AuthIndex, now)
 	if err != nil {
 		if ok {
 			return cached.quota
@@ -66,22 +70,63 @@ func (c *Client) geminiQuota(ctx context.Context, acc Account, now time.Time) Co
 	q.PlanType = tier
 
 	c.quotaMu.Lock()
-	c.quotaCache[acc.AuthIndex] = cachedQuota{quota: q, at: now, tier: tier, tierAt: tierAt}
+	c.quotaCache[acc.AuthIndex] = cachedQuota{quota: q, at: now, tier: tier, tierAt: tierAt, models: models}
 	c.quotaMu.Unlock()
 	return q
 }
 
-func (c *Client) fetchGeminiQuota(ctx context.Context, authIndex string, now time.Time) (CodexQuota, error) {
+func (c *Client) fetchGeminiQuota(ctx context.Context, authIndex string, now time.Time) (CodexQuota, map[string]bool, error) {
 	body, err := c.antigravityCall(ctx, authIndex, antigravityModelsURL, `{}`)
 	if err != nil {
-		return CodexQuota{}, err
+		return CodexQuota{}, nil, err
 	}
 	q, err := parseGeminiQuota(body)
 	if err != nil {
-		return CodexQuota{}, err
+		return CodexQuota{}, nil, err
 	}
 	q.ObservedAtUnix = now.Unix()
-	return q, nil
+	return q, parseAvailableModels(body), nil
+}
+
+// AvailableModels returns the model IDs Google offers to at least one of the
+// channel's enabled accounts.
+//
+// The sidecar's catalogue is static per channel, not per account: it lists
+// Gemini 4 Argon for every Antigravity sign-in, while Google serves Argon in
+// Antigravity only to AI Ultra and Enterprise subscriptions and answers 404
+// "Requested entity was not found" for anyone else — after which the sidecar
+// cools the account down and every retry is a 503 auth_unavailable. The list
+// comes from the fetchAvailableModels response already read for quota, so it
+// costs no extra upstream call.
+//
+// known is false when no account has reported a list (a channel without
+// upstream quota, an unreachable sidecar, every fetch failing); callers must
+// not filter then, since an unknown list is not an empty one.
+func (c *Client) AvailableModels(ctx context.Context, ch Channel) (models map[string]bool, known bool) {
+	if c == nil || !ch.quotaFromAPI {
+		return nil, false
+	}
+	accounts, err := c.Accounts(ctx, ch)
+	if err != nil {
+		return nil, false
+	}
+	models = map[string]bool{}
+	c.quotaMu.Lock()
+	defer c.quotaMu.Unlock()
+	for _, acc := range accounts {
+		if acc.Disabled || acc.AuthIndex == "" {
+			continue
+		}
+		cached, ok := c.quotaCache[acc.AuthIndex]
+		if !ok || cached.models == nil {
+			continue
+		}
+		known = true
+		for id := range cached.models {
+			models[id] = true
+		}
+	}
+	return models, known
 }
 
 func (c *Client) fetchGeminiTier(ctx context.Context, authIndex string) (string, error) {
@@ -175,6 +220,22 @@ func parseGeminiQuota(body []byte) (CodexQuota, error) {
 		FiveHourPct:    math.Round((1-minRemaining)*1000) / 10,
 		FiveHourResets: resetAt,
 	}, nil
+}
+
+// parseAvailableModels returns the model IDs a fetchAvailableModels response
+// lists, or nil when it lists none.
+func parseAvailableModels(body []byte) map[string]bool {
+	var resp struct {
+		Models map[string]json.RawMessage `json:"models"`
+	}
+	if json.Unmarshal(body, &resp) != nil || len(resp.Models) == 0 {
+		return nil
+	}
+	ids := make(map[string]bool, len(resp.Models))
+	for id := range resp.Models {
+		ids[id] = true
+	}
+	return ids
 }
 
 // parseGeminiTier names the account's Google tier from loadCodeAssist:
