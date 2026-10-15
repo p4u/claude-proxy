@@ -546,6 +546,44 @@ the attested worker, but claude-proxy itself reads them to route.
   Watchtower only updates `claude-proxy`. `data/privatemode/` holds the
   sidecar's manifest transparency log.
 
+### OpenAI-compatible API (`proxy/openaiapi.go`, base `/openai/v1`)
+
+Non-Claude-Code agents (Pi, opencode, any OpenAI SDK) connect to
+`https://<host>/openai/v1` with a **user token** as the API key:
+`GET /openai/v1/models` and `POST /openai/v1/chat/completions`. It is its own
+prefix because Claude Code owns `/v1/models` with an Anthropic-shaped, alias-laden
+list; `AuthMiddleware` treats it like `/v1/*` (user tokens accepted, never handed
+to the UI's cookie auth).
+
+- **Pass-through, not translation.** Only providers whose upstream natively
+  speaks Chat Completions are offered (`provider.OpenAIChat`): Privatemode (the
+  sidecar encrypts `/v1/chat/completions` like `/v1/messages`, and gets the same
+  per-user `cache_salt`), Codex and Gemini (CLIProxyAPI's `/v1/chat/completions`,
+  verified on production 2026-10-15 with an unknown-model probe), and custom
+  OpenAI hosts (`base_url` already ends in its version, so `/chat/completions` is
+  appended). Anthropic, GLM and MiMo would need a reverse translator and are
+  not listed; they stay on the Anthropic surface.
+- **Model IDs are `<provider>/<native id>`** (`privatemode/glm-5.3`,
+  `codex/gpt-5.5`, `custom_openai/<declared>`); the claude-* aliases also route.
+  The list is derived from the shared catalogue (`GetCatalogue`), minus
+  `[1m]`/`-gw` picker rows, with `context_length` where known.
+- **Same request path otherwise:** `enforceUserLimit`, sticky binding
+  (`router.Derive` hashes the first user message), `forward()` — so 401/429
+  credential handling and status healing are identical — and `request_log`
+  under path `/openai/v1/chat/completions`. `forward()` maps the path to the
+  upstream's and parses OpenAI usage (`newOpenAIUsageCapture`): `prompt_tokens`
+  minus `cached_tokens` → `input_tokens`, the cached part → `cache_read`.
+- **Streamed usage is requested** (`withStreamUsage`): a streaming request
+  without `stream_options.include_usage` gets it set, or every stream would meter
+  zero tokens and per-user limits would treat it as free. Nothing is captured to
+  `prompt_log` on this surface.
+
+**Connect panel** (Users → *Connect*, `static/js/connect.js`): base URLs from the
+page origin, the user's token (`GET /api/users/{id}/token`, `no-store`), the
+user's model list fetched from `/openai/v1/models` with that token, and
+copy-paste settings for env vars, curl, Pi (`~/.pi/agent/models.json`,
+`api: "openai-completions"`) and Claude Code gateway mode.
+
 ### Conversation Key Derivation (4-priority, `internal/router/`)
 
 1. `X-Router-Conversation-ID` header (explicit override)

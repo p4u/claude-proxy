@@ -97,6 +97,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
+	if IsOpenAIPath(r.URL.Path) {
+		h.serveOpenAI(w, r, start, body)
+		return
+	}
 
 	// Keep the client-selected model even if alias rewriting changes the wire
 	// name or an error response has no usage/model fields to parse.
@@ -330,6 +334,8 @@ func maskBearer(v string) string {
 
 func shouldForward(p string) bool {
 	switch {
+	case IsOpenAIPath(p):
+		return true
 	case p == "/v1/messages",
 		p == "/v1/messages/count_tokens",
 		p == "/v1/models",
@@ -386,7 +392,16 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 	up := provider.Get(credProvider(cred))
 	requestURI := r.URL.RequestURI()
 	openAIStream := false
-	if up.ID == provider.CustomOpenAI {
+	inboundOpenAI := IsOpenAIPath(r.URL.Path)
+	if inboundOpenAI {
+		// Chat Completions passes through untranslated. Registry providers
+		// serve it under /v1; a custom OpenAI host's base URL already ends in
+		// its version prefix.
+		requestURI = strings.TrimPrefix(r.URL.Path, OpenAIBasePath)
+		if up.ID != provider.CustomOpenAI {
+			requestURI = "/v1" + requestURI
+		}
+	} else if up.ID == provider.CustomOpenAI {
 		switch r.URL.Path {
 		case "/v1/messages/count_tokens":
 			payload, _ := json.Marshal(map[string]any{"input_tokens": approximateAnthropicTokens(body)})
@@ -409,7 +424,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 			return forwardResult{status: http.StatusNotImplemented}
 		}
 	}
-	if up.InjectCacheSalt && r.Method == http.MethodPost && r.URL.Path == "/v1/messages" {
+	if up.InjectCacheSalt && r.Method == http.MethodPost && (r.URL.Path == "/v1/messages" || inboundOpenAI) {
 		body = withCacheSalt(r.Context(), body, cred.AccessToken)
 	}
 	upstreamURL := provider.ResolveBaseURL(up.ID, cred.BaseURL) + requestURI
@@ -429,7 +444,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 		upstreamReq.Header.Del("Authorization")
 	}
 	upstreamReq.Header.Del("X-Api-Key")
-	if up.ID == provider.CustomOpenAI {
+	if up.ID == provider.CustomOpenAI || inboundOpenAI {
 		upstreamReq.Header.Del("Anthropic-Version")
 		upstreamReq.Header.Del("Anthropic-Beta")
 		// Translation needs a plain response body. With this header absent Go's
@@ -453,7 +468,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 		h.log.Error("upstream transport error", "cred", cred.ID, "err", err)
 		return forwardResult{status: -1}
 	}
-	if up.ID == provider.CustomOpenAI {
+	if up.ID == provider.CustomOpenAI && !inboundOpenAI {
 		if resp.StatusCode >= 400 {
 			raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 			_ = resp.Body.Close()
@@ -598,7 +613,11 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 	// responses; other statuses carry no billable usage worth parsing.
 	var cap *usageCapture
 	if resp.StatusCode == http.StatusOK {
-		cap = newUsageCapture(resp.Header.Get("Content-Type"), resp.Header.Get("Content-Encoding"), captureText, captureSummary)
+		if inboundOpenAI {
+			cap = newOpenAIUsageCapture(resp.Header.Get("Content-Type"), resp.Header.Get("Content-Encoding"))
+		} else {
+			cap = newUsageCapture(resp.Header.Get("Content-Type"), resp.Header.Get("Content-Encoding"), captureText, captureSummary)
+		}
 	}
 
 	result.status = resp.StatusCode

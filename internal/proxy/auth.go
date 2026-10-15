@@ -14,10 +14,11 @@ import (
 //
 // Priority order:
 //  1. /health — always public.
-//  2. When uiEnabled, any path that is not /v1/* and not /admin/* is passed
-//     through untouched — the web UI (mounted at "/") does its own cookie auth.
+//  2. When uiEnabled, any path that is not /v1/*, /openai/v1/* or /admin/* is
+//     passed through untouched — the web UI (mounted at "/") does its own
+//     cookie auth.
 //  3. adminToken match — admin identity, all routes allowed.
-//  4. user token DB match — user identity, /v1/* and /health only;
+//  4. user token DB match — user identity, /v1/*, /openai/v1/* and /health only;
 //     /admin/* requests are rejected with 403.
 //  5. A bearer/x-api-key credential that was presented but failed steps 3–4
 //     is always rejected with 401, even when adminToken is empty.
@@ -31,7 +32,7 @@ func AuthMiddleware(adminToken string, db *store.DB, uiEnabled bool, next http.H
 			return
 		}
 
-		isProxy := strings.HasPrefix(r.URL.Path, "/v1/")
+		isProxy := strings.HasPrefix(r.URL.Path, "/v1/") || IsOpenAIPath(r.URL.Path)
 		isAdmin := strings.HasPrefix(r.URL.Path, "/admin/")
 
 		// When the UI is enabled, everything outside the proxy (/v1/*) and admin

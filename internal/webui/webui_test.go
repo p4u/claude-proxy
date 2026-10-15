@@ -1173,3 +1173,28 @@ func TestUsageCurrentMeteredTokens(t *testing.T) {
 		t.Fatalf("expected both credentials in the response, got %d rows", len(rows))
 	}
 }
+
+// The Connect panel reads a user's token back; only a UI session may, and the
+// response must not be cached by the browser.
+func TestUserTokenEndpoint(t *testing.T) {
+	db, h := newTestServer(t)
+	ut, err := usertoken.Create(context.Background(), db, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := do(t, h, http.MethodGet, "/api/users/"+ut.ID+"/token", "", nil); w.Code != http.StatusUnauthorized {
+		t.Fatalf("token without a UI session = %d, want 401", w.Code)
+	}
+	cookie := loginCookie(t, h)
+	w := do(t, h, http.MethodGet, "/api/users/"+ut.ID+"/token", "", cookie)
+	var got struct{ ID, Name, Token string }
+	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &got) != nil || got.Token != ut.Token || got.Name != "alice" {
+		t.Fatalf("token = %d %s", w.Code, w.Body.String())
+	}
+	if cc := w.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", cc)
+	}
+	if w := do(t, h, http.MethodGet, "/api/users/nope/token", "", cookie); w.Code != http.StatusNotFound {
+		t.Fatalf("unknown user = %d, want 404", w.Code)
+	}
+}

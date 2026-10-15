@@ -68,6 +68,19 @@ func (s *Server) userAction(w http.ResponseWriter, r *http.Request, id, action s
 		}
 		writeJSON(w, map[string]any{"ok": true, "id": id, "token": token})
 		return
+	case action == "token" && r.Method == http.MethodGet:
+		// The Connect panel needs the token to build copy-paste client
+		// settings. The UI session is the operator's, who can print any token
+		// with `claude-proxy users token` anyway; Cache-Control keeps it out of
+		// the browser cache.
+		ut, gerr := usertoken.Get(ctx, s.db, id)
+		if gerr != nil {
+			s.userErr(w, gerr)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, map[string]any{"id": ut.ID, "name": ut.Name, "token": ut.Token})
+		return
 	case action == "prompts" && r.Method == http.MethodGet:
 		s.listUserPrompts(w, r, id)
 		return

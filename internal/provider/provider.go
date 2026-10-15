@@ -216,6 +216,13 @@ type Provider struct {
 	// salts each request randomly, which disables prompt caching altogether.
 	InjectCacheSalt bool
 
+	// OpenAIChat is true when the upstream serves OpenAI Chat Completions
+	// natively, so the OpenAI-compatible API (proxy.OpenAIBasePath) can pass
+	// requests through untranslated: the Privatemode sidecar (encrypted like
+	// /v1/messages), CLIProxyAPI for the Codex and Gemini subscriptions, and
+	// custom OpenAI hosts.
+	OpenAIChat bool
+
 	// AttestingGateway marks a local gateway that answers 401 for its own
 	// failures — attestation or key exchange — as well as for a rejected key.
 	// Only a 401 that names the key (see GatewayAuthFailure) revokes it.
@@ -276,6 +283,7 @@ var registry = []Provider{
 		// OpenAI-compatible hosts happen to publish the same native model ID.
 		AdvertisePrefix: "claude-openai-",
 		HasModelsAPI:    false, // discovered and stored per credential
+		OpenAIChat:      true,
 	},
 	{
 		ID:              MiMo,
@@ -316,6 +324,7 @@ var registry = []Provider{
 		AdvertisePrefix: "claude-",
 		HasModelsAPI:    true,
 		CatalogOwner:    "openai",
+		OpenAIChat:      true,
 	},
 	{
 		ID:              Gemini,
@@ -330,6 +339,7 @@ var registry = []Provider{
 		HasModelsAPI:    true,
 		CatalogOwner:    "antigravity",
 		CatalogExclude:  []string{"-image"},
+		OpenAIChat:      true,
 		// Every Gemini chat model behind Antigravity reports maxTokens
 		// 1048576 in fetchAvailableModels.
 		DefaultMaxInputTokens: 1_048_576,
@@ -362,6 +372,7 @@ var registry = []Provider{
 		VerifyModel:      "glm-flash-latest",
 		NoPromptCapture:  true,
 		InjectCacheSalt:  true,
+		OpenAIChat:       true,
 		AttestingGateway: true,
 	},
 }

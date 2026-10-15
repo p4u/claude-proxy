@@ -479,6 +479,24 @@ Models appear in `/model` as `claude-pm-glm-5.3`, `claude-pm-glm-5.3[1m]`,
 this proxy, whatever the prompt-retention or full-capture settings; token counts
 are still recorded for the stats. Each user gets their own prompt cache.
 
+## OpenAI-compatible API
+
+Agents that speak OpenAI Chat Completions (Pi, opencode, the OpenAI SDKs)
+connect to `https://<your-host>/openai/v1`, using a **user token** as the API
+key. It serves the providers whose upstream speaks Chat Completions natively —
+Privatemode, Codex and Gemini subscriptions, custom OpenAI hosts — with models
+named `<provider>/<model>`:
+
+```bash
+curl https://<your-host>/openai/v1/models -H "Authorization: Bearer $USER_TOKEN"
+export OPENAI_BASE_URL=https://<your-host>/openai/v1 OPENAI_API_KEY=$USER_TOKEN
+```
+
+Requests count against the user's limit and show in their stats like Claude
+Code traffic. In the web UI, **Users → Connect** shows the base URLs, the token,
+the user's model list and ready-to-paste settings for env vars, curl, Pi and
+Claude Code.
+
 ## GLM (Z.AI) and MiMo support
 
 The proxy can serve [Z.AI GLM coding plans](https://docs.z.ai/devpack/tool/claude)

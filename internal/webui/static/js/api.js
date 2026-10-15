@@ -2,6 +2,8 @@
 // The app is served at the root "/", so the API lives at "/api".
 
 export const API_BASE = "/api";
+// The OpenAI-compatible API (proxy.OpenAIBasePath), same origin as the UI.
+export const OPENAI_BASE = "/openai/v1";
 
 // Build the time-window query fragment. Accepts either a bare period string
 // (e.g. "24h") or a selection object {mode,period,from,to}. A valid custom
@@ -154,6 +156,18 @@ export const api = {
   // Output tokens this user produced over an arbitrary rolling window,
   // whether or not a limit is configured. Lets the limit editor show real
   // usage for the window being capped instead of asking for a blind guess.
+  // A user's bearer token, for the Connect panel's copy-paste settings.
+  userToken: (id) => request("GET", `/users/${enc(id)}/token`),
+
+  // Models the user can reach on the OpenAI-compatible API, fetched from the
+  // proxy surface itself with the user's own token: the list is what that
+  // client will actually see, and fetching it proves the token works.
+  openAIModels: async (token) => {
+    const r = await fetch(`${OPENAI_BASE}/models`, { headers: { Authorization: `Bearer ${token}` } });
+    if (!r.ok) throw new ApiError(`OpenAI API answered HTTP ${r.status}`, r.status);
+    return (await r.json()).data || [];
+  },
+
   userWindowUsage: (id, windowSeconds) =>
     request("GET", `/users/${enc(id)}/usage?window_seconds=${Math.trunc(Number(windowSeconds) || 0)}`),
 

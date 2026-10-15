@@ -277,6 +277,8 @@ func runServe(args []string) {
 	claudioH.SetSessions(proxyH.Sessions)
 	claudioH.SetPool(p)
 	mux.Handle("/v1/", proxyH)
+	// OpenAI-compatible API (Chat Completions) for non-Claude-Code agents.
+	mux.Handle(proxy.OpenAIBasePath+"/", proxyH)
 	mux.Handle("/admin/", adminH)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -287,7 +289,7 @@ func runServe(args []string) {
 	if uiEnabled {
 		secureCookies := isTruthy(os.Getenv("CLAUDE_PROXY_UI_SECURE_COOKIES"))
 		uiH := webui.NewWithCodex(db, r, *uiPassword, secureCookies, codexClient)
-		// The UI owns the root: reserved prefixes (/v1/, /admin/, /health) are
+		// The UI owns the root: reserved prefixes (/v1/, /openai/v1/, /admin/, /health) are
 		// registered above and win by ServeMux's longest-match rule; everything
 		// else (static assets, SPA deep links, /api/*, legacy /ui redirect)
 		// falls through to the web UI handler.

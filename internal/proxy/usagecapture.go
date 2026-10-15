@@ -224,6 +224,10 @@ type usageCapture struct {
 	// only a proof of a complete, narrowly validated compaction response.
 	captureSummary bool
 
+	// openAI parses an OpenAI Chat Completions response (OpenAIBasePath)
+	// instead of an Anthropic Messages one.
+	openAI bool
+
 	result capturedResponse
 }
 
@@ -240,7 +244,16 @@ func isGzip(contentEncoding string) bool {
 // spins up a background parser reading through an io.Pipe (so gzip can stream);
 // for non-stream JSON it buffers up to 1 MiB and parses on Close.
 func newUsageCapture(contentType, contentEncoding string, captureText, captureSummary bool) *usageCapture {
-	c := &usageCapture{gzip: isGzip(contentEncoding), captureText: captureText, captureSummary: captureSummary}
+	return startCapture(&usageCapture{gzip: isGzip(contentEncoding), captureText: captureText, captureSummary: captureSummary}, contentType)
+}
+
+// newOpenAIUsageCapture is newUsageCapture for an OpenAI Chat Completions
+// response. Neither text nor summary capture applies to it.
+func newOpenAIUsageCapture(contentType, contentEncoding string) *usageCapture {
+	return startCapture(&usageCapture{gzip: isGzip(contentEncoding), openAI: true}, contentType)
+}
+
+func startCapture(c *usageCapture, contentType string) *usageCapture {
 	if isEventStream(contentType) {
 		c.stream = true
 		pr, pw := io.Pipe()
@@ -264,6 +277,10 @@ func (c *usageCapture) runSSE(pr *io.PipeReader) {
 		}
 		defer zr.Close()
 		r = zr
+	}
+	if c.openAI {
+		c.result = parseOpenAISSEUsage(r)
+		return
 	}
 	c.result = parseSSEUsage(r, c.captureText, c.captureSummary)
 }
@@ -348,10 +365,108 @@ func (c *usageCapture) Close() tokenUsage {
 			raw = raw[:usageJSONCap]
 		}
 	}
-	c.result = parseJSONUsage(raw, c.captureText, c.captureSummary)
+	if c.openAI {
+		c.result = parseOpenAIJSONUsage(raw)
+	} else {
+		c.result = parseJSONUsage(raw, c.captureText, c.captureSummary)
+	}
 	c.result.complete = c.result.complete && !c.truncated
 	if !c.result.complete {
 		c.result.summary = pool.SummaryProof{}
 	}
 	return c.result.usage
+}
+
+// openAIUsageBlock is an OpenAI Chat Completions usage object.
+type openAIUsageBlock struct {
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
+	PromptDetails    *struct {
+		CachedTokens int64 `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+}
+
+// tokenUsage maps OpenAI usage onto request_log's Anthropic columns. OpenAI's
+// prompt_tokens includes the cached prefix while Anthropic's input_tokens does
+// not, so the cached part moves to cache_read and input keeps the rest; the
+// stats then price both the same way for every provider.
+func (u openAIUsageBlock) tokenUsage(model string) tokenUsage {
+	var cached int64
+	if u.PromptDetails != nil {
+		cached = min(max(u.PromptDetails.CachedTokens, 0), u.PromptTokens)
+	}
+	return tokenUsage{
+		Model:           model,
+		InputTokens:     u.PromptTokens - cached,
+		OutputTokens:    u.CompletionTokens,
+		CacheReadTokens: cached,
+	}
+}
+
+// parseOpenAIJSONUsage reads model and usage from a Chat Completions response.
+func parseOpenAIJSONUsage(b []byte) capturedResponse {
+	b = bytes.TrimSpace(b)
+	if len(b) == 0 || b[0] != '{' {
+		return capturedResponse{}
+	}
+	var body struct {
+		Model string            `json:"model"`
+		Usage *openAIUsageBlock `json:"usage"`
+		Error *json.RawMessage  `json:"error"`
+	}
+	if err := json.Unmarshal(b, &body); err != nil {
+		return capturedResponse{}
+	}
+	result := capturedResponse{usage: tokenUsage{Model: body.Model}, complete: body.Error == nil}
+	if body.Usage != nil {
+		result.usage = body.Usage.tokenUsage(body.Model)
+	}
+	if !result.complete {
+		result.errorType = "unknown"
+	}
+	return result
+}
+
+// parseOpenAISSEUsage reads model and usage from a Chat Completions stream:
+// usage arrives in the final chunk when stream_options.include_usage is set
+// (withStreamUsage), and the stream is complete at "data: [DONE]".
+func parseOpenAISSEUsage(r io.Reader) capturedResponse {
+	var result capturedResponse
+	var failed bool
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(line[len("data:"):])
+		if bytes.Equal(payload, []byte("[DONE]")) {
+			result.complete = true
+			continue
+		}
+		if len(payload) == 0 || payload[0] != '{' {
+			continue
+		}
+		var chunk struct {
+			Model string            `json:"model"`
+			Usage *openAIUsageBlock `json:"usage"`
+			Error *json.RawMessage  `json:"error"`
+		}
+		if json.Unmarshal(payload, &chunk) != nil {
+			failed = true
+			continue
+		}
+		if chunk.Error != nil {
+			failed, result.errorType = true, "unknown"
+		}
+		if chunk.Model != "" {
+			result.usage.Model = chunk.Model
+		}
+		if chunk.Usage != nil {
+			result.usage = chunk.Usage.tokenUsage(result.usage.Model)
+		}
+	}
+	result.complete = result.complete && !failed && sc.Err() == nil
+	return result
 }

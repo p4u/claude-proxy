@@ -4,6 +4,7 @@ import {
 } from "../ui.js";
 import { periodControl, sectionHead, segmented, meter } from "../components.js";
 import { getWindow, setWindowPeriod, setWindowCustom, windowLabel } from "../store.js";
+import { connectModal } from "../connect.js";
 import { compactNum, fullNum, ms, relTime, localTime, pct } from "../format.js";
 
 // Module-level render token: guards async fetches against stale responses when
@@ -489,13 +490,14 @@ function userRow(u, s, root) {
   const disabled = (u.status || "").toLowerCase() === "disabled";
   const errTone = (s.errors || 0) > 0 ? "cell-warn" : "";
   const actions = el("div", { class: "row-actions" }, [
+    button("Connect", { onClick: () => connectModal(u), title: "Base URLs, token and client settings for this user" }),
     button("Prompts", { onClick: () => promptsModal(u) }),
     button("Limit", { onClick: () => limitModal(u, root), title: LIMIT_HELP }),
     button("Rotate", {
       onClick: async () => {
         const ok = await confirmDialog({
           title: "Rotate token?",
-          message: `The current token for "${u.name}" stops working immediately. A new one is shown once.`,
+          message: `The current token for "${u.name}" stops working immediately, in every client using it.`,
           confirmLabel: "Rotate", danger: false,
         });
         if (!ok) return;
@@ -565,7 +567,7 @@ function createModal(root) {
   const name = el("input", { class: "input", type: "text", placeholder: "e.g. alice", autocomplete: "off" });
   const m = modal({
     title: "Create user",
-    subtitle: "Mints a named bearer token, shown once.",
+    subtitle: "Mints a named bearer token. Connect shows it again with ready-made client settings.",
     body: el("div", { class: "form-row" }, [el("label", { class: "field-label", text: "Name" }), name]),
     actions: [
       button("Cancel", { onClick: () => m.close() }),
@@ -1082,7 +1084,7 @@ function tokenReveal(name, token, verb) {
   });
   const m = modal({
     title: `Token ${verb}`,
-    subtitle: `Copy this now — it won't be shown again. Use it as the Bearer token for ${name}.`,
+    subtitle: `Use it as the Bearer token for ${name}. Connect, on the user's row, shows it again with base URLs and client settings.`,
     body: el("div", { class: "token-box" }, [field, copyBtn]),
     actions: [button("Done", { kind: "ghost", onClick: () => m.close() })],
   });

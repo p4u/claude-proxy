@@ -780,6 +780,15 @@ function json(body, status = 200) {
 const realFetch = window.fetch.bind(window);
 window.fetch = async (input, init = {}) => {
   const url = typeof input === "string" ? input : input.url;
+  // The Connect panel asks the OpenAI-compatible API itself for the model list.
+  if (new URL(url, location.origin).pathname === "/openai/v1/models") {
+    return json({ object: "list", data: [
+      { id: "codex/gpt-5.5", object: "model", owned_by: "codex", context_length: 400000 },
+      { id: "gemini/gemini-3.8-flash-high", object: "model", owned_by: "gemini", context_length: 1048576 },
+      { id: "privatemode/glm-5.3", object: "model", owned_by: "privatemode", context_length: 1048576 },
+      { id: "privatemode/gpt-oss-120b", object: "model", owned_by: "privatemode", context_length: 131072 },
+    ] });
+  }
   if (!url.includes(API_BASE)) return realFetch(input, init);
   const u = new URL(url, location.origin);
   const path = u.pathname.replace(API_BASE, "");
@@ -996,6 +1005,11 @@ window.fetch = async (input, init = {}) => {
   }
 
   // Dynamic route: per-user prompts, paginated over ALL stored rows.
+  const tm = path.match(/^\/users\/([^/]+)\/token$/);
+  if (tm) {
+    const u = userById(decodeURIComponent(tm[1]));
+    return u ? json({ id: u.id, name: u.name, token: "cpu_mock_" + u.id }) : json({ error: "unknown user" }, 404);
+  }
   const pm = path.match(/^\/users\/([^/]+)\/prompts$/);
   if (pm) {
     const usr = userById(decodeURIComponent(pm[1]));

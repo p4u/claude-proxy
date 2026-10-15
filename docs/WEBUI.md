@@ -321,7 +321,12 @@ meter.
 
 ### Proxy user management (wraps `internal/usertoken`)
 - `GET /api/users` → list incl. status, created_at, last_used_at.
-- `POST /api/users` `{name}` → `{id,name,token}` (token shown once).
+- `POST /api/users` `{name}` → `{id,name,token}`.
+- `GET /api/users/{id}/token` → `{id,name,token}`, `Cache-Control: no-store`.
+  Backs the Users page *Connect* panel, which builds copy-paste client settings
+  (OpenAI base URL `/openai/v1`, Anthropic base URL, env/curl/Pi/Claude Code
+  snippets) and lists the user's models by calling `GET /openai/v1/models` with
+  that token. `404` for an unknown user.
 - `POST /api/users/{id}/disable` | `/enable`
 - `POST /api/users/{id}/rotate` → `{token}`
 - `DELETE /api/users/{id}`
