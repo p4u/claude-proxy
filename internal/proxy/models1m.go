@@ -3,6 +3,8 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"maps"
 	"net/http"
@@ -526,15 +528,45 @@ type modelsCache struct {
 	ct          string
 	exp         time.Time
 	refreshedAt time.Time // when the current body was fetched from upstream
+	// fingerprint is the catalogueFingerprint the body was built from. A
+	// different one means a credential was added, removed or changed
+	// usability since, so the body may advertise models nothing can serve —
+	// or miss a provider that just became available — and is stale whatever
+	// its age.
+	fingerprint string
 }
 
-func (c *modelsCache) get(now time.Time) ([]byte, string, bool) {
+func (c *modelsCache) get(now time.Time, fingerprint string) ([]byte, string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.body == nil || now.After(c.exp) {
+	if c.body == nil || now.After(c.exp) || c.fingerprint != fingerprint {
 		return nil, "", false
 	}
 	return c.body, c.ct, true
+}
+
+// catalogueFingerprint summarises everything about the credential list that
+// shapes GET /v1/models: which credentials can serve (active or limited, the
+// pickFrom rule — so a 429 flipping active↔limited does not invalidate), their
+// provider and endpoint, and a custom host's declared models. It is computed
+// from the list on every read, so a change made by any process sharing the
+// database — the web UI, the CLI, the TUI — is seen on the next request
+// instead of after the cache TTL.
+func catalogueFingerprint(list []*creds.Credential) string {
+	rows := make([]string, 0, len(list))
+	for _, c := range list {
+		if c.Status != creds.StatusActive && c.Status != creds.StatusLimited {
+			continue
+		}
+		models := make([]string, 0, len(c.Models))
+		for _, m := range c.Models {
+			models = append(models, m.ID)
+		}
+		rows = append(rows, string(credProvider(c))+"|"+c.ID+"|"+c.BaseURL+"|"+strings.Join(models, ","))
+	}
+	slices.Sort(rows)
+	sum := sha256.Sum256([]byte(strings.Join(rows, "\n")))
+	return hex.EncodeToString(sum[:8])
 }
 
 func (c *modelsCache) getStale() ([]byte, string, bool) {
@@ -543,10 +575,10 @@ func (c *modelsCache) getStale() ([]byte, string, bool) {
 	return c.body, c.ct, c.body != nil
 }
 
-func (c *modelsCache) set(body []byte, ct string, now time.Time) {
+func (c *modelsCache) set(body []byte, ct string, now time.Time, fingerprint string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.body, c.ct, c.exp, c.refreshedAt = body, ct, now.Add(modelsCacheTTL), now
+	c.body, c.ct, c.exp, c.refreshedAt, c.fingerprint = body, ct, now.Add(modelsCacheTTL), now, fingerprint
 }
 
 // GetCatalogue implements claudioapi.CatalogueSource. It parses the cached
@@ -576,8 +608,10 @@ func (h *Handler) GetCatalogue() (entries []map[string]any, refreshedAt time.Tim
 // can therefore serve /v1/claudio/models and /v1/claudio/config on a cold
 // start without waiting for any /v1/models client traffic.
 func (h *Handler) refreshCatalogueOnce(ctx context.Context) {
-	if _, _, ok := h.modelsCache.get(time.Now()); ok {
-		return // already fresh — nothing to do
+	if list, err := creds.List(ctx, h.db); err == nil {
+		if _, _, ok := h.modelsCache.get(time.Now(), catalogueFingerprint(list)); ok {
+			return // already fresh — nothing to do
+		}
 	}
 	// Build a minimal synthetic GET /v1/models request. forward() needs the
 	// request to construct the upstream URL; the URL host is overwritten by
@@ -645,12 +679,6 @@ func (b *bufferedRW) Flush()                      {}
 // discovery, since a partial picker beats no picker at all.
 func (h *Handler) serveModels(w http.ResponseWriter, r *http.Request, start time.Time) {
 	now := time.Now()
-	if body, ct, ok := h.modelsCache.get(now); ok {
-		h.log.Debug("models served from cache", "bytes", len(body))
-		writeModels(w, body, ct)
-		return
-	}
-
 	list, err := creds.List(r.Context(), h.db)
 	if err != nil {
 		h.log.Error("models: list credentials", "err", err)
@@ -659,6 +687,12 @@ func (h *Handler) serveModels(w http.ResponseWriter, r *http.Request, start time
 			return
 		}
 		h.failBind(w, err, provider.Default)
+		return
+	}
+	fingerprint := catalogueFingerprint(list)
+	if body, ct, ok := h.modelsCache.get(now, fingerprint); ok {
+		h.log.Debug("models served from cache", "bytes", len(body))
+		writeModels(w, body, ct)
 		return
 	}
 
@@ -791,7 +825,7 @@ func (h *Handler) serveModels(w http.ResponseWriter, r *http.Request, start time
 		"providers", answered, "models", len(merged),
 		"latency_ms", time.Since(start).Milliseconds())
 
-	h.modelsCache.set(body, "application/json", now)
+	h.modelsCache.set(body, "application/json", now, fingerprint)
 	writeModels(w, body, "application/json")
 }
 

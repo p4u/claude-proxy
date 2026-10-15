@@ -523,7 +523,8 @@ the attested worker, but claude-proxy itself reads them to route.
 - **Alias-only routing** (`AliasOnly`): models are advertised and routed as
   `claude-pm-<id>`, any `<id>`. Native `glm-*`/`gpt-oss-*` names stay Z.AI's and
   Codex's. The catalogue is the sidecar's `/v1/models`, kept to entries tagged
-  `generate` (`CatalogTask`) minus OCR; windows come from `ContextWindows`
+  `generate` (`CatalogTask`) minus OCR, the `openai/`-namespaced duplicates and
+  the deprecated `glm-5.2` (all still route); windows come from `ContextWindows`
   (GLM 1M, gpt-oss 128K — the API publishes none), so GLM gets `[1m]` rows.
 - **Never captured** (`NoPromptCapture`): Privatemode requests skip
   `prompt_log` and full-conversation capture regardless of retention or the
@@ -583,6 +584,15 @@ page origin, the user's token (`GET /api/users/{id}/token`, `no-store`), the
 user's model list fetched from `/openai/v1/models` with that token, and
 copy-paste settings for env vars, curl, Pi (`~/.pi/agent/models.json`,
 `api: "openai-completions"`) and Claude Code gateway mode.
+
+**The model catalogue cache follows the credentials** (`catalogueFingerprint`
+in `models1m.go`). Beside its 5-minute TTL, the cached `/v1/models` body is
+tied to a hash of the usable credentials (active or limited — the `pickFrom`
+rule, so a 429 does not refetch), their provider, endpoint and declared custom
+models. It is recomputed from the credential list on every read, so a key added
+or a credential disabled from the web UI, CLI or TUI — any process on the same
+database — shows on the next `/v1/models` (and `/openai/v1/models`) request.
+Before this, a key added seconds after a refresh stayed invisible for 5 minutes.
 
 ### Conversation Key Derivation (4-priority, `internal/router/`)
 

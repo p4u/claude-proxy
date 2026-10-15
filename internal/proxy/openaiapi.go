@@ -98,11 +98,10 @@ func (h *Handler) serveOpenAI(w http.ResponseWriter, r *http.Request, start time
 // context accounting and model picker, and an OpenAI client sends the window it
 // wants itself.
 func (h *Handler) serveOpenAIModels(w http.ResponseWriter, r *http.Request) {
-	entries, _, ok := h.GetCatalogue()
-	if !ok {
-		h.refreshCatalogueOnce(r.Context())
-		entries, _, _ = h.GetCatalogue()
-	}
+	// A no-op while the cached catalogue matches the credentials; rebuilds
+	// it as soon as one was added, removed or changed usability.
+	h.refreshCatalogueOnce(r.Context())
+	entries, _, _ := h.GetCatalogue()
 	list, _ := creds.List(r.Context(), h.db)
 	seen := map[string]bool{}
 	out := []map[string]any{}

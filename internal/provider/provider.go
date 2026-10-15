@@ -363,8 +363,12 @@ var registry = []Provider{
 		HasModelsAPI:    true,
 		CatalogTask:     "generate",
 		// deepseek-ocr-2 is tagged generate but only serves chat completions
-		// with an OCR prompt format, never /v1/messages.
-		CatalogExclude: []string{"-ocr"},
+		// with an OCR prompt format, never /v1/messages. The live list also
+		// repeats models under an "openai/" namespace (openai/gpt-oss-120b =
+		// gpt-oss-120b) and keeps glm-5.2, deprecated and served by GLM-5.3:
+		// duplicates in the picker, and the namespaced copy matches no
+		// ContextWindows prefix. Both still route if a client names them.
+		CatalogExclude: []string{"-ocr", "openai/", "glm-5.2"},
 		ContextWindows: []ContextWindow{
 			{Prefix: "glm-", Tokens: 1_048_576},
 			{Prefix: "gpt-oss-", Tokens: 131_072},

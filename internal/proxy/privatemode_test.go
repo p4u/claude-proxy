@@ -48,23 +48,35 @@ func postAsUser(t *testing.T, h *Handler, user, body string) *httptest.ResponseR
 	return w
 }
 
-// The live /v1/models lists embedding, speech and OCR models next to the chat
-// ones; only chat models are advertised, under the claude-pm- alias, with the
-// window each family really has.
-func TestPrivatemodeCatalogue(t *testing.T) {
-	h, _, _ := privatemodeSetup(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/models" || r.Header.Get("Authorization") != "Bearer pm-key" {
-			http.Error(w, "unexpected", http.StatusBadRequest)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"object":"list","data":[
-		 {"id":"glm-5.3","object":"model","tasks":["generate","tool_calling"]},
-		 {"id":"gpt-oss-120b","object":"model","tasks":["generate","tool_calling"]},
-		 {"id":"deepseek-ocr-2","object":"model","tasks":["generate","vision"]},
-		 {"id":"qwen3-embedding-4b","object":"model","tasks":["embed"]},
-		 {"id":"whisper-large-v3","object":"model","tasks":["transcribe"]}]}`)
-	})
+// livePrivatemodeModels is the production /v1/models answer through the
+// sidecar on 2026-10-15: chat models next to embedding, speech and OCR ones,
+// a deprecated glm-5.2 and an openai/-namespaced copy of gpt-oss-120b.
+const livePrivatemodeModels = `{"object":"list","data":[
+ {"id":"deepseek-ocr-2","object":"model","tasks":["generate","vision"]},
+ {"id":"glm-5.3","object":"model","tasks":["generate","tool_calling"]},
+ {"id":"glm-5.2","object":"model","tasks":["generate","tool_calling"]},
+ {"id":"glm-latest","object":"model","tasks":["generate","tool_calling"]},
+ {"id":"glm-5.3-flash","object":"model","tasks":["generate","tool_calling","vision"]},
+ {"id":"glm-flash-latest","object":"model","tasks":["generate","tool_calling","vision"]},
+ {"id":"openai/gpt-oss-120b","object":"model","tasks":["generate","tool_calling"]},
+ {"id":"gpt-oss-120b","object":"model","tasks":["generate","tool_calling"]},
+ {"id":"gpt-oss-latest","object":"model","tasks":["generate","tool_calling"]},
+ {"id":"openai/whisper-large-v3","object":"model","tasks":["transcribe"]},
+ {"id":"whisper-large-v3","object":"model","tasks":["transcribe"]},
+ {"id":"qwen3-embedding-4b","object":"model","tasks":["embed"]},
+ {"id":"voxtral-mini-3b","object":"model","tasks":["transcribe"]}]}`
+
+func servePrivatemodeModels(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/v1/models" || r.Header.Get("Authorization") != "Bearer pm-key" {
+		http.Error(w, "unexpected", http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, livePrivatemodeModels)
+}
+
+func advertisedModels(t *testing.T, h *Handler) map[string]int64 {
+	t.Helper()
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
 	if w.Code != http.StatusOK {
@@ -73,7 +85,6 @@ func TestPrivatemodeCatalogue(t *testing.T) {
 	var env struct {
 		Data []struct {
 			ID             string `json:"id"`
-			DisplayName    string `json:"display_name"`
 			MaxInputTokens int64  `json:"max_input_tokens"`
 		} `json:"data"`
 	}
@@ -84,11 +95,21 @@ func TestPrivatemodeCatalogue(t *testing.T) {
 	for _, m := range env.Data {
 		got[m.ID] = m.MaxInputTokens
 	}
-	want := map[string]int64{
-		"claude-pm-glm-5.3[1m]":  1_048_576,
-		"claude-pm-glm-5.3":      1_048_576,
-		"claude-pm-gpt-oss-120b": 131_072,
+	return got
+}
+
+// Only chat models are advertised, once each, under the claude-pm- alias and
+// with the window each family really has.
+func TestPrivatemodeCatalogue(t *testing.T) {
+	h, _, _ := privatemodeSetup(t, servePrivatemodeModels)
+	got := advertisedModels(t, h)
+	want := map[string]int64{}
+	for _, id := range []string{"glm-5.3", "glm-latest", "glm-5.3-flash", "glm-flash-latest"} {
+		want["claude-pm-"+id] = 1_048_576
+		want["claude-pm-"+id+"[1m]"] = 1_048_576
 	}
+	want["claude-pm-gpt-oss-120b"] = 131_072
+	want["claude-pm-gpt-oss-latest"] = 131_072
 	if len(got) != len(want) {
 		t.Fatalf("advertised %v, want %v", got, want)
 	}
@@ -96,6 +117,49 @@ func TestPrivatemodeCatalogue(t *testing.T) {
 		if got[id] != n {
 			t.Errorf("%s: max_input_tokens = %d, want %d (all: %v)", id, got[id], n, got)
 		}
+	}
+}
+
+// Adding, disabling or removing a credential shows in GET /v1/models on the
+// next request, not after the cache TTL; a 429 flipping a credential to
+// limited (still usable) does not refetch every provider.
+func TestCatalogueFollowsCredentialChanges(t *testing.T) {
+	var fetches int
+	h, db, pmID := privatemodeSetup(t, func(w http.ResponseWriter, r *http.Request) {
+		fetches++
+		servePrivatemodeModels(w, r)
+	})
+	ctx := context.Background()
+	if _, ok := advertisedModels(t, h)["claude-pm-glm-5.3"]; !ok || fetches != 1 {
+		t.Fatalf("initial catalogue: fetches=%d", fetches)
+	}
+
+	glm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"data":[{"id":"glm-4.7","type":"model"}]}`)
+	}))
+	t.Cleanup(glm.Close)
+	if _, err := creds.InsertKey(ctx, db, provider.GLM, "zai", "", "glm-key", glm.URL, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := advertisedModels(t, h)["claude-glm-4.7"]; !ok {
+		t.Fatal("a key added after the catalogue was cached is not advertised")
+	}
+
+	before := fetches
+	if err := creds.SetStatus(ctx, db, pmID, creds.StatusLimited); err != nil {
+		t.Fatal(err)
+	}
+	advertisedModels(t, h)
+	if fetches != before {
+		t.Fatalf("active→limited refetched the catalogue (%d fetches)", fetches-before)
+	}
+
+	if err := creds.SetStatus(ctx, db, pmID, creds.StatusDisabled); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := advertisedModels(t, h)["claude-pm-glm-5.3"]; ok {
+		t.Fatal("models of a disabled credential are still advertised")
 	}
 }
 
