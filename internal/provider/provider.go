@@ -14,6 +14,7 @@
 package provider
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -44,7 +45,18 @@ const (
 	// OpenAI Chat Completions API. Requests and responses are translated at the
 	// proxy boundary so downstream clients continue to speak Anthropic.
 	CustomOpenAI ID = "custom_openai"
+	// Privatemode is Edgeless Systems' confidential inference API, reached
+	// through the privatemode-proxy sidecar: the sidecar attests the remote
+	// deployment and encrypts every prompt end to end to the attested GPU
+	// worker. Credentials are Privatemode API keys, passed through per request.
+	Privatemode ID = "privatemode"
 )
+
+// ContextWindow assigns an input window to models whose ID starts with Prefix.
+type ContextWindow struct {
+	Prefix string
+	Tokens int64
+}
 
 // Endpoint is one selectable base URL for a provider.
 //
@@ -173,7 +185,46 @@ type Provider struct {
 	// has a 1,048,576-token window (fetchAvailableModels reports maxTokens
 	// 1048576); with Augment1M this is what earns them their "[1m]" rows.
 	DefaultMaxInputTokens int64
+
+	// ContextWindows assigns windows by ID prefix to catalogue entries that
+	// publish none, for upstreams whose models differ (Privatemode's GLM models
+	// take 1M, gpt-oss 128K) so one DefaultMaxInputTokens cannot describe them.
+	// The longest matching prefix wins; DefaultMaxInputTokens still applies to
+	// entries no prefix covers.
+	ContextWindows []ContextWindow
+
+	// CatalogTask keeps only catalogue entries whose "tasks" list contains it.
+	// Privatemode's /v1/models lists embedding and speech-to-text models next
+	// to the chat ones and tags each with what it can do. Entries without a
+	// tasks list are kept. Empty means no filtering.
+	CatalogTask string
+
+	// AliasOnly routes requests to this provider by its AdvertisePrefix alone,
+	// for any model ID after it, and never by a native ID: the upstream's
+	// native names belong to other providers (Privatemode serves glm-* and
+	// gpt-oss-*, which Z.AI and Codex already route). ModelPrefixes is unused.
+	AliasOnly bool
+
+	// NoPromptCapture keeps this provider's requests out of prompt_log and
+	// full-conversation capture, whatever the retention and per-user settings.
+	// A provider chosen for confidentiality must not leave its prompts in
+	// plaintext in proxy.db.
+	NoPromptCapture bool
+
+	// InjectCacheSalt adds a per-user "cache_salt" to /v1/messages bodies that
+	// carry none (see proxy.withCacheSalt). The Privatemode proxy otherwise
+	// salts each request randomly, which disables prompt caching altogether.
+	InjectCacheSalt bool
+
+	// AttestingGateway marks a local gateway that answers 401 for its own
+	// failures — attestation or key exchange — as well as for a rejected key.
+	// Only a 401 that names the key (see GatewayAuthFailure) revokes it.
+	AttestingGateway bool
 }
+
+// PrivatemodeSidecarURL is the bundled privatemode-proxy sidecar, reachable by
+// its Compose service name on the private network.
+const PrivatemodeSidecarURL = "http://privatemode-proxy:8080"
 
 var registry = []Provider{
 	{
@@ -283,6 +334,65 @@ var registry = []Provider{
 		// 1048576 in fetchAvailableModels.
 		DefaultMaxInputTokens: 1_048_576,
 	},
+	{
+		ID:   Privatemode,
+		Name: "Privatemode",
+		// The sidecar, never api.privatemode.ai: only the sidecar attests the
+		// deployment and encrypts the prompt. A credential may point at another
+		// privatemode-proxy instance, but not at the hosted "proxyless" API,
+		// which offers no client-side attestation.
+		BaseURL: PrivatemodeSidecarURL,
+		Endpoints: []Endpoint{
+			{Name: "sidecar", Desc: "Bundled privatemode-proxy sidecar", URL: PrivatemodeSidecarURL},
+		},
+		AliasOnly:       true,
+		AdvertisePrefix: "claude-pm-",
+		Refreshable:     false,
+		PollsUsage:      false,
+		Augment1M:       true,
+		HasModelsAPI:    true,
+		CatalogTask:     "generate",
+		// deepseek-ocr-2 is tagged generate but only serves chat completions
+		// with an OCR prompt format, never /v1/messages.
+		CatalogExclude: []string{"-ocr"},
+		ContextWindows: []ContextWindow{
+			{Prefix: "glm-", Tokens: 1_048_576},
+			{Prefix: "gpt-oss-", Tokens: 131_072},
+		},
+		VerifyModel:      "glm-flash-latest",
+		NoPromptCapture:  true,
+		InjectCacheSalt:  true,
+		AttestingGateway: true,
+	},
+}
+
+// GatewayAuthFailure reports whether a 401 body from an attesting gateway
+// describes the gateway's own failure rather than a rejected key, and returns
+// its message.
+//
+// The Privatemode proxy runs the attested key exchange with the first API key
+// it sees and answers 401 "trying API key: <err>" when that fails — for a
+// rejected key ("Unauthorized (status code: 401)") but equally for a failed
+// attestation, an unreachable manifest CDN or a network error. Only the first
+// says anything about the key; revoking it for the others would take a healthy
+// credential out of the pool.
+func GatewayAuthFailure(p ID, body []byte) (string, bool) {
+	if !Get(p).AttestingGateway {
+		return "", false
+	}
+	var resp struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &resp) != nil {
+		return "", false
+	}
+	msg := resp.Error.Message
+	if !strings.HasPrefix(msg, "trying API key:") || strings.Contains(msg, "status code: 401") {
+		return "", false
+	}
+	return msg, true
 }
 
 // Default is the provider assumed for credentials and requests that name none.
@@ -394,6 +504,9 @@ func ForModel(model string) ID {
 		if p.AdvertisePrefix == "" {
 			continue
 		}
+		if p.AliasOnly && len(m) > len(p.AdvertisePrefix) && strings.HasPrefix(m, p.AdvertisePrefix) {
+			return p.ID
+		}
 		for _, prefix := range p.ModelPrefixes {
 			if strings.HasPrefix(m, p.AdvertisePrefix+prefix) {
 				return p.ID
@@ -439,6 +552,9 @@ func WireModel(model string) string {
 	for _, p := range registry {
 		if p.AdvertisePrefix == "" {
 			continue
+		}
+		if p.AliasOnly && len(m) > len(p.AdvertisePrefix) && strings.HasPrefix(m, p.AdvertisePrefix) {
+			return model[len(p.AdvertisePrefix):]
 		}
 		for _, prefix := range p.ModelPrefixes {
 			if strings.HasPrefix(m, p.AdvertisePrefix+prefix) {

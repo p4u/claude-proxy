@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 It serves `/v1/*` as a transparent pass-through for Anthropic-compatible upstreams, swapping in a managed credential's `Authorization` header. Custom OpenAI-compatible hosts are translated at the boundary while clients still speak the Anthropic Messages API. This is what Claude Code clients connect to.
 
-Seven provider modes are supported (`internal/provider`): **Anthropic** OAuth subscriptions, **Z.AI GLM** coding plans, **Xiaomi MiMo** token plans, **OpenAI Codex** and **Google Gemini** subscriptions through a private CLIProxyAPI sidecar, and dynamic **custom Anthropic** or **custom OpenAI-compatible** hosts. The provider that serves a request is decided by the model the client asked for, so a user picks a GLM, GPT, Gemini, or custom-host model in Claude Code's `/model` picker and it just works. See [Providers](#providers-multi-upstream).
+Eight provider modes are supported (`internal/provider`): **Anthropic** OAuth subscriptions, **Z.AI GLM** coding plans, **Xiaomi MiMo** token plans, **OpenAI Codex** and **Google Gemini** subscriptions through a private CLIProxyAPI sidecar, **Privatemode** confidential inference through Edgeless Systems' attesting privatemode-proxy sidecar, and dynamic **custom Anthropic** or **custom OpenAI-compatible** hosts. The provider that serves a request is decided by the model the client asked for, so a user picks a GLM, GPT, Gemini, or custom-host model in Claude Code's `/model` picker and it just works. See [Providers](#providers-multi-upstream).
 
 ## Build & Test Commands
 
@@ -498,6 +498,54 @@ published on host loopback next to Codex's 1455; the forwarder hop is
 - On the free tier Google's notice says prompts and code may be used to
   improve its models and read by human reviewers.
 
+### Privatemode confidential inference (`provider.Privatemode`)
+
+[Privatemode](https://docs.privatemode.ai) (Edgeless Systems) serves
+open-weights models (GLM-5.3, GLM-5.3-Flash, gpt-oss-120b) inside attested
+confidential VMs, billed per token. Its guarantee rests on the **client-side**
+`privatemode-proxy`: it verifies the deployment by remote attestation, agrees a
+key that only attested GPU workers receive, AES-GCM-encrypts every request field
+except routing metadata (`model`, `stream`, `max_tokens`…) and decrypts the
+reply. That proxy runs as the `privatemode-proxy` Compose sidecar (pinned by
+digest, no host port, private `privatemode-internal` network); the provider's
+base URL is the sidecar, **never** `api.privatemode.ai` or the hosted
+`proxyless-api`, which has no client-side attestation. The Go code lives under
+`internal/` of another module, so it cannot be imported — a sidecar is the only
+way in. The plaintext boundary is this host: prompts are encrypted from here to
+the attested worker, but claude-proxy itself reads them to route.
+
+- **Keys are ordinary credentials.** The sidecar runs with
+  `--api-key-fallback=never` and no key of its own, so it forwards each
+  request's `Authorization: Bearer` unchanged (and offers the first key it sees
+  for the attested key exchange). Add keys like GLM's — web UI, TUI `k`,
+  `creds add-key --provider privatemode` — verified with an encrypted
+  `max_tokens:1` message through the sidecar (`glm-flash-latest`).
+- **Alias-only routing** (`AliasOnly`): models are advertised and routed as
+  `claude-pm-<id>`, any `<id>`. Native `glm-*`/`gpt-oss-*` names stay Z.AI's and
+  Codex's. The catalogue is the sidecar's `/v1/models`, kept to entries tagged
+  `generate` (`CatalogTask`) minus OCR; windows come from `ContextWindows`
+  (GLM 1M, gpt-oss 128K — the API publishes none), so GLM gets `[1m]` rows.
+- **Never captured** (`NoPromptCapture`): Privatemode requests skip
+  `prompt_log` and full-conversation capture regardless of retention or the
+  user's opt-in. `request_log` metadata and token counts are still written.
+- **Per-user prompt cache** (`InjectCacheSalt`, `proxy/privatemode.go`): the
+  sidecar salts a request without `cache_salt` randomly, which disables caching
+  (input is ~10× the cached price). The proxy adds
+  `cache_salt = HMAC-SHA256(api_key, label ‖ user_token_id)`: stable per user,
+  so a user's sessions cache, but unguessable across users, who therefore cannot
+  probe each other's cache. A client's own `cache_salt` is kept.
+- **401s are split** (`AttestingGateway`, `provider.GatewayAuthFailure`): the
+  sidecar answers 401 `trying API key: …` both when the key is rejected (the
+  message ends `Unauthorized (status code: 401)`, verified against v1.59.0 with
+  a fake key) and when attestation, the manifest CDN or the network fails. Only
+  the first revokes the key; the others return 502 and leave it active.
+- `count_tokens` is not served (plain 404), like MiMo; Claude Code estimates.
+  Privatemode has no usage API, so the card shows proxy-metered totals.
+- Upgrade the image deliberately (`PRIVATEMODE_PROXY_IMAGE`); a deployment
+  manifest newer than the sidecar fails with "unmarshaling" errors until it is.
+  Watchtower only updates `claude-proxy`. `data/privatemode/` holds the
+  sidecar's manifest transparency log.
+
 ### Conversation Key Derivation (4-priority, `internal/router/`)
 
 1. `X-Router-Conversation-ID` header (explicit override)
@@ -653,7 +701,7 @@ without storing raw upstream error text.
 ### Storage Schema (SQLite)
 
 Eight tables (`internal/store/schema.go`): `credentials` (incl. `provider`:
-`anthropic` | `glm` | `mimo` | `codex` | `custom` | `custom_openai`, added via
+`anthropic` | `glm` | `mimo` | `codex` | `gemini` | `privatemode` | `custom` | `custom_openai`, added via
 the swallow-duplicate `ALTER TABLE` mechanism — its `DEFAULT 'anthropic'` is
 what migrates existing rows, no backfill needed),
 `conversations` (whose `id` is the provider-qualified sticky key), `rr_cursor` (legacy round-robin state), `user_tokens` (named bearer tokens, plus the per-user usage cap `limit_output_tokens` / `limit_window_seconds`, `0` = unlimited, and `block_suggestions` = suppress Claude Code's prompt-suggestion requests), `request_log` (one row per forwarded request, for per-user stats), `usage_history` (utilization snapshots driving selection), `prompt_log` (last user prompt per `POST /v1/messages`, `user_token_id` FK `ON DELETE SET NULL`; never stores responses, gated + retained by `CLAUDE_PROXY_PROMPT_RETENTION_DAYS`, captured in `internal/proxy/promptcapture.go` and pruned by its hourly janitor), `conversation_message` (opt-in whole-conversation capture: `UNIQUE(conv_id, seq)` where `seq` is the message's index in the request's `messages` array, so re-sent history is idempotent; same retention window and janitor as `prompt_log`). Deleting a credential cascades to `usage_history` (`ON DELETE CASCADE`); `conversations` bindings are cleared inside `creds.Delete`'s transaction, since older DBs created that FK without a cascade clause. `request_log` additionally carries per-request token usage columns (`model`, `input_tokens`, `output_tokens`, `cache_creation_tokens`, `cache_read_tokens`), added via the existing swallow-duplicate `ALTER TABLE` migration mechanism and populated by `internal/proxy/usagecapture.go` from the tee'd response stream (SSE and non-streaming JSON) — this feeds the web UI's token stats and never affects what the client receives. Core dependency: `modernc.org/sqlite` (pure Go, no CGO required); `guptarohit/asciigraph` for usage charts and `charmbracelet/bubbletea`+`lipgloss`+`bubbles` for the management TUI.

@@ -45,6 +45,7 @@ services:
     networks:
       - default
       - codex-internal
+      - privatemode-internal
     depends_on:
       - cli-proxy-api
     command:
@@ -111,6 +112,36 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  privatemode-proxy:
+    # Edgeless Systems' client-side Privatemode proxy, the trust anchor for the
+    # privatemode provider: it attests the confidential deployment, then
+    # encrypts every prompt to the attested GPU worker and decrypts the reply.
+    # Pinned by digest as Edgeless recommends; update it when Privatemode rolls
+    # out a manifest this version cannot read ("unmarshaling" errors).
+    image: ${PRIVATEMODE_PROXY_IMAGE:-ghcr.io/edgelesssys/privatemode/privatemode-proxy:v1.59.0@sha256:3cd4da0ee6ceee91ca84dde4e3e3f0e94e8b354d7c1d46987e4331a5c2f8bcff}
+    container_name: claude-proxy-privatemode
+    restart: unless-stopped
+    user: "${PROXY_UID:-65532}:${PROXY_GID:-65532}"
+    command:
+      # No --api-key: claude-proxy sends each credential's own key, which the
+      # sidecar forwards unchanged and offers for the attested key exchange.
+      - "--api-key-fallback=never"
+      - "--workspace=/workspace"
+      - "--port=8080"
+    # No host port: only claude-proxy reaches it, over privatemode-internal.
+    volumes:
+      # Transparency log of every enforced deployment manifest.
+      - ./data/privatemode:/workspace
+    networks:
+      - privatemode-internal
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
   traefik:
     image: traefik:latest
     container_name: claude-proxy-traefik
@@ -155,4 +186,8 @@ networks:
   codex-internal:
     # Dedicated bridge: only claude-proxy and the sidecar join it. It must keep
     # normal outbound NAT so CLIProxyAPI can reach OpenAI OAuth/model services.
+    driver: bridge
+  privatemode-internal:
+    # Same shape for the Privatemode sidecar, which needs outbound access to
+    # api.privatemode.ai and cdn.confidential.cloud (manifest) on 443.
     driver: bridge

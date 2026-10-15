@@ -50,6 +50,10 @@ func VerifyKey(ctx context.Context, p provider.ID, apiKey, baseURL string) error
 
 	resp, err := verifyClient.Do(req)
 	if err != nil {
+		if pr.AttestingGateway {
+			return fmt.Errorf("contacting the %s proxy at %s: %w — is the privatemode-proxy sidecar running?",
+				pr.Name, provider.ResolveBaseURL(p, baseURL), err)
+		}
 		return fmt.Errorf("contacting %s: %w", pr.Name, err)
 	}
 	defer resp.Body.Close()
@@ -59,6 +63,10 @@ func VerifyKey(ctx context.Context, p provider.ID, apiKey, baseURL string) error
 	case http.StatusOK:
 		return nil
 	case http.StatusUnauthorized, http.StatusForbidden:
+		if msg, ok := provider.GatewayAuthFailure(p, respBody); ok {
+			return fmt.Errorf("the %s proxy could not verify the confidential deployment, so the key was not checked: %s",
+				pr.Name, msg)
+		}
 		// Regional providers answer a wrong-cluster key with a bare "Invalid
 		// API Key", so name the endpoint that actually rejected it.
 		return fmt.Errorf("%s rejected the API key at %s (HTTP %d) — check the key and that the endpoint matches the one it was issued for",

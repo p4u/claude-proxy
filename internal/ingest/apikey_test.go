@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -369,5 +370,34 @@ func TestProbeCustomHostRejectsBadInput(t *testing.T) {
 	}
 	if p := ProbeCustomHost(ctx, "10.0.0.1:3456", "k", ""); p.OK || p.Error == "" {
 		t.Error("a URL without a scheme must fail rather than be guessed at")
+	}
+}
+
+// A Privatemode key is verified through the sidecar. When the sidecar cannot
+// attest the deployment the key was never judged, and the error must say so
+// instead of calling the key wrong.
+func TestImportPrivatemodeKeyGatewayFailure(t *testing.T) {
+	db := keyTestDB(t)
+	var sawPath, sawModel string
+	stubVerify(t, func(w http.ResponseWriter, r *http.Request) {
+		sawPath = r.URL.Path
+		var body struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		sawModel = body.Model
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"trying API key: setting secrets: dial tcp: i/o timeout","type":""}}`))
+	})
+	_, err := ImportKey(context.Background(), db, provider.Privatemode, "pm", "", "pm-key", "", 0)
+	if err == nil || !strings.Contains(err.Error(), "could not verify the confidential deployment") {
+		t.Fatalf("err = %v", err)
+	}
+	if sawPath != "/v1/messages" || sawModel != "glm-flash-latest" {
+		t.Fatalf("verification hit %s with model %q", sawPath, sawModel)
+	}
+	if list, _ := creds.List(context.Background(), db); len(list) != 0 {
+		t.Fatalf("an unverified key was stored: %+v", list)
 	}
 }

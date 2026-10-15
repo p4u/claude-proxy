@@ -7,8 +7,9 @@ const PROVIDERS = {
   mimo: { name: "Xiaomi MiMo", mark: "mi", color: "#ff6900", order: 2, description: "MiMo token plans · proxy-metered usage" },
   codex: { name: "OpenAI Codex", mark: "O", color: "#10a37f", order: 3, description: "Codex subscriptions · account quota windows" },
   gemini: { name: "Google Gemini", mark: "✦", color: "#5286ee", order: 4, description: "Gemini subscriptions · shared model quota" },
-  custom: { name: "Custom Anthropic", mark: "</>", color: "#9a79c7", order: 5, description: "Anthropic-compatible hosts · proxy-metered usage" },
-  custom_openai: { name: "Custom OpenAI", mark: "</>", color: "#699cae", order: 6, description: "OpenAI-compatible hosts · proxy-metered usage" },
+  privatemode: { name: "Privatemode", mark: "PM", color: "#3a9d7a", order: 5, description: "Confidential inference · attested, end-to-end encrypted · proxy-metered usage" },
+  custom: { name: "Custom Anthropic", mark: "</>", color: "#9a79c7", order: 6, description: "Anthropic-compatible hosts · proxy-metered usage" },
+  custom_openai: { name: "Custom OpenAI", mark: "</>", color: "#699cae", order: 7, description: "OpenAI-compatible hosts · proxy-metered usage" },
 };
 
 export function providerInfo(id = "anthropic") {

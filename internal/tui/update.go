@@ -173,8 +173,9 @@ func (m *model) handleCredKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "p": // import a new credential by pasting JSON
 		m.startPaste()
 		return m, nil
-	case "k": // add a static API-key credential (GLM / MiMo)
-		m.startInput(inputAPIKey, "API key (glm or mimo): ", "")
+	case "k": // add a static API-key credential (GLM / MiMo / Privatemode)
+		m.pendingProvider = ""
+		m.startInput(inputAPIKeyProvider, "Provider [glm|mimo|privatemode] (blank = detect from key): ", "")
 		return m, nil
 	}
 
@@ -329,18 +330,32 @@ func (m *model) submitInput() (tea.Model, tea.Cmd) {
 		m.busy = true
 		m.status = "importing " + file + "…"
 		return m, m.importCred(file, label)
+	case inputAPIKeyProvider:
+		switch p := provider.ID(strings.ToLower(val)); p {
+		case "", provider.GLM, provider.MiMo, provider.Privatemode:
+			m.pendingProvider = p
+		default:
+			m.resetInput()
+			m.status, m.isErr = "unknown provider "+val+" — use glm, mimo or privatemode", true
+			return m, nil
+		}
+		m.startInput(inputAPIKey, "API key: ", "")
+		return m, nil
 	case inputAPIKey:
 		if val == "" {
 			m.status, m.isErr = "API key is required", true
 			return m, nil
 		}
 		m.pendingJSON = val // reused as the pending secret between steps
-		// The provider is inferred from the key's own prefix: MiMo Token Plan
-		// keys start with "tp-", Z.AI keys do not. Asking would be one more
-		// prompt for something the key already states.
-		p := provider.GLM
-		if strings.HasPrefix(val, "tp-") || strings.HasPrefix(val, "sk-") {
-			p = provider.MiMo
+		p := m.pendingProvider
+		if p == "" {
+			// Inferred from the key's own prefix: MiMo Token Plan keys start
+			// with "tp-", Z.AI keys do not. Privatemode keys carry no marker,
+			// so they must be named in the previous step.
+			p = provider.GLM
+			if strings.HasPrefix(val, "tp-") || strings.HasPrefix(val, "sk-") {
+				p = provider.MiMo
+			}
 		}
 		m.pendingProvider = p
 		m.startInput(inputAPIKeyEndpoint, endpointPrompt(p), "")

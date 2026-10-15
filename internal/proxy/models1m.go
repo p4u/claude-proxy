@@ -343,7 +343,8 @@ func (h *Handler) filterUnoffered(ctx context.Context, p provider.Provider, entr
 // untouched. Entries are cloned before the context default is written, since
 // the caller may reuse the upstream slice.
 func filterCatalog(entries []map[string]any, p provider.Provider) []map[string]any {
-	if p.CatalogOwner == "" && len(p.CatalogExclude) == 0 && p.DefaultMaxInputTokens == 0 {
+	if p.CatalogOwner == "" && len(p.CatalogExclude) == 0 && p.DefaultMaxInputTokens == 0 &&
+		p.CatalogTask == "" && len(p.ContextWindows) == 0 {
 		return entries
 	}
 	out := make([]map[string]any, 0, len(entries))
@@ -366,12 +367,16 @@ func filterCatalog(entries []map[string]any, p provider.Provider) []map[string]a
 		if containsAny(id, p.CatalogExclude) {
 			continue
 		}
+		if p.CatalogTask != "" && !hasTask(e, p.CatalogTask) {
+			continue
+		}
 		_, hasWindow := maxInputTokens(e)
+		window := defaultWindow(id, p)
 		name, _ := e["display_name"].(string)
-		if (p.DefaultMaxInputTokens > 0 && !hasWindow) || name == "" {
+		if (window > 0 && !hasWindow) || name == "" {
 			e = maps.Clone(e)
-			if p.DefaultMaxInputTokens > 0 && !hasWindow {
-				e["max_input_tokens"] = p.DefaultMaxInputTokens
+			if window > 0 && !hasWindow {
+				e["max_input_tokens"] = window
 			}
 			// The sidecar's OpenAI-shaped list has no display names. Naming
 			// the entry after its ID lets augment1M label the "[1m]" twin
@@ -383,6 +388,35 @@ func filterCatalog(entries []map[string]any, p provider.Provider) []map[string]a
 		out = append(out, e)
 	}
 	return out
+}
+
+// hasTask reports whether a catalogue entry's "tasks" list contains task. An
+// entry without the list is assumed capable: an upstream that stops publishing
+// it must not empty the catalogue.
+func hasTask(e map[string]any, task string) bool {
+	tasks, ok := e["tasks"].([]any)
+	if !ok {
+		return true
+	}
+	for _, t := range tasks {
+		if s, _ := t.(string); s == task {
+			return true
+		}
+	}
+	return false
+}
+
+// defaultWindow is the input window assumed for a catalogue entry that
+// publishes none: the longest matching ContextWindows prefix, else the
+// provider's DefaultMaxInputTokens.
+func defaultWindow(id string, p provider.Provider) int64 {
+	best, bestLen := p.DefaultMaxInputTokens, -1
+	for _, w := range p.ContextWindows {
+		if strings.HasPrefix(id, w.Prefix) && len(w.Prefix) > bestLen {
+			best, bestLen = w.Tokens, len(w.Prefix)
+		}
+	}
+	return best
 }
 
 func hasAnyPrefix(s string, prefixes []string) bool {

@@ -244,7 +244,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// enabled, plus the full message history for users opted into full capture.
 	// No-op otherwise.
 	replySeq, captureReply := -1, false
-	if r.Method == http.MethodPost && r.URL.Path == "/v1/messages" {
+	if r.Method == http.MethodPost && r.URL.Path == "/v1/messages" && !provider.Get(prov).NoPromptCapture {
 		h.capturePrompt(r.Context(), convID, body)
 		if seq, ok := h.captureConversation(r.Context(), convID, body); ok {
 			replySeq, captureReply = seq, true
@@ -409,6 +409,9 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 			return forwardResult{status: http.StatusNotImplemented}
 		}
 	}
+	if up.InjectCacheSalt && r.Method == http.MethodPost && r.URL.Path == "/v1/messages" {
+		body = withCacheSalt(r.Context(), body, cred.AccessToken)
+	}
 	upstreamURL := provider.ResolveBaseURL(up.ID, cred.BaseURL) + requestURI
 
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, bytes.NewReader(body))
@@ -512,6 +515,15 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		_ = resp.Body.Close()
 		errorType := upstreamErrorType(raw, resp.Header.Get("Content-Encoding"))
+		if msg, ok := provider.GatewayAuthFailure(up.ID, raw); ok {
+			// The gateway could not attest the deployment or exchange a key;
+			// the key itself was never judged, so it stays in the pool.
+			_ = creds.MarkError(r.Context(), h.db, cred.ID)
+			h.log.Error("attesting gateway failed before the key was checked; credential status unchanged",
+				"cred", cred.ID, "label", cred.Label, "provider", string(up.ID), "gateway_error", msg)
+			http.Error(w, `{"type":"error","error":{"type":"api_error","message":"proxy: `+up.Name+` could not verify the confidential deployment; try again later"}}`, http.StatusBadGateway)
+			return forwardResult{status: http.StatusBadGateway, errorType: "api_error"}
+		}
 		_ = creds.SetStatus(r.Context(), h.db, cred.ID, creds.StatusRevoked)
 		_ = creds.MarkError(r.Context(), h.db, cred.ID)
 		h.log.Error("upstream 401 on API key; marked revoked",

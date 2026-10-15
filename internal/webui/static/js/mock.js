@@ -13,6 +13,7 @@ const CREDS = [
   { id: "cred_dz17", label: "enterprise-01", type: "enterprise", weight: 5, status: "active" },
   { id: "cred_er05", label: "pro-old", type: "pro", weight: 1, status: "disabled" },
   { id: "cred_gl01", label: "zai-main", type: "pro", weight: 1, status: "active", provider: "glm" },
+  { id: "cred_pm01", label: "privatemode-team", type: "", weight: 1, status: "active", provider: "privatemode" },
   { id: "cred_oa01", label: "local-openai", type: "", weight: 2, status: "active",
     provider: "custom_openai", endpoint: "http://localhost:8000/v1",
     models: [{ id: "local-model", display_name: "local-model" }] },
@@ -57,6 +58,8 @@ const MOCK_ENDPOINTS = {
     { name: "ams", desc: "Token Plan — Amsterdam", url: "https://token-plan-ams.xiaomimimo.com/anthropic" },
     { name: "cn", desc: "Token Plan — China", url: "https://token-plan-cn.xiaomimimo.com/anthropic" },
     { name: "payg", desc: "Pay-as-you-go", url: "https://api.xiaomimimo.com/anthropic" }]},
+  privatemode: { name: "Privatemode", default: "http://privatemode-proxy:8080", endpoints: [
+    { name: "sidecar", desc: "Bundled privatemode-proxy sidecar", url: "http://privatemode-proxy:8080" }]},
 };
 const endpointOf = (c) => {
   const p = MOCK_ENDPOINTS[providerOf(c)];
@@ -329,7 +332,7 @@ function subscriptionReport(q) {
   };
   const add = (rows) => tokens(Object.fromEntries(tokenKeys.map((key) => [key, rows.reduce((sum, row) => sum + row[key], 0)])));
   const scaled = (value, factor) => tokens(Object.fromEntries(tokenKeys.map((key) => [key, value[key] * factor])));
-  const providerNames = { anthropic: "Anthropic", glm: "Z.AI GLM", custom_openai: "Custom OpenAI", codex: "OpenAI Codex", gemini: "Google Gemini" };
+  const providerNames = { anthropic: "Anthropic", glm: "Z.AI GLM", privatemode: "Privatemode", custom_openai: "Custom OpenAI", codex: "OpenAI Codex", gemini: "Google Gemini" };
   const normalizedTier = (value) => {
     const tier = (value || "").trim().toLowerCase();
     if (!tier) return "unknown";
@@ -385,7 +388,7 @@ function subscriptionReport(q) {
       row.tokens = add([row.tokens, value.tokens]);
       dailyMap.set(dailyKey, row);
     }
-    const modelIDs = source.provider === "anthropic" ? ["claude-opus-4-7", "claude-sonnet-4-6"] : source.provider === "codex" ? ["gpt-5.4", "gpt-5.4-mini"] : source.provider === "gemini" ? ["gemini-3.1-pro", "gemini-3-flash"] : source.provider === "glm" ? ["glm-4.7", "glm-5"] : ["demo-model", "demo-small"];
+    const modelIDs = source.provider === "anthropic" ? ["claude-opus-4-7", "claude-sonnet-4-6"] : source.provider === "codex" ? ["gpt-5.4", "gpt-5.4-mini"] : source.provider === "gemini" ? ["gemini-3.1-pro", "gemini-3-flash"] : source.provider === "glm" ? ["glm-4.7", "glm-5"] : source.provider === "privatemode" ? ["glm-5.3", "gpt-oss-120b"] : ["demo-model", "demo-small"];
     const split = scaled(observed.tokens, 0.63 + index * 0.02);
     modelIDs.forEach((model, modelIndex) => {
       const modelKey = JSON.stringify([key, model]);

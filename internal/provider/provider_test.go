@@ -241,3 +241,56 @@ func TestResolveBaseURL(t *testing.T) {
 		t.Errorf("override should win (trailing slash trimmed), got %q", got)
 	}
 }
+
+// Privatemode serves glm-* and gpt-oss-*, which Z.AI and Codex already route,
+// so it is reached only through its own alias and never by a native name.
+func TestPrivatemodeRouting(t *testing.T) {
+	for _, tc := range []struct {
+		model string
+		want  ID
+	}{
+		{"claude-pm-glm-5.3", Privatemode},
+		{"claude-pm-glm-5.3[1m]", Privatemode},
+		{"claude-pm-gpt-oss-120b", Privatemode},
+		{"claude-pm-some-future-model", Privatemode},
+		{"glm-5.3", GLM},          // native name stays Z.AI's
+		{"gpt-oss-120b", Codex},   // and Codex's
+		{"claude-glm-4.7", GLM},   // GLM's own alias is untouched
+		{"claude-pm-", Anthropic}, // a bare prefix names no model
+		{"claude-sonnet-5", Anthropic},
+	} {
+		if got := ForModel(tc.model); got != tc.want {
+			t.Errorf("ForModel(%q) = %q, want %q", tc.model, got, tc.want)
+		}
+	}
+	if got := AdvertisedID("glm-5.3", Privatemode); got != "claude-pm-glm-5.3" {
+		t.Errorf("AdvertisedID = %q", got)
+	}
+	if got := WireModel("claude-pm-gpt-oss-120b"); got != "gpt-oss-120b" {
+		t.Errorf("WireModel = %q", got)
+	}
+	if got := WireModel("claude-glm-4.7"); got != "glm-4.7" {
+		t.Errorf("WireModel(GLM alias) = %q", got)
+	}
+}
+
+// The messages are the live privatemode-proxy v1.59.0 responses (2026-10-15):
+// a fake key fails the attest call with 401, which is a judgement on the key;
+// anything else before the key is checked is the gateway's own failure.
+func TestGatewayAuthFailure(t *testing.T) {
+	rejected := `{"error":{"message":"trying API key: setting secrets: All attempts fail:\n#1: updating mesh CA: getting attested certificate: doing attest request: Unauthorized (status code: 401)","type":""}}`
+	if _, ok := GatewayAuthFailure(Privatemode, []byte(rejected)); ok {
+		t.Fatal("a rejected key read as a gateway failure; it would never be revoked")
+	}
+	broken := `{"error":{"message":"trying API key: setting secrets: All attempts fail:\n#1: updating mesh CA: dial tcp: lookup api.privatemode.ai: no such host","type":""}}`
+	msg, ok := GatewayAuthFailure(Privatemode, []byte(broken))
+	if !ok || !strings.Contains(msg, "no such host") {
+		t.Fatalf("an unreachable deployment must not revoke the key: %q %v", msg, ok)
+	}
+	if _, ok := GatewayAuthFailure(GLM, []byte(broken)); ok {
+		t.Fatal("only attesting gateways get this treatment")
+	}
+	if _, ok := GatewayAuthFailure(Privatemode, []byte(`{"error":{"message":"invalid api key"}}`)); ok {
+		t.Fatal("an upstream key rejection is not a gateway failure")
+	}
+}

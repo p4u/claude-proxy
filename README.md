@@ -459,6 +459,26 @@ The models then appear in the `/model` picker like any other, and requests route
 to the host that declared them. Two hosts declaring the same model name pool and
 load-balance.
 
+## Privatemode (confidential inference)
+
+[Privatemode](https://docs.privatemode.ai) runs open-weights models (GLM-5.3,
+GLM-5.3-Flash, gpt-oss-120b) inside attested confidential VMs. Prompts are
+encrypted end to end by Edgeless Systems' `privatemode-proxy`, which ships as the
+`privatemode-proxy` service in `docker-compose.yml`: it verifies the deployment
+by remote attestation before any prompt leaves this host, and only attested GPU
+workers can decrypt it. Billing is per token, by Privatemode.
+
+```bash
+make up                                          # also starts the sidecar
+make add-key PROVIDER=privatemode LABEL=pm-team  # prompts for the API key
+```
+
+The key is verified with an encrypted one-token request through the sidecar.
+Models appear in `/model` as `claude-pm-glm-5.3`, `claude-pm-glm-5.3[1m]`,
+`claude-pm-gpt-oss-120b` and so on. Privatemode prompts are **never stored** by
+this proxy, whatever the prompt-retention or full-capture settings; token counts
+are still recorded for the stats. Each user gets their own prompt cache.
+
 ## GLM (Z.AI) and MiMo support
 
 The proxy can serve [Z.AI GLM coding plans](https://docs.z.ai/devpack/tool/claude)

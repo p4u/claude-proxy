@@ -47,7 +47,7 @@ Usage:
   claude-proxy users limit <id>       --tokens 1M --window 24h | --none [--db PATH]
   claude-proxy tui                 [--db PATH]   # interactive management UI
   claude-proxy creds import        --from FILE [--label NAME] [--weight N]
-  claude-proxy creds add-key       --provider glm|mimo [--endpoint sgp|https://…]
+  claude-proxy creds add-key       --provider glm|mimo|privatemode [--endpoint sgp|https://…]
                                    [--key KEY] [--label NAME] [--plan TIER] [--weight N]
                                                  # omit --key to read it from stdin
   claude-proxy creds update <id>   --from FILE   # replace tokens from a fresh login
@@ -427,7 +427,7 @@ func credsUpdate(ctx context.Context, args []string) {
 func credsAddKey(ctx context.Context, args []string) {
 	fs := flag.NewFlagSet("creds add-key", flag.ExitOnError)
 	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
-	prov := fs.String("provider", string(provider.GLM), "provider id (glm)")
+	prov := fs.String("provider", string(provider.GLM), "provider id (glm, mimo or privatemode)")
 	key := fs.String("key", "", "API key (omit to read from stdin)")
 	label := fs.String("label", "", "display label (defaults to the provider id)")
 	plan := fs.String("plan", "", "plan tier label, e.g. lite|pro|max (display only)")

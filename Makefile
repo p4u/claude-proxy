@@ -39,7 +39,7 @@ help: ## Show this help.
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) }' $(MAKEFILE_LIST)
 
 env: ## Create or upgrade .env: sync UID/GID to host shell, add missing auth token.
-	@mkdir -p data creds data/letsencrypt data/cliproxy-auth
+	@mkdir -p data creds data/letsencrypt data/cliproxy-auth data/privatemode
 	@if [ ! -f $(ENV_FILE) ]; then cp .env.example $(ENV_FILE); echo "wrote fresh $(ENV_FILE)"; fi
 	@HOST_UID=$$(id -u); HOST_GID=$$(id -g); \
 	 if grep -q '^PROXY_UID=' $(ENV_FILE); then \
@@ -167,9 +167,9 @@ tui: env ## Launch the interactive management TUI (credentials + users). Attache
 
 # usage: make import FROM=acct-A.json LABEL=acct-A [WEIGHT=5]
 # FROM is a path RELATIVE to ./creds (which is bind-mounted as /creds:ro).
-add-key: env ## Add a provider API key (PROVIDER=glm|mimo LABEL=x [ENDPOINT=sgp] [PLAN=pro] [WEIGHT=N]). Prompts for the key.
+add-key: env ## Add a provider API key (PROVIDER=glm|mimo|privatemode LABEL=x [ENDPOINT=sgp] [PLAN=pro] [WEIGHT=N]). Prompts for the key.
 	@if [ -z "$(LABEL)" ]; then \
-		echo "usage: make add-key PROVIDER=glm|mimo LABEL=zai-main [ENDPOINT=sgp] [PLAN=pro] [WEIGHT=N]"; exit 2; fi
+		echo "usage: make add-key PROVIDER=glm|mimo|privatemode LABEL=zai-main [ENDPOINT=sgp] [PLAN=pro] [WEIGHT=N]"; exit 2; fi
 	@printf 'API key (input hidden): ' >&2; stty -echo 2>/dev/null; read KEY; stty echo 2>/dev/null; echo >&2; \
 	 printf '%s' "$$KEY" | $(DC) run --rm --no-deps -i $(SERVICE) creds add-key --db $(DB) \
 		--provider "$(if $(PROVIDER),$(PROVIDER),glm)" --label "$(LABEL)" \

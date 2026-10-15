@@ -49,6 +49,7 @@ const (
 	inputUserName
 	inputPasteJSON
 	// API-key credentials are entered in two steps: the key, then a label.
+	inputAPIKeyProvider
 	inputAPIKey
 	inputAPIKeyEndpoint
 	inputAPIKeyLabel

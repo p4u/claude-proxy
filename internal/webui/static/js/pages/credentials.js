@@ -151,7 +151,7 @@ async function loadEndpoints() {
 }
 
 const PROVIDER_LABELS = {
-  anthropic: "Anthropic", glm: "GLM", mimo: "MiMo", custom: "Custom Anthropic",
+  anthropic: "Anthropic", glm: "GLM", mimo: "MiMo", privatemode: "Privatemode", custom: "Custom Anthropic",
   custom_openai: "Custom OpenAI", codex: "OpenAI Codex", gemini: "Google Gemini",
 };
 function providerLabel(id) {
@@ -528,6 +528,13 @@ const KINDS = {
     keyHelp: "Token Plan keys start with tp-. Verified against the endpoint below before it is stored.",
     endpointHelp:
       "A Token Plan key works on exactly one cluster — the others answer “Invalid API Key” without saying why. Type a URL directly for a cluster not listed.",
+    plan: true,
+  },
+  privatemode: {
+    label: "Privatemode",
+    blurb: "A Privatemode API key. Prompts are encrypted end to end by the privatemode-proxy sidecar, which attests the confidential deployment first; they are never stored by this proxy.",
+    keyHelp: "From portal.privatemode.ai. Verified with an encrypted request through the sidecar before it is stored.",
+    endpointHelp: "The privatemode-proxy sidecar, not api.privatemode.ai — only the sidecar attests the deployment and encrypts prompts.",
     plan: true,
   },
   custom: {

@@ -174,8 +174,8 @@ value claims.
 
 ### Credential management (wraps `internal/creds`, `internal/ingest`)
 - `GET /api/credentials` → extended `credView` (reuse fields from `internal/admin`),
-  including `provider` (`anthropic` | `glm` | `mimo` | `custom` |
-  `custom_openai`), optional `rate_limit_tier`, and `has_usage_api`. The latter is
+  including `provider` (`anthropic` | `glm` | `mimo` | `codex` | `gemini` |
+  `privatemode` | `custom` | `custom_openai`), optional `rate_limit_tier`, and `has_usage_api`. The latter is
   false for providers publishing no utilization endpoint; the UI uses it to hide
   the usage meters, the expiry date and the OAuth-only row actions (Refresh,
   Update tokens) rather than showing 0% and a synthetic far-future date.
@@ -191,7 +191,8 @@ value claims.
   when a tier is missing; a changed plan clears an obsolete tier unless the
   new login supplies a replacement. JSONL backups preserve the tier.
 - `POST /api/credentials/keys` `{provider, api_key, endpoint?, label?, plan?, weight?}`
-  → add a static API key (`ingest.ImportKey`). `provider` is `glm` or `mimo`.
+  → add a static API key (`ingest.ImportKey`). `provider` is `glm`, `mimo` or
+  `privatemode` (verified through the privatemode-proxy sidecar).
   `endpoint` is a short name from the provider's endpoint list (`sgp`, `ams`,
   `cn`, `payg`, `global`) or a full `https://` URL; empty selects the provider
   default. Verified before storing with a live `max_tokens:1 POST /v1/messages`
@@ -202,7 +203,7 @@ value claims.
   unknown provider or endpoint, or an OAuth provider (which needs `POST
   /api/credentials` instead).
 - `GET /api/credentials/endpoints` → endpoint presets per key-based provider:
-  `{glm:{name,default,endpoints:[{name,desc,url}]}, mimo:{...}}`. Served from the
+  `{glm:{name,default,endpoints:[{name,desc,url}]}, mimo:{...}, privatemode:{...}}`. Served from the
   Go registry so the UI keeps no copy of it. OAuth providers are omitted.
 - `POST /api/credentials/{id}/endpoint` `{endpoint}` → move an API-key credential
   to another cluster (`ingest.UpdateKeyEndpoint`). Accepts a preset name or a
