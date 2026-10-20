@@ -24,6 +24,9 @@ const ROUTES = {
 const appRoot = document.getElementById("app");
 let shellBuilt = false;
 let outlet;
+// The last /api/session answer: which sign-in method applies and, for single
+// sign-on, who is signed in.
+let session = {};
 
 applyTheme();
 
@@ -36,6 +39,7 @@ async function boot() {
   applyTheme();
   try {
     const s = await api.session();
+    session = s || {};
     if (s && s.authenticated) showApp();
     else showLogin();
   } catch {
@@ -47,13 +51,22 @@ function showLogin() {
   clear(appRoot);
   const mount = el("div", { class: "login-shell" });
   appRoot.append(mount);
-  renderLogin(mount, () => showApp());
+  renderLogin(mount, () => showApp(), session.method);
 }
 
 function showApp() {
   if (!shellBuilt) buildShell();
   if (!location.hash || !ROUTES[currentRoute()]) location.hash = "#/dashboard";
   route();
+}
+
+// Single sign-on sign-out must be a same-origin form POST: the provider kit
+// refuses a GET and a cross-site post. It answers with a redirect to /, which
+// reloads into the sign-in screen.
+function ssoSignOut() {
+  const form = el("form", { method: "post", action: "/auth/logout", hidden: true });
+  document.body.append(form);
+  form.submit();
 }
 
 function currentRoute() {
@@ -79,9 +92,17 @@ function buildShell() {
     class: "icon-btn theme-btn", "aria-label": "Toggle theme", title: "Toggle theme",
     onClick: cycleTheme, html: ICONS.theme,
   });
+  const sso = session.method === "sso";
+  const who = sso && session.user ? session.user.email : "";
   const logoutBtn = el("button", {
-    class: "icon-btn", "aria-label": "Log out", title: "Log out",
-    onClick: async () => { try { await api.logout(); } catch {} shellBuilt = false; showLogin(); },
+    class: "icon-btn", "aria-label": "Log out",
+    title: sso ? `Sign out${who ? " " + who : ""} (your Google session stays signed in)` : "Log out",
+    onClick: async () => {
+      if (sso) { ssoSignOut(); return; }
+      try { await api.logout(); } catch {}
+      shellBuilt = false;
+      showLogin();
+    },
     html: ICONS.logout,
   });
 
@@ -96,7 +117,10 @@ function buildShell() {
   const sidebar = el("aside", { class: "sidebar" }, [
     brand,
     nav,
-    el("div", { class: "sidebar__foot" }, [themeBtn, logoutBtn]),
+    el("div", { class: "sidebar__foot" }, [
+      themeBtn, logoutBtn,
+      who ? el("span", { class: "sidebar__user", text: who, title: who }) : null,
+    ]),
   ]);
 
   // Mobile top bar

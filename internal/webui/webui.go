@@ -1,6 +1,6 @@
 // Package webui serves the management/monitoring dashboard (cookie-authenticated
 // REST API under /api/ + embedded SPA) at the root "/". It is mounted by the
-// serve command only when a UI password is configured. Legacy /ui* paths
+// serve command only when a UI password or single sign-on is configured. Legacy /ui* paths
 // permanently redirect to the root.
 package webui
 
@@ -28,6 +28,9 @@ type Server struct {
 	refresher     *creds.Refresher
 	password      string
 	secureCookies bool
+	// sso, when set, replaces the password: sign-in goes through the OpenID
+	// Connect provider and the password routes answer 404.
+	sso *SSO
 
 	hmacKey []byte
 	static  fs.FS
@@ -50,6 +53,27 @@ func New(db *store.DB, refresher *creds.Refresher, password string, secureCookie
 // NewWithCodex builds the UI with optional access to a private CLIProxyAPI
 // sidecar. New remains for tests and deployments that do not enable Codex.
 func NewWithCodex(db *store.DB, refresher *creds.Refresher, password string, secureCookies bool, codex *codexgateway.Client) http.Handler {
+	return NewWithOptions(db, refresher, Options{Password: password, SecureCookies: secureCookies, Codex: codex})
+}
+
+// Options configures NewWithOptions.
+type Options struct {
+	// Password is the shared UI password. Ignored when SSO is set.
+	Password string
+	// SSO switches sign-in to single sign-on (see NewSSO); nil keeps the
+	// password login.
+	SSO           *SSO
+	SecureCookies bool
+	Codex         *codexgateway.Client
+}
+
+// NewWithOptions builds the web UI handler.
+func NewWithOptions(db *store.DB, refresher *creds.Refresher, opts Options) http.Handler {
+	password, secureCookies, codex := opts.Password, opts.SecureCookies, opts.Codex
+	if opts.SSO != nil {
+		// No password may open a session alongside SSO, not even an empty one.
+		password = ""
+	}
 	sub, err := fs.Sub(staticFS, "static")
 	if err != nil {
 		// The embed directive guarantees the directory exists; this cannot fail
@@ -61,6 +85,7 @@ func NewWithCodex(db *store.DB, refresher *creds.Refresher, password string, sec
 		refresher:     refresher,
 		password:      password,
 		secureCookies: secureCookies,
+		sso:           opts.SSO,
 		hmacKey:       deriveKey(password, sessionSecret(db)),
 		static:        sub,
 		limiter:       newLoginLimiter(),
@@ -83,6 +108,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			target += "?" + r.URL.RawQuery
 		}
 		http.Redirect(w, r, target, http.StatusPermanentRedirect)
+	case s.sso != nil && strings.HasPrefix(path, "/auth/"):
+		// GET /auth/login, GET /auth/callback, POST /auth/logout.
+		s.sso.auth.Routes().ServeHTTP(w, r)
 	case path == "/api" || strings.HasPrefix(path, "/api/"):
 		s.serveAPI(w, r, strings.TrimPrefix(path, "/api"))
 	default:
@@ -95,6 +123,23 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // everything else requires a valid session cookie.
 func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, rest string) {
 	w.Header().Set("Content-Type", "application/json")
+
+	if s.sso != nil {
+		switch rest {
+		case "/session":
+			s.handleSSOSession(w, r)
+			return
+		case "/login", "/logout":
+			// Sign-in and sign-out live under /auth/; there is no password.
+			writeErr(w, http.StatusNotFound, "not found")
+			return
+		}
+		if !s.ssoAuthorize(w, r) {
+			return
+		}
+		s.serveAuthenticatedAPI(w, r, rest)
+		return
+	}
 
 	switch rest {
 	case "/login":
@@ -112,7 +157,12 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, rest string) {
 		writeErr(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+	s.serveAuthenticatedAPI(w, r, rest)
+}
 
+// serveAPI's routes past the authentication check, shared by both sign-in
+// methods.
+func (s *Server) serveAuthenticatedAPI(w http.ResponseWriter, r *http.Request, rest string) {
 	switch {
 	case rest == "/overview" && r.Method == http.MethodGet:
 		s.handleOverview(w, r)

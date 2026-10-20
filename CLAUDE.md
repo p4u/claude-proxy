@@ -607,7 +607,7 @@ Before this, a key added seconds after a refresh stayed invisible for 5 minutes.
 |---|---|
 | `cmd/claude-proxy/` | CLI entry point; `serve`, `tui`, `creds`, and `users` subcommands |
 | `internal/tui/` | Interactive Bubble Tea management UI (credentials + users tabs) for `claude-proxy tui` |
-| `internal/webui/` | Embedded browser dashboard (`go:embed`), served at `/` when `CLAUDE_PROXY_UI_PASSWORD` is set (old `/ui` 308-redirects); cookie-authenticated JSON API under `/api` (contract: `docs/WEBUI.md`) |
+| `internal/webui/` | Embedded browser dashboard (`go:embed`), served at `/` when `CLAUDE_PROXY_UI_PASSWORD` or single sign-on (`CLAUDE_PROXY_OAUTH_*`, replaces the password) is set (old `/ui` 308-redirects); cookie-authenticated JSON API under `/api` (contract: `docs/WEBUI.md`) |
 | `internal/provider/` | Per-upstream behaviour table (base URL, model prefixes, refreshability, usage API, `[1m]` support) |
 | `internal/codexgateway/` | Private CLIProxyAPI client, sanitized Codex OAuth/account management, and synthetic gateway-credential reconciliation |
 | `internal/proxy/` | Proxy-mode HTTP handler + `AuthMiddleware` (two-tier auth, request logging); `routing.go` maps model → provider |
@@ -806,10 +806,11 @@ instead; it does not load `.env` automatically. Key Compose variables:
 | `LOG_LEVEL` | `info` | `debug\|info\|warn\|error` |
 | `LOG_FORMAT` | `auto` | `pretty\|text\|json\|auto` |
 | `LOG_COLOR` | `auto` | `auto\|always\|never` |
-| `UI_PASSWORD` | _(empty)_ | Web UI password (`CLAUDE_PROXY_UI_PASSWORD`); empty = UI disabled. UI is served at `/` (old `/ui/*` paths 308-redirect); API prefixes `/v1/`, `/admin/`, `/api/`, `/health` are reserved |
+| `UI_PASSWORD` | _(empty)_ | Web UI password (`CLAUDE_PROXY_UI_PASSWORD`); empty = UI disabled unless SSO (below) is set; ignored when it is. UI is served at `/` (old `/ui/*` paths 308-redirect); API prefixes `/v1/`, `/admin/`, `/api/`, `/health` are reserved |
 | `MODELS_1M` | _(enabled)_ | Append `[1m]` model variants to `GET /v1/models` for Claude Code gateway model discovery (`CLAUDE_PROXY_MODELS_1M`); set `0` to disable |
 | `REBALANCE_SESSIONS` | `1` | Proactive long-session rebalance for direct Anthropic subscriptions, announced via an API header notice (`CLAUDE_PROXY_REBALANCE_SESSIONS`; `0` disables it). Account-bound conversations never migrate. |
 | `EXPIRY_POLICY` | `shadow` | `off` or `shadow` only (`CLAUDE_PROXY_EXPIRY_POLICY`, `--expiry-policy`). Records bounded unused-quota forecasts in Routing activity; never changes routing. |
+| `OAUTH_CLIENT_ID` (+ `OAUTH_ISSUER`, `_CLIENT_SECRET`, `_REDIRECT_URL`, `_COOKIE_KEYS`, `_ALLOWED_EMAILS`) | _(empty)_ | Web UI single sign-on via OpenID Connect (`CLAUDE_PROXY_OAUTH_*`, env only; issuer default `https://oauth.vocdoni.org`). Set ⇒ replaces the password: `/api/login` 404s, sign-in at `/auth/login` (`internal/webui/sso.go`, `vocauth` kit). Unset ⇒ password login, the open-source default. Contract in `docs/WEBUI.md` |
 | `UI_SECURE_COOKIES` | _(empty)_ | Force `Secure` UI session cookies (`CLAUDE_PROXY_UI_SECURE_COOKIES`); auto-detected behind Traefik via `X-Forwarded-Proto` |
 | `PROMPT_RETENTION_DAYS` | `7` | Retain prompt/full-capture rows; `0` disables capture (`CLAUDE_PROXY_PROMPT_RETENTION_DAYS`) |
 | `CLIPROXY_API_KEY` | _(generated)_ | Private proxy-to-CLIProxyAPI API key; never sent to OpenAI |

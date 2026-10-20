@@ -168,7 +168,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	writeJSON(w, map[string]any{"authenticated": authenticated})
+	writeJSON(w, map[string]any{"authenticated": authenticated, "method": "password"})
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {

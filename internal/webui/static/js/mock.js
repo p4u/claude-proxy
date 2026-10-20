@@ -797,7 +797,16 @@ window.fetch = async (input, init = {}) => {
   await new Promise((r) => setTimeout(r, 120 + Math.random() * 220));
 
   const anon = new URLSearchParams(location.search).get("anon") === "1";
-  if (path === "/session") return json({ authenticated: !anon });
+  // ?sso=1 previews the single sign-on mode (its sign-in link and sign-out
+  // form leave the mock, since they are real navigations).
+  if (path === "/session") {
+    if (new URLSearchParams(location.search).get("sso") === "1") {
+      return json(anon
+        ? { authenticated: false, method: "sso" }
+        : { authenticated: true, method: "sso", user: { email: "alice@vocdoni.org", name: "Alice" } });
+    }
+    return json({ authenticated: !anon, method: "password" });
+  }
   if (path === "/login") return json({ authenticated: true });
   if (path === "/logout") return json({ authenticated: false });
 

@@ -139,7 +139,7 @@ func runServe(args []string) {
 	authToken := fs.String("auth-token", os.Getenv("CLAUDE_PROXY_AUTH_TOKEN"),
 		"shared bearer token (env CLAUDE_PROXY_AUTH_TOKEN). empty disables auth.")
 	uiPassword := fs.String("ui-password", os.Getenv("CLAUDE_PROXY_UI_PASSWORD"),
-		"web UI password (env CLAUDE_PROXY_UI_PASSWORD). empty disables the UI.")
+		"web UI password (env CLAUDE_PROXY_UI_PASSWORD). empty disables the UI unless single sign-on (CLAUDE_PROXY_OAUTH_*) is configured, which replaces it.")
 	promptRetentionDays := fs.Int("prompt-retention-days", envIntDefault("CLAUDE_PROXY_PROMPT_RETENTION_DAYS", 7),
 		"days to retain captured user prompts (env CLAUDE_PROXY_PROMPT_RETENTION_DAYS). 0 disables prompt capture.")
 	_ = fs.String("on-limited", "passthrough", "behavior when pinned credential is limited")
@@ -285,16 +285,31 @@ func runServe(args []string) {
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
 
-	uiEnabled := *uiPassword != ""
+	sso, err := ssoFromEnv()
+	if err != nil {
+		// A half-configured SSO must not quietly fall back to the password.
+		fmt.Fprintf(os.Stderr, "web UI single sign-on: %v\n", err)
+		os.Exit(1)
+	}
+	uiEnabled := *uiPassword != "" || sso != nil
 	if uiEnabled {
 		secureCookies := isTruthy(os.Getenv("CLAUDE_PROXY_UI_SECURE_COOKIES"))
-		uiH := webui.NewWithCodex(db, r, *uiPassword, secureCookies, codexClient)
+		uiH := webui.NewWithOptions(db, r, webui.Options{
+			Password: *uiPassword, SSO: sso, SecureCookies: secureCookies, Codex: codexClient,
+		})
 		// The UI owns the root: reserved prefixes (/v1/, /openai/v1/, /admin/, /health) are
 		// registered above and win by ServeMux's longest-match rule; everything
-		// else (static assets, SPA deep links, /api/*, legacy /ui redirect)
-		// falls through to the web UI handler.
+		// else (static assets, SPA deep links, /api/*, /auth/*, legacy /ui
+		// redirect) falls through to the web UI handler.
 		mux.Handle("/", uiH)
-		logger.Info("web UI enabled", "path", "/", "secure_cookies", secureCookies)
+		login := "password"
+		if sso != nil {
+			login = "sso"
+			if *uiPassword != "" {
+				logger.Warn("web UI password ignored: single sign-on is configured")
+			}
+		}
+		logger.Info("web UI enabled", "path", "/", "login", login, "secure_cookies", secureCookies)
 	}
 
 	if *authToken != "" {
@@ -321,6 +336,32 @@ func runServe(args []string) {
 		fmt.Fprintf(os.Stderr, "listen: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// ssoFromEnv reads the web UI's single sign-on settings. SSO is on when
+// CLAUDE_PROXY_OAUTH_CLIENT_ID is set and then replaces the password login;
+// unset, it returns nil and the password login applies. They are read from
+// the environment only, never flags, so the client secret stays out of ps.
+func ssoFromEnv() (*webui.SSO, error) {
+	clientID := strings.TrimSpace(os.Getenv("CLAUDE_PROXY_OAUTH_CLIENT_ID"))
+	if clientID == "" {
+		return nil, nil
+	}
+	var emails []string
+	for e := range strings.SplitSeq(os.Getenv("CLAUDE_PROXY_OAUTH_ALLOWED_EMAILS"), ",") {
+		if e = strings.TrimSpace(e); e != "" {
+			emails = append(emails, e)
+		}
+	}
+	return webui.NewSSO(webui.SSOConfig{
+		Issuer:        strings.TrimSpace(os.Getenv("CLAUDE_PROXY_OAUTH_ISSUER")),
+		ClientID:      clientID,
+		ClientSecret:  os.Getenv("CLAUDE_PROXY_OAUTH_CLIENT_SECRET"),
+		RedirectURL:   strings.TrimSpace(os.Getenv("CLAUDE_PROXY_OAUTH_REDIRECT_URL")),
+		CookieKeys:    os.Getenv("CLAUDE_PROXY_OAUTH_COOKIE_KEYS"),
+		AllowedEmails: emails,
+		Insecure:      isTruthy(os.Getenv("CLAUDE_PROXY_OAUTH_INSECURE")),
+	})
 }
 
 func runTUI(args []string) {

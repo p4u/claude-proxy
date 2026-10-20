@@ -17,12 +17,20 @@ services:
       # Auth token — read by the binary at startup. Empty disables auth.
       CLAUDE_PROXY_AUTH_TOKEN: "${PROXY_AUTH_TOKEN:-}"
       # Web UI password — read by the binary at startup. Empty disables the
-      # UI (/ui/* returns 404). Served on the same port; traefik/TLS above
+      # UI unless single sign-on (OAUTH_* below) is configured. Served on the same port; traefik/TLS above
       # covers it automatically.
       CLAUDE_PROXY_UI_PASSWORD: "${UI_PASSWORD:-}"
       # Force Secure session cookies for the UI. Usually left empty — TLS via
       # traefik is auto-detected from X-Forwarded-Proto.
       CLAUDE_PROXY_UI_SECURE_COOKIES: "${UI_SECURE_COOKIES:-}"
+      # Web UI single sign-on (OpenID Connect, oauth.vocdoni.org by default).
+      # Setting OAUTH_CLIENT_ID turns it on and turns the UI password off.
+      CLAUDE_PROXY_OAUTH_ISSUER: "${OAUTH_ISSUER:-}"
+      CLAUDE_PROXY_OAUTH_CLIENT_ID: "${OAUTH_CLIENT_ID:-}"
+      CLAUDE_PROXY_OAUTH_CLIENT_SECRET: "${OAUTH_CLIENT_SECRET:-}"
+      CLAUDE_PROXY_OAUTH_REDIRECT_URL: "${OAUTH_REDIRECT_URL:-}"
+      CLAUDE_PROXY_OAUTH_COOKIE_KEYS: "${OAUTH_COOKIE_KEYS:-}"
+      CLAUDE_PROXY_OAUTH_ALLOWED_EMAILS: "${OAUTH_ALLOWED_EMAILS:-}"
       CLAUDE_PROXY_MODELS_1M: "${MODELS_1M:-}"
       # Proactive Anthropic long-session rebalance; 0 disables it.
       CLAUDE_PROXY_REBALANCE_SESSIONS: "${REBALANCE_SESSIONS:-1}"

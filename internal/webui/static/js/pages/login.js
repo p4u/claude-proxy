@@ -2,8 +2,14 @@ import { api } from "../api.js";
 import { el, clear } from "../ui.js";
 
 // Renders the login screen into document body's #app-login slot. onSuccess() called after auth.
-export function renderLogin(mount, onSuccess) {
+// method is what /api/session reported: "sso" sends the operator to the
+// single sign-on provider instead of asking for the password.
+export function renderLogin(mount, onSuccess, method) {
   clear(mount);
+  if (method === "sso") {
+    renderSSO(mount);
+    return;
+  }
   const pw = el("input", {
     class: "input login__input", type: "password", placeholder: "Password",
     autocomplete: "current-password", "aria-label": "UI password", autofocus: true,
@@ -40,19 +46,45 @@ export function renderLogin(mount, onSuccess) {
   mount.append(
     el("div", { class: "login" }, [
       el("div", { class: "login__card" }, [
-        el("div", { class: "login__brand" }, [
-          el("div", { class: "brand-mark", "aria-hidden": "true" }, buildMark()),
-          el("div", {}, [
-            el("div", { class: "login__title", text: "claude-proxy" }),
-            el("div", { class: "login__tag", text: "subscription control tower" }),
-          ]),
-        ]),
+        brandBlock(),
         form,
       ]),
-      el("p", { class: "login__foot", text: "Sessions last 24 hours · same-origin only" }),
+      el("p", { class: "login__foot", text: "Sessions renew while in use · same-origin only" }),
     ])
   );
   setTimeout(() => pw.focus(), 30);
+}
+
+// Single sign-on: a plain link to the provider round trip, which lands back
+// on the page the operator was looking at. There is no password field.
+function renderSSO(mount) {
+  const back = "/" + location.hash;
+  const go = el("a", {
+    class: "btn btn--primary login__btn login__sso",
+    href: "/auth/login?return_to=" + encodeURIComponent(back),
+    text: "Sign in with Vocdoni",
+  });
+  mount.append(
+    el("div", { class: "login" }, [
+      el("div", { class: "login__card" }, [
+        brandBlock(),
+        el("p", { class: "login__hint", text: "Use your @vocdoni.org Google account." }),
+        go,
+      ]),
+      el("p", { class: "login__foot", text: "Single sign-on · oauth.vocdoni.org" }),
+    ])
+  );
+  setTimeout(() => go.focus(), 30);
+}
+
+function brandBlock() {
+  return el("div", { class: "login__brand" }, [
+    el("div", { class: "brand-mark", "aria-hidden": "true" }, buildMark()),
+    el("div", {}, [
+      el("div", { class: "login__title", text: "claude-proxy" }),
+      el("div", { class: "login__tag", text: "subscription control tower" }),
+    ]),
+  ]);
 }
 
 // The signature mark: three stacked signal bars (multiplexed channels).

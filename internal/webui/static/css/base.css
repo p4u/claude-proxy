@@ -143,7 +143,8 @@ button { font-family: inherit; }
 .nav__link.is-active { background: var(--accent-soft); color: var(--accent); }
 .nav__icon { width: 19px; height: 19px; display: inline-flex; }
 .nav__icon svg { width: 100%; height: 100%; }
-.sidebar__foot { display: flex; gap: 6px; padding-top: 14px; border-top: 1px solid var(--border); }
+.sidebar__foot { display: flex; align-items: center; gap: 6px; padding-top: 14px; border-top: 1px solid var(--border); }
+.sidebar__user { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; color: var(--ink-muted); }
 
 .brand-mark { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; background: var(--accent-soft); border-radius: 9px; }
 .brand-mark--sm { width: 30px; height: 30px; }
@@ -531,6 +532,8 @@ td.actions { text-align: right; white-space: nowrap; }
 .login__input { padding: 11px 13px; }
 .login__btn { margin-top: 6px; padding: 11px; font-size: 14px; }
 .login__err { color: var(--critical); font-size: 12.5px; min-height: 16px; }
+.login__hint { color: var(--ink-muted); font-size: 12.5px; margin: 0 0 8px; }
+.login__sso { display: flex; width: 100%; text-decoration: none; }
 .form-err { color: var(--critical); font-size: 12.5px; min-height: 16px; margin: 0; }
 /* Per-field guidance. Empty by default and collapsed via :empty so a field
    without help does not leave a gap. */

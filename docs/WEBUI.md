@@ -19,6 +19,29 @@ vendored chart library, committed to the repo under `internal/webui/static/`.
   check keeps a regularly used dashboard logged in. The token stays in an `HttpOnly` cookie —
   not `localStorage` — so page scripts can never read it.
 - All other `/api/*` require a valid cookie → 401 otherwise.
+- **Single sign-on (optional, replaces the password).** Setting `CLAUDE_PROXY_OAUTH_CLIENT_ID`
+  (compose: `.env` `OAUTH_*`) switches sign-in to an OpenID Connect provider through the
+  `vocauth` kit (`github.com/vocdoni/oauth/go`, `internal/webui/sso.go`): issuer
+  `CLAUDE_PROXY_OAUTH_ISSUER` (default `https://oauth.vocdoni.org`), `_CLIENT_SECRET`,
+  `_REDIRECT_URL` (must be `https://<host>/auth/callback`, exactly as registered), `_COOKIE_KEYS`
+  (comma-separated base64 32-byte keys), optional `_ALLOWED_EMAILS` (otherwise every verified
+  `@vocdoni.org` account), `_INSECURE=1` for a localhost dev provider only. Read from the
+  environment only, never flags. A half-configured SSO stops the server instead of falling back
+  to the password. In this mode:
+  - `GET /auth/login` (302 to the provider, PKCE S256), `GET /auth/callback`, `POST /auth/logout`
+    (same-origin form only) are the kit's routes; `POST /api/login` and `/api/logout` answer 404
+    and no password or `cpui_session` cookie opens anything.
+  - The session is the kit's encrypted `vocauth_session` cookie (HttpOnly, Secure, SameSite=Lax),
+    absolute 7 days (the kit's maximum; it does not slide).
+  - `GET /api/session` → `{"authenticated":bool,"method":"sso","user":{"email","name"}}`
+    (password mode answers `"method":"password"`); the SPA shows a *Sign in with Vocdoni* link
+    instead of the password field, the signed-in e-mail in the sidebar, and signs out with a
+    same-origin form POST (which does not end the browser's Google session).
+  - Because Lax lets the cookie ride a top-level cross-site navigation, every non-GET `/api/*`
+    call must also carry `Origin` equal to the redirect URL's origin (or, without `Origin`,
+    `Sec-Fetch-Site: same-origin`) → 403 otherwise. Each such change is logged with the
+    operator's e-mail.
+  - Sign-in starts and callbacks are rate-limited to 20 per IP per minute.
 - **Routing:** the UI is served at the root `/`. Reserved prefixes `/v1/`, `/admin/`, `/health`, `/api/` route to their handlers; every other path serves the SPA (deep-link fallback to index.html). `/ui` and `/ui/*` permanently redirect to `/`. `proxy.AuthMiddleware` passes non-`/v1/` non-`/admin/` paths through untouched when the UI is enabled (webui does its own cookie auth); with the UI disabled, unknown paths keep the pre-UI 401/404 behavior;
   same-origin only, no CORS headers needed.
 - If `TLS_DOMAIN` is set the cookie gets `Secure`. (Detected via `X-Forwarded-Proto: https`
@@ -364,7 +387,8 @@ queries must use the indexes on `request_log(ts)` / `usage_history(credential_id
 
 ## Frontend layout (SPA, hash-routing: #/dashboard #/usage #/credentials #/users)
 
-- **Login screen**: single password field.
+- **Login screen**: single password field, or a *Sign in with Vocdoni* link in SSO mode
+  (`?mock=1&sso=1` previews it offline).
 - **Dashboard**: header stat tiles and six aligned, equally sized chart panels:
   token totals, request totals, requests by user/credential, tokens by user/credential,
   latency, and new-session credential picks. A shared period selector
