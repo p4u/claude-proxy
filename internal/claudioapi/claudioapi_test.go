@@ -219,6 +219,27 @@ func TestConfigPicksCorrect1MDefaults(t *testing.T) {
 	}
 }
 
+// TestConfigOmitsAutoCompactWindow verifies that the config does not
+// recommend CLAUDE_CODE_AUTO_COMPACT_WINDOW (see defaultEnv).
+func TestConfigOmitsAutoCompactWindow(t *testing.T) {
+	cat := &fakeCatalogue{ok: true, entries: fakeEntries(), refreshedAt: time.Now()}
+	mux, _ := setupHandler(t, cat)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/claudio/config", nil)
+	rw := httptest.NewRecorder()
+	mux.ServeHTTP(rw, req)
+
+	var resp struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.NewDecoder(rw.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if v, present := resp.Env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]; present {
+		t.Errorf("CLAUDE_CODE_AUTO_COMPACT_WINDOW should be absent, got %q", v)
+	}
+}
+
 // TestConfigNoDefaultsWhenCatalogueEmpty verifies that the family env vars are
 // absent when the catalogue is empty.
 func TestConfigNoDefaultsWhenCatalogueEmpty(t *testing.T) {

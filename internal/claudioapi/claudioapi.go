@@ -245,12 +245,16 @@ type configResponse struct {
 
 // defaultEnv is the fixed set of env vars recommended for every claudio session.
 // The ANTHROPIC_DEFAULT_*_MODEL values are filled from the live catalogue.
+//
+// CLAUDE_CODE_AUTO_COMPACT_WINDOW is deliberately absent: Claude Code clamps it
+// to the window it believes the model has (its model table, or 1M for a "[1m]"
+// id), so it can never raise a window. It only hides the "model not recognized,
+// 200k assumed" notice and locks /autocompact.
 var defaultEnv = map[string]string{
 	"CLAUDE_CODE_USE_GATEWAY":                    "1",
 	"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
 	"CLAUDE_CODE_GATEWAY_HINT_HEADERS":           "1",
 	"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":   "1",
-	"CLAUDE_CODE_AUTO_COMPACT_WINDOW":            "1000000",
 	"API_TIMEOUT_MS":                             "30000",
 }
 
