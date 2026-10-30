@@ -122,6 +122,8 @@ func (s *Server) credAction(w http.ResponseWriter, r *http.Request, id, action s
 			"ok": true, "id": c.ID, "status": string(c.Status),
 			"endpoint": provider.ResolveBaseURL(c.Provider, c.BaseURL),
 		})
+	case action == "models" && r.Method == http.MethodPost:
+		s.setCustomModels(w, r, id)
 	case action == "weight" && r.Method == http.MethodPost:
 		var body struct {
 			Weight int `json:"weight"`
@@ -191,6 +193,91 @@ func (s *Server) credAction(w http.ResponseWriter, r *http.Request, id, action s
 	default:
 		writeErr(w, http.StatusNotFound, "not found")
 	}
+}
+
+// setCustomModels replaces a custom host's declared model list wholesale. The
+// host is not re-probed: the operator is correcting what the probe found (or
+// could not), so the submitted list is taken as the truth. The same id on
+// several credentials is allowed, since that is how hosts are pooled; only a
+// repeat within one list is refused.
+func (s *Server) setCustomModels(w http.ResponseWriter, r *http.Request, id string) {
+	ctx := r.Context()
+	var body struct {
+		Models []creds.Model `json:"models"`
+	}
+	if err := decodeJSON(w, r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	c, err := creds.Get(ctx, s.db, id)
+	if err != nil {
+		if errors.Is(err, creds.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if c.Provider != provider.Custom && c.Provider != provider.CustomOpenAI {
+		writeErr(w, http.StatusBadRequest, "provider "+string(c.Provider)+" has no editable model list")
+		return
+	}
+	models, err := validateCustomModels(c.Provider, body.Models)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := creds.SetModels(ctx, s.db, id, models); err != nil {
+		if errors.Is(err, creds.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	c, err = creds.Get(ctx, s.db, id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "id": id, "models": c.Models})
+}
+
+// validateCustomModels normalises and checks a submitted model list. An id may
+// not carry the provider's advertised prefix or a trailing "[1m]": the proxy
+// adds the first when it advertises the model and matchCustomModel strips the
+// second when it routes, so a declared name with either could never match.
+// Zero context_window / max_output mean "unknown" and are kept as such.
+func validateCustomModels(p provider.ID, in []creds.Model) ([]creds.Model, error) {
+	if len(in) == 0 {
+		return nil, errors.New("at least one model is required")
+	}
+	prefix := strings.ToLower(provider.Get(p).AdvertisePrefix)
+	seen := make(map[string]bool, len(in))
+	out := make([]creds.Model, 0, len(in))
+	for _, m := range in {
+		m.ID = strings.TrimSpace(m.ID)
+		m.DisplayName = strings.TrimSpace(m.DisplayName)
+		if m.ID == "" {
+			return nil, errors.New("model id must not be blank")
+		}
+		low := strings.ToLower(m.ID)
+		if seen[low] {
+			return nil, errors.New("duplicate model id " + m.ID)
+		}
+		seen[low] = true
+		if strings.HasSuffix(low, "[1m]") {
+			return nil, errors.New("model id " + m.ID + " must not end in [1m]")
+		}
+		if prefix != "" && strings.HasPrefix(low, prefix) {
+			return nil, errors.New("model id " + m.ID + " must not start with " + prefix)
+		}
+		if m.ContextWindow < 0 || m.MaxOutput < 0 {
+			return nil, errors.New("context_window and max_output must not be negative")
+		}
+		out = append(out, m)
+	}
+	return out, nil
 }
 
 func (s *Server) listCreds(w http.ResponseWriter, r *http.Request) {

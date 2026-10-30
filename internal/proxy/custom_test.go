@@ -139,3 +139,24 @@ func TestCustomModelsOmitUnknownContext(t *testing.T) {
 		t.Errorf("unknown context must be omitted, not zero: %v", byID["unknown"])
 	}
 }
+
+// The cached /v1/models body advertises display names and context windows, so
+// an edit to either must change the fingerprint, not wait out the TTL.
+func TestCatalogueFingerprintTracksModelFields(t *testing.T) {
+	mk := func(m creds.Model) []*creds.Credential {
+		return []*creds.Credential{{ID: "c1", Provider: provider.Custom, Status: creds.StatusActive, Models: []creds.Model{m}}}
+	}
+	base := catalogueFingerprint(mk(creds.Model{ID: "m", DisplayName: "M", ContextWindow: 1000, MaxOutput: 100}))
+	for name, m := range map[string]creds.Model{
+		"context window": {ID: "m", DisplayName: "M", ContextWindow: 2000, MaxOutput: 100},
+		"max output":     {ID: "m", DisplayName: "M", ContextWindow: 1000, MaxOutput: 200},
+		"display name":   {ID: "m", DisplayName: "N", ContextWindow: 1000, MaxOutput: 100},
+	} {
+		if catalogueFingerprint(mk(m)) == base {
+			t.Errorf("changing only %s left the fingerprint unchanged", name)
+		}
+	}
+	if catalogueFingerprint(mk(creds.Model{ID: "m", DisplayName: "M", ContextWindow: 1000, MaxOutput: 100})) != base {
+		t.Error("identical lists fingerprint differently")
+	}
+}

@@ -560,7 +560,9 @@ func catalogueFingerprint(list []*creds.Credential) string {
 		}
 		models := make([]string, 0, len(c.Models))
 		for _, m := range c.Models {
-			models = append(models, m.ID)
+			// Name and limits too: they are advertised, so editing one must
+			// not wait out the TTL.
+			models = append(models, strings.Join([]string{m.ID, m.DisplayName, strconv.Itoa(m.ContextWindow), strconv.Itoa(m.MaxOutput)}, "\x1f"))
 		}
 		rows = append(rows, string(credProvider(c))+"|"+c.ID+"|"+c.BaseURL+"|"+strings.Join(models, ","))
 	}

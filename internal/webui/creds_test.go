@@ -1,13 +1,18 @@
 package webui
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/p4u/claude-proxy/internal/creds"
+	"github.com/p4u/claude-proxy/internal/provider"
 	"github.com/p4u/claude-proxy/internal/store"
 )
 
@@ -246,6 +251,109 @@ func TestCredSettings(t *testing.T) {
 		// Tokens must never appear in the list response.
 		if strings.Contains(listed, "sk-test") {
 			t.Error("credential list exposed the API key after rename")
+		}
+	})
+}
+
+// TestCustomModelsEdit covers POST /credentials/{id}/models: wholesale
+// replacement for both custom provider types, and every rejection rule.
+func TestCustomModelsEdit(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "models.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	s := &Server{db: db}
+	ctx := context.Background()
+
+	anth, err := creds.InsertCustomKey(ctx, db, "anth-host", "sk-a", "https://a.example/", []creds.Model{{ID: "old"}}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oai, err := creds.InsertCustomOpenAIKey(ctx, db, "oai-host", "sk-o", "https://o.example/v1", []creds.Model{{ID: "old"}}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	glm, err := creds.InsertKey(ctx, db, provider.GLM, "glm", "pro", "sk-g", "", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	post := func(id, payload string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		s.credAction(rec, httptest.NewRequest(http.MethodPost, "/api/credentials/"+id+"/models", strings.NewReader(payload)), id, "models")
+		return rec
+	}
+
+	for _, c := range []*creds.Credential{anth, oai} {
+		t.Run("replaces list "+string(c.Provider), func(t *testing.T) {
+			rec := post(c.ID, `{"models":[{"id":" Alpha ","display_name":"Alpha","context_window":128000,"max_output":0},{"id":"beta"}]}`)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d %s", rec.Code, rec.Body.String())
+			}
+			var resp struct {
+				OK     bool          `json:"ok"`
+				ID     string        `json:"id"`
+				Models []creds.Model `json:"models"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatal(err)
+			}
+			want := []creds.Model{{ID: "Alpha", DisplayName: "Alpha", ContextWindow: 128000}, {ID: "beta"}}
+			if !resp.OK || resp.ID != c.ID || !reflect.DeepEqual(resp.Models, want) {
+				t.Fatalf("response = %+v, want models %+v", resp, want)
+			}
+			got, err := creds.Get(ctx, db, c.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got.Models, want) {
+				t.Fatalf("stored = %+v, want %+v", got.Models, want)
+			}
+		})
+	}
+
+	// Same id on several credentials is pooling, not a clash.
+	if rec := post(oai.ID, `{"models":[{"id":"beta"}]}`); rec.Code != http.StatusOK {
+		t.Errorf("id shared with another credential = %d %s", rec.Code, rec.Body.String())
+	}
+
+	for name, tc := range map[string]struct{ id, payload string }{
+		"non-custom provider": {glm.ID, `{"models":[{"id":"x"}]}`},
+		"empty list":          {anth.ID, `{"models":[]}`},
+		"missing list":        {anth.ID, `{}`},
+		"blank id":            {anth.ID, `{"models":[{"id":"  "}]}`},
+		"duplicate id":        {anth.ID, `{"models":[{"id":"Dup"},{"id":"dup"}]}`},
+		"1m suffix":           {anth.ID, `{"models":[{"id":"x[1m]"}]}`},
+		"1m suffix any case":  {oai.ID, `{"models":[{"id":"x[1M]"}]}`},
+		"anthropic prefix":    {anth.ID, `{"models":[{"id":"claude-x"}]}`},
+		"openai prefix":       {oai.ID, `{"models":[{"id":"Claude-OpenAI-x"}]}`},
+		"negative context":    {anth.ID, `{"models":[{"id":"x","context_window":-1}]}`},
+		"negative max output": {anth.ID, `{"models":[{"id":"x","max_output":-5}]}`},
+		"malformed json":      {anth.ID, `{"models":`},
+	} {
+		t.Run("rejects "+name, func(t *testing.T) {
+			before, _ := creds.Get(ctx, db, tc.id)
+			rec := post(tc.id, tc.payload)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d %s, want 400", rec.Code, rec.Body.String())
+			}
+			after, _ := creds.Get(ctx, db, tc.id)
+			if !reflect.DeepEqual(before.Models, after.Models) {
+				t.Errorf("rejected request changed the list: %+v -> %+v", before.Models, after.Models)
+			}
+		})
+	}
+
+	t.Run("non-custom message names the provider", func(t *testing.T) {
+		if body := post(glm.ID, `{"models":[{"id":"x"}]}`).Body.String(); !strings.Contains(body, "provider glm has no editable model list") {
+			t.Errorf("body = %s", body)
+		}
+	})
+
+	t.Run("unknown id", func(t *testing.T) {
+		if rec := post("cred_missing", `{"models":[{"id":"x"}]}`); rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d %s, want 404", rec.Code, rec.Body.String())
 		}
 	})
 }
