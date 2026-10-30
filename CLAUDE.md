@@ -356,6 +356,19 @@ Surfaces: `creds add-custom --url … [--model ID]…` for Anthropic hosts, and 
 web UI's two custom-host credential types (`POST /api/credentials/probe` then
 `/custom`).
 
+**Declared models are editable after creation** (`POST
+/api/credentials/{id}/models`, the web UI's *Edit models* on a custom row): a
+full-list replace through `creds.SetModels` — rename an id, set a context
+window the probe could not discover, add or drop entries. Validation keeps the
+stored list honest: trimmed non-empty ids, unique within the credential,
+non-negative windows (0 = unknown, the "omit rather than guess" rule), no
+advertise prefix and no `[1m]` suffix; the same id on several hosts stays
+allowed, that is pooling. `catalogueFingerprint` hashes the full model entries,
+not just ids, so an edit shows on the next `/v1/models` request instead of the
+5-minute TTL later. Renaming changes the advertised id — conversations pinned
+to the old name fail to resolve until the client switches models, which is
+inherent to a rename and only noted in the modal, not blocked.
+
 ### OpenAI Codex subscriptions (`internal/codexgateway/`)
 
 Codex is a separate provider backed by a private, pinned CLIProxyAPI Docker

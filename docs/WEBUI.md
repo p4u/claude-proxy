@@ -249,6 +249,20 @@ value claims.
   URL or key may have changed since. `models` overrides discovery; omitted, the
   discovered catalogue is used. `400` if the host is unusable or no model could
   be determined.
+- `POST /api/credentials/{id}/models` `{models:[{id,display_name?,context_window?,max_output?}]}`
+  → replace a custom host's declared model list after creation
+  (`creds.SetModels`): rename an id, set a context window the probe could not
+  discover, or add/remove entries. Ids are trimmed and must be non-empty and
+  unique within the credential (case-insensitive); `context_window`/`max_output`
+  must not be negative (0 = unknown, omitted from `/v1/models`); an id carrying
+  the advertise prefix (`claude-`, `claude-openai-`) or a trailing `[1m]` is
+  rejected — the former would be double-prefixed, the latter can never match a
+  request. The same id on several hosts stays allowed: that is pooling.
+  Renaming or removing an id changes what `/v1/models` advertises; sessions
+  addressed to the old id stop resolving until they switch models. `400` for
+  non-custom providers or an invalid list, `404` unknown id, `409` for
+  synthetic gateway rows. The catalogue cache follows on the next
+  `/v1/models` request: its fingerprint hashes the full model entries.
 - `POST /api/credentials/oauth/start` → `{session, url}`. Begins an Anthropic
   subscription sign-in from the browser (`internal/claudeoauth`), using Claude
   Code's own OAuth client and its manual-code flow: `url` is claude.com's
