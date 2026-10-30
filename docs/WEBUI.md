@@ -256,8 +256,9 @@ value claims.
   unique within the credential (case-insensitive); `context_window`/`max_output`
   must not be negative (0 = unknown, omitted from `/v1/models`); an id carrying
   the advertise prefix (`claude-`, `claude-openai-`) or a trailing `[1m]` is
-  rejected — the former would be double-prefixed, the latter can never match a
-  request. The same id on several hosts stays allowed: that is pooling.
+  rejected — the former would be advertised as if it were a native
+  Anthropic/Codex model, the latter can never match a request. The same id on
+  several hosts stays allowed: that is pooling.
   Renaming or removing an id changes what `/v1/models` advertises; sessions
   addressed to the old id stop resolving until they switch models. `400` for
   non-custom providers or an invalid list, `404` unknown id, `409` for

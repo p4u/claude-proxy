@@ -929,7 +929,7 @@ window.fetch = async (input, init = {}) => {
         if (seen.has(id.toLowerCase())) return json({ error: `duplicate model id "${id}"` }, 400);
         seen.add(id.toLowerCase());
         if (id.toLowerCase().startsWith(prefix)) return json({ error: `model id "${id}" must not start with "${prefix}"` }, 400);
-        if (id.endsWith("[1m]")) return json({ error: `model id "${id}" must not end with "[1m]"` }, 400);
+        if (id.toLowerCase().endsWith("[1m]")) return json({ error: `model id "${id}" must not end with "[1m]"` }, 400);
         const ctx = Number(m.context_window || 0), mx = Number(m.max_output || 0);
         if (ctx < 0 || mx < 0) return json({ error: "context_window and max_output must not be negative" }, 400);
         out.push({ id, display_name: String(m.display_name || "").trim() || id, context_window: ctx, max_output: mx });

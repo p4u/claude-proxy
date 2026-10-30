@@ -1197,7 +1197,7 @@ function editModelsModal(c, root) {
       if (seen.has(mid.toLowerCase())) throw new Error(`Duplicate model id "${mid}".`);
       seen.add(mid.toLowerCase());
       if (mid.toLowerCase().startsWith(prefix)) throw new Error(`Model id "${mid}" must not start with "${prefix}".`);
-      if (mid.endsWith("[1m]")) throw new Error(`Model id "${mid}" must not end with "[1m]".`);
+      if (mid.toLowerCase().endsWith("[1m]")) throw new Error(`Model id "${mid}" must not end with "[1m]".`);
       const ctx = parseTokenCount(ctxRaw);
       const out = parseTokenCount(outRaw);
       if ((ctxRaw && !ctx && ctxRaw !== "0") || (outRaw && !out && outRaw !== "0")) {

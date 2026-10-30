@@ -244,10 +244,12 @@ func (s *Server) setCustomModels(w http.ResponseWriter, r *http.Request, id stri
 }
 
 // validateCustomModels normalises and checks a submitted model list. An id may
-// not carry the provider's advertised prefix or a trailing "[1m]": the proxy
-// adds the first when it advertises the model and matchCustomModel strips the
-// second when it routes, so a declared name with either could never match.
-// Zero context_window / max_output mean "unknown" and are kept as such.
+// not carry the provider's advertised prefix or a trailing "[1m]": AdvertisedID
+// leaves an already-prefixed id alone, so the first would be advertised bare
+// and read as an Anthropic (or Codex) model while routing to this host, and
+// matchCustomModel strips the second when it routes, so a declared name with
+// it could never match. Zero context_window / max_output mean "unknown" and
+// are kept as such.
 func validateCustomModels(p provider.ID, in []creds.Model) ([]creds.Model, error) {
 	if len(in) == 0 {
 		return nil, errors.New("at least one model is required")
