@@ -177,7 +177,10 @@ func (h *Handler) serveOpenAIChat(w http.ResponseWriter, r *http.Request, start 
 		h.log.Error("counter bump", "err", err, "cred", cred.ID)
 	}
 
-	result := h.forward(w, r, body, cred, true, false, false)
+	// No requested-model echo on this surface: OpenAI SDK clients address
+	// <provider>/<native> ids directly and the upstream's own model string is
+	// the honest one.
+	result := h.forward(w, r, body, "", cred, true, false, false)
 	usage := result.usage
 	if usage.Model == "" {
 		usage.Model = wire

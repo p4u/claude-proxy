@@ -255,7 +255,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	result := h.forward(w, r, body, cred, true, captureReply, captureSummary)
+	result := h.forward(w, r, body, requestedModel, cred, true, captureReply, captureSummary)
 	result.complete = result.complete && !notice.failed && r.Context().Err() == nil
 	notice.complete = result.complete
 	if captureSummary && result.status == http.StatusOK && result.complete {
@@ -385,7 +385,11 @@ type forwardResult struct {
 // forward sends the request upstream and streams the response back. If
 // allowRetry is true and upstream returns 401, it refreshes the credential and
 // retries once, before any response bytes have been sent to the client.
-func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, cred *creds.Credential, allowRetry, captureText, captureSummary bool) (result forwardResult) {
+// requestedModel is the model exactly as the client sent it, before the
+// advertising alias was stripped. Successful responses carry it back to the
+// client (see restoreModel below), so what the client records about a turn is
+// a model it could pick again.
+func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, requestedModel string, cred *creds.Credential, allowRetry, captureText, captureSummary bool) (result forwardResult) {
 	// The upstream is a property of the credential, not of the proxy. GLM's
 	// base URL carries a path prefix (/api/anthropic), so this concatenates
 	// onto the base rather than swapping a host.
@@ -457,6 +461,21 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 		}
 	}
 
+	// The client picked an advertised alias (claude-glm-*, claude-openai-*…)
+	// but the upstream answers with its native model name, which the client
+	// records as the session's model and then cannot restore — Claude Code
+	// falls back to its default with a "Session model … could not be
+	// restored" warning (see responsemodel.go). Restore the client's own
+	// string in the response. Only when the two actually differ: Anthropic
+	// passthrough keeps its byte-for-byte guarantee.
+	restoreModel := ""
+	if requestedModel != "" && requestModel(body) != requestedModel {
+		restoreModel = requestedModel
+		// The rewriter needs plain bytes; without this header Go's transport
+		// negotiates gzip itself and decodes it transparently.
+		upstreamReq.Header.Del("Accept-Encoding")
+	}
+
 	h.log.Debug("upstream send",
 		"cred", cred.ID, "label", cred.Label,
 		"auth", maskBearer("Bearer "+cred.AccessToken))
@@ -479,7 +498,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 			resp.Header.Set("Content-Length", strconv.Itoa(len(raw)))
 			resp.Header.Del("Content-Encoding")
 		} else if openAIStream {
-			resp.Body = translateOpenAIStream(r.Context(), resp.Body)
+			resp.Body = translateOpenAIStream(r.Context(), resp.Body, requestedModel)
 			resp.ContentLength = -1
 			resp.Header.Set("Content-Type", "text/event-stream")
 			resp.Header.Del("Content-Length")
@@ -492,7 +511,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 				_ = creds.MarkError(r.Context(), h.db, cred.ID)
 				return forwardResult{status: -1}
 			}
-			translated, translateErr := translateOpenAIJSON(raw)
+			translated, translateErr := translateOpenAIJSON(raw, requestedModel)
 			if translateErr != nil {
 				http.Error(w, "translate response: "+translateErr.Error(), http.StatusBadGateway)
 				_ = creds.MarkError(r.Context(), h.db, cred.ID)
@@ -564,7 +583,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 			return forwardResult{status: http.StatusUnauthorized, errorType: errorType}
 		}
 		h.log.Info("refresh succeeded; retrying upstream", "cred", cred.ID)
-		return h.forward(w, r, body, fresh, false, captureText, captureSummary)
+		return h.forward(w, r, body, requestedModel, fresh, false, captureText, captureSummary)
 	}
 
 	if resp.StatusCode == http.StatusTooManyRequests {
@@ -602,6 +621,18 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 	}
 
 	defer resp.Body.Close()
+	// Alias restore on the response (see restoreModel above): the rewriter
+	// inspects the head of the body, so it is skipped for compressed bodies —
+	// a upstream that gzips against a deleted Accept-Encoding is left verbatim.
+	var rewriter *responseModelRewriter
+	if restoreModel != "" && resp.StatusCode == http.StatusOK && !isGzip(resp.Header.Get("Content-Encoding")) {
+		sse := isEventStream(resp.Header.Get("Content-Type"))
+		if sse || strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "json") {
+			rewriter = newResponseModelRewriter(restoreModel, sse)
+			// A rewritten body may differ in length from what the upstream declared.
+			resp.Header.Del("Content-Length")
+		}
+	}
 	for k, vs := range resp.Header {
 		for _, v := range vs {
 			w.Header().Add(k, v)
@@ -642,23 +673,38 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 			if resp.StatusCode >= 400 && len(errorBody) < errorBodyCap {
 				errorBody = append(errorBody, buf[:min(n, errorBodyCap-len(errorBody))]...)
 			}
-			nw, werr := w.Write(buf[:n])
-			if werr == nil && nw != n {
-				werr = io.ErrShortWrite
+			out := buf[:n]
+			if rewriter != nil {
+				// May hold bytes back while the head is undecided, so the
+				// usage capture and rxBytes keep counting the original chunk.
+				out = rewriter.filter(out)
 			}
-			if werr != nil {
-				h.log.Warn("client write error", "err", werr, "cred", cred.ID, "streamed", result.rxBytes)
-				return result
+			if len(out) > 0 {
+				nw, werr := w.Write(out)
+				if werr == nil && nw != len(out) {
+					werr = io.ErrShortWrite
+				}
+				if werr != nil {
+					h.log.Warn("client write error", "err", werr, "cred", cred.ID, "streamed", result.rxBytes)
+					return result
+				}
+				if flusher != nil {
+					flusher.Flush()
+				}
 			}
 			if cap != nil {
 				cap.Write(buf[:n])
 			}
 			result.rxBytes += int64(n)
-			if flusher != nil {
-				flusher.Flush()
-			}
 		}
 		if rerr == io.EOF {
+			if rewriter != nil {
+				if tail := rewriter.flush(); len(tail) > 0 {
+					if _, werr := w.Write(tail); werr == nil && flusher != nil {
+						flusher.Flush()
+					}
+				}
+			}
 			h.log.Debug("stream done",
 				"cred", cred.ID, "label", cred.Label, "status", resp.StatusCode, "bytes", result.rxBytes)
 			result.complete = resp.StatusCode >= 200 && resp.StatusCode < 300 && r.Context().Err() == nil &&
@@ -666,6 +712,12 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, c
 			return result
 		}
 		if rerr != nil {
+			if rewriter != nil {
+				// The upstream died mid-head: deliver whatever arrived.
+				if tail := rewriter.flush(); len(tail) > 0 {
+					_, _ = w.Write(tail)
+				}
+			}
 			h.log.Warn("upstream stream error", "err", rerr, "cred", cred.ID, "streamed", result.rxBytes)
 			return result
 		}

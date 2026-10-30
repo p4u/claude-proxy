@@ -212,7 +212,12 @@ func openAIImage(block map[string]any) map[string]any {
 	return map[string]any{"type": "image_url", "image_url": map[string]any{"url": imageURL}}
 }
 
-func translateOpenAIJSON(raw []byte) ([]byte, error) {
+// translateOpenAIJSON renders a Chat Completions response in the Messages
+// shape. requestedModel is echoed back as the response's model: hosts report
+// their own names (one even answers "assistant"), which the client would
+// record as the session's model and then refuse to restore. Empty falls back
+// to whatever the host said.
+func translateOpenAIJSON(raw []byte, requestedModel string) ([]byte, error) {
 	var in struct {
 		ID      string `json:"id"`
 		Model   string `json:"model"`
@@ -239,6 +244,10 @@ func translateOpenAIJSON(raw []byte) ([]byte, error) {
 		return nil, fmt.Errorf("OpenAI response contains no choices")
 	}
 	choice := in.Choices[0]
+	model := requestedModel
+	if model == "" {
+		model = in.Model
+	}
 	content := make([]any, 0, 1+len(choice.Message.ToolCalls))
 	text := openAIResponseText(choice.Message.Content)
 	if text == "" {
@@ -260,7 +269,7 @@ func translateOpenAIJSON(raw []byte) ([]byte, error) {
 	}
 	out := map[string]any{
 		"id": in.ID, "type": "message", "role": "assistant", "content": content,
-		"model": in.Model, "stop_reason": anthropicStopReason(choice.FinishReason),
+		"model": model, "stop_reason": anthropicStopReason(choice.FinishReason),
 		"stop_sequence": nil, "usage": anthropicUsage(in.Usage),
 	}
 	return json.Marshal(out)
@@ -341,13 +350,14 @@ func translateOpenAIError(raw []byte, status int) []byte {
 }
 
 // translateOpenAIStream exposes a live Anthropic SSE stream while consuming
-// OpenAI chat.completion.chunk events. The pipe preserves backpressure and
-// cancellation; it does not buffer a completion before returning it.
-func translateOpenAIStream(ctx context.Context, src io.ReadCloser) io.ReadCloser {
+// OpenAI chat.completion.chunk events. requestedModel is echoed back as the
+// response's model (see translateOpenAIJSON). The pipe preserves backpressure
+// and cancellation; it does not buffer a completion before returning it.
+func translateOpenAIStream(ctx context.Context, src io.ReadCloser, requestedModel string) io.ReadCloser {
 	pr, pw := io.Pipe()
 	go func() {
 		defer src.Close()
-		err := writeAnthropicStream(ctx, pw, src)
+		err := writeAnthropicStream(ctx, pw, src, requestedModel)
 		_ = pw.CloseWithError(err)
 	}()
 	return pr
@@ -359,7 +369,7 @@ type streamTool struct {
 	Args strings.Builder
 }
 
-func writeAnthropicStream(ctx context.Context, dst io.Writer, src io.Reader) error {
+func writeAnthropicStream(ctx context.Context, dst io.Writer, src io.Reader, requestedModel string) error {
 	scanner := bufio.NewScanner(src)
 	scanner.Buffer(make([]byte, 64*1024), 16<<20)
 	started := false
@@ -369,7 +379,8 @@ func writeAnthropicStream(ctx context.Context, dst io.Writer, src io.Reader) err
 	tools := map[int]*streamTool{}
 	finish := ""
 	usage := openAIUsage{}
-	id, model := "", ""
+	id := ""
+	model := requestedModel
 	emit := func(event string, payload any) error {
 		if err := ctx.Err(); err != nil {
 			return err

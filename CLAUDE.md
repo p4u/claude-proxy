@@ -172,9 +172,23 @@ does not recognise (`QQ` returns `null` outside its built-in table), so
 `AdvertisedID` applies it in the merged model list (with the display name tagged
 `(Z.AI GLM)` so the picker stays honest about the upstream), and `WireModel`
 strips it again in `rewriteModel` before forwarding — Z.AI rejects the prefixed
-name, so the alias must never escape the proxy. The native `glm-4.7` keeps
-routing normally for clients that address it directly (raw API calls, or
-`ANTHROPIC_DEFAULT_SONNET_MODEL=glm-4.7`).
+name, so the alias must never escape the proxy **towards the upstream**. The
+native `glm-4.7` keeps routing normally for clients that address it directly
+(raw API calls, or `ANTHROPIC_DEFAULT_SONNET_MODEL=glm-4.7`).
+
+**The alias is deliberately reinstated on the way back**
+(`internal/proxy/responsemodel.go`). Claude Code copies the model a response
+reports into the session record and tries to restore it on resume; upstreams
+answer with their native name (`glm-4.7`, `gpt-6-astra`, or — on one custom
+host — the literal `"assistant"`), a string the client never picked, so the
+session falls back with a "Session model … could not be restored" warning. When
+the wire model differs from what the client asked for, the proxy rewrites the
+`message_start` event's model (or the JSON body's top-level field) back to the
+client's own string and strips `Accept-Encoding` so Go's transport decodes the
+gzip transparently. Anthropic passthrough stays byte-identical (wire ==
+requested), the usage capture keeps reading the original bytes (so
+`request_log` records the native model), and the OpenAI-compatible surface is
+untouched — there the upstream's own string is the honest one.
 
 Ordering in `ForModel` is load-bearing: aliases are matched **before** native
 prefixes, because `claude-glm-4.7` also starts with Anthropic's `claude-`, so a

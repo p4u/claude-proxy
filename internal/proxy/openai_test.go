@@ -69,7 +69,9 @@ func TestCustomOpenAITranslatesMessagesAndTools(t *testing.T) {
 			t.Errorf("translated tools = %#v", tools)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"id":"chatcmpl_1","model":"local-model","choices":[{"message":{"role":"assistant","content":"Checking","tool_calls":[{"id":"call_1","type":"function","function":{"name":"weather","arguments":"{\"city\":\"Madrid\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":12,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":3}}}`)
+		// The host answers with a model name of its own — here the literal
+		// "assistant" some translation shims report — never the client's id.
+		fmt.Fprint(w, `{"id":"chatcmpl_1","model":"assistant","choices":[{"message":{"role":"assistant","content":"Checking","tool_calls":[{"id":"call_1","type":"function","function":{"name":"weather","arguments":"{\"city\":\"Madrid\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":12,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":3}}}`)
 	})
 
 	body := `{"model":"claude-openai-local-model","max_tokens":64,"system":"Be concise","messages":[{"role":"user","content":"Weather?"},{"role":"assistant","content":[{"type":"tool_use","id":"old_call","name":"lookup","input":{"q":"x"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"old_call","content":"done"}]}],"tools":[{"name":"weather","description":"Get weather","input_schema":{"type":"object"}}],"tool_choice":{"type":"any"}}`
@@ -80,6 +82,7 @@ func TestCustomOpenAITranslatesMessagesAndTools(t *testing.T) {
 	}
 	var out struct {
 		Type       string `json:"type"`
+		Model      string `json:"model"`
 		StopReason string `json:"stop_reason"`
 		Content    []struct {
 			Type  string         `json:"type"`
@@ -96,6 +99,11 @@ func TestCustomOpenAITranslatesMessagesAndTools(t *testing.T) {
 	}
 	if out.Type != "message" || out.StopReason != "tool_use" || len(out.Content) != 2 {
 		t.Fatalf("translated response = %s", rec.Body.String())
+	}
+	// The client's own id is echoed back, never the host's "assistant": a
+	// restored session would otherwise record a model no client recognizes.
+	if out.Model != "claude-openai-local-model" {
+		t.Errorf("response model = %q, want the client's claude-openai-local-model", out.Model)
 	}
 	if out.Content[0].Text != "Checking" || out.Content[1].Name != "weather" || out.Content[1].Input["city"] != "Madrid" {
 		t.Errorf("translated content = %#v", out.Content)
@@ -130,7 +138,8 @@ func TestCustomOpenAITranslatesStreamingTextAndToolCalls(t *testing.T) {
 		t.Fatalf("stream response = %d %s", rec.Code, rec.Body.String())
 	}
 	for _, want := range []string{
-		"event: message_start", `"text":"Hi ","type":"text_delta"`,
+		"event: message_start", `"model":"claude-openai-local-model"`,
+		`"text":"Hi ","type":"text_delta"`,
 		`"id":"call_9","input":{},"name":"lookup","type":"tool_use"`,
 		`"partial_json":"{\"q\":\"x\"}","type":"input_json_delta"`,
 		`"stop_reason":"tool_use"`, "event: message_stop",
