@@ -120,6 +120,9 @@ export const api = {
   // Atomically update a credential's display label and selection weight.
   updateCredSettings: (id, { label = "", weight } = {}) =>
     request("POST", `/credentials/${enc(id)}/settings`, { label, weight }),
+  // Replace a custom-host credential's declared model list.
+  updateCredModels: (id, models) =>
+    request("POST", `/credentials/${enc(id)}/models`, { models }),
   // Sidecar channels (CLIProxyAPI): "codex" for OpenAI Codex, "gemini" for
   // Google Gemini via Antigravity. Same endpoints under /api/<channel>/.
   sidecar: (ch) => ({

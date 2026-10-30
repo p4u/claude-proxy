@@ -912,6 +912,31 @@ window.fetch = async (input, init = {}) => {
       else if (credentialAction[2] === "weight") c.weight = JSON.parse(init.body || "{}").weight;
       return json({ ok: true });
     }
+    const mdl = path.match(/^\/credentials\/([^/]+)\/models$/);
+    if (mdl && method === "POST") {
+      const b = JSON.parse(init.body || "{}");
+      const c = CREDS.find((x) => x.id === decodeURIComponent(mdl[1]));
+      if (!c) return json({ error: "not found" }, 404);
+      const p = providerOf(c);
+      if (p !== "custom" && p !== "custom_openai") return json({ error: "model list is only editable on custom hosts" }, 400);
+      if (!Array.isArray(b.models) || !b.models.length) return json({ error: "at least one model is required" }, 400);
+      const prefix = p === "custom_openai" ? "claude-openai-" : "claude-";
+      const seen = new Set();
+      const out = [];
+      for (const m of b.models) {
+        const id = String(m.id || "").trim();
+        if (!id) return json({ error: "model id must not be empty" }, 400);
+        if (seen.has(id.toLowerCase())) return json({ error: `duplicate model id "${id}"` }, 400);
+        seen.add(id.toLowerCase());
+        if (id.toLowerCase().startsWith(prefix)) return json({ error: `model id "${id}" must not start with "${prefix}"` }, 400);
+        if (id.endsWith("[1m]")) return json({ error: `model id "${id}" must not end with "[1m]"` }, 400);
+        const ctx = Number(m.context_window || 0), mx = Number(m.max_output || 0);
+        if (ctx < 0 || mx < 0) return json({ error: "context_window and max_output must not be negative" }, 400);
+        out.push({ id, display_name: String(m.display_name || "").trim() || id, context_window: ctx, max_output: mx });
+      }
+      c.models = out;
+      return json({ ok: true, id: c.id, models: out });
+    }
     const epm = path.match(/^\/credentials\/([^/]+)\/endpoint$/);
     if (epm && method === "POST") {
       const b = JSON.parse(init.body || "{}");

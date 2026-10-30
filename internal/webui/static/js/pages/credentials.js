@@ -235,6 +235,10 @@ function credCard(c, root) {
       label: "Change endpoint",
       onClick: () => endpointModal(c, root),
     }] : []),
+    ...(c.provider === "custom" || c.provider === "custom_openai" ? [{
+      label: "Edit models",
+      onClick: () => editModelsModal(c, root),
+    }] : []),
     ...(!isKey ? [
       {
         label: "Refresh token",
@@ -1142,6 +1146,97 @@ function endpointModal(c, root) {
           } finally {
             btn.disabled = false;
             btn.textContent = orig;
+          }
+        },
+      }),
+    ],
+  });
+  return m;
+}
+
+// ---------------------------------------------------------------------------
+// Edit models modal — replace a custom host's declared model list
+// ---------------------------------------------------------------------------
+
+function editModelsModal(c, root) {
+  const id = c.id || c.credential_id;
+  const prefix = c.provider === "custom_openai" ? "claude-openai-" : "claude-";
+  const err = el("p", { class: "form-err", role: "alert" });
+  const list = el("div", { class: "form" });
+
+  const numVal = (n) => (Number(n) > 0 ? String(n) : "");
+  function addRow(m = {}) {
+    const row = el("div", { class: "model-row", style: "display:flex;gap:6px;align-items:center;margin-bottom:6px" });
+    const mk = (cls, ph, value, label, extra = "") => el("input", {
+      class: `input input--sm ${cls}`, type: "text", placeholder: ph, value,
+      "aria-label": label, style: extra,
+    });
+    row.append(
+      mk("model-id", "id", m.id || "", "Model id", "flex:2;min-width:0"),
+      mk("model-name", "Name", m.display_name && m.display_name !== m.id ? m.display_name : "", "Display name", "flex:2;min-width:0"),
+      mk("model-ctx", "ctx", numVal(m.context_window), "Context window", "flex:1;min-width:0"),
+      mk("model-out", "out", numVal(m.max_output), "Max output", "flex:1;min-width:0"),
+      button("Remove", { onClick: () => row.remove() }),
+    );
+    list.append(row);
+    return row;
+  }
+  (c.models || []).forEach(addRow);
+  if (!list.children.length) addRow();
+
+  function collect() {
+    const models = [];
+    const seen = new Set();
+    for (const row of list.querySelectorAll(".model-row")) {
+      const mid = row.querySelector(".model-id").value.trim();
+      const name = row.querySelector(".model-name").value.trim();
+      const ctxRaw = row.querySelector(".model-ctx").value.trim();
+      const outRaw = row.querySelector(".model-out").value.trim();
+      if (!mid && !name && !ctxRaw && !outRaw) continue; // blank row
+      if (!mid) throw new Error("Every model needs an id.");
+      if (seen.has(mid.toLowerCase())) throw new Error(`Duplicate model id "${mid}".`);
+      seen.add(mid.toLowerCase());
+      if (mid.toLowerCase().startsWith(prefix)) throw new Error(`Model id "${mid}" must not start with "${prefix}".`);
+      if (mid.endsWith("[1m]")) throw new Error(`Model id "${mid}" must not end with "[1m]".`);
+      const ctx = parseTokenCount(ctxRaw);
+      const out = parseTokenCount(outRaw);
+      if ((ctxRaw && !ctx && ctxRaw !== "0") || (outRaw && !out && outRaw !== "0")) {
+        throw new Error(`Model "${mid}": use numbers like 262000, 262k or 1M for ctx/out.`);
+      }
+      models.push({ id: mid, display_name: name || mid, context_window: ctx, max_output: out });
+    }
+    if (!models.length) throw new Error("Declare at least one model.");
+    return models;
+  }
+
+  const m = modal({
+    title: "Edit models",
+    subtitle: `Models declared by ${c.label || id}.`,
+    body: el("div", { class: "form" }, [
+      list,
+      button("Add model", { onClick: () => addRow() }),
+      el("p", { class: "field-help", text: "Renaming or removing an id changes the advertised model; existing sessions on it must switch. ctx/out accept 262000, 262k or 1M; leave blank if unknown." }),
+      err,
+    ]),
+    actions: [
+      button("Cancel", { onClick: () => m.close() }),
+      button("Save models", {
+        kind: "primary",
+        onClick: async (ev) => {
+          const btn = ev.currentTarget;
+          err.textContent = "";
+          let models;
+          try { models = collect(); } catch (e) { err.textContent = e.message; return; }
+          btn.disabled = true;
+          try {
+            await api.updateCredModels(id, models);
+            m.close();
+            toast("Models updated", "good");
+            render(root);
+          } catch (e) {
+            err.textContent = e.message || "Could not update models.";
+          } finally {
+            btn.disabled = false;
           }
         },
       }),
