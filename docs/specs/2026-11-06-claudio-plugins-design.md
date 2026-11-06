@@ -1,6 +1,6 @@
 # Claudio plugins and browser login: design
 
-Status: audited   Class: architectural
+Status: approved (2026-11-06)   Class: architectural
 Owner decisions so far (2026-11-06):
 - Plugin content (skills, agents, hooks, MCP list) lives in a git repo and is released as a zip; the proxy serves only the pinned bundle reference and the secret env.
 - `claudio proxy login` uses a device-style flow: one-time code, browser sign-in at the proxy, polling.
