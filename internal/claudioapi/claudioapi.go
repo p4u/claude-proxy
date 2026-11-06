@@ -17,6 +17,7 @@
 //	GET /v1/claudio/session?id= — which credential serves a Claude Code session
 //	POST /v1/claudio/session/switch — move a session to another credential
 //	GET /v1/claudio/plugins    — plugins to load, with their env (user token only)
+//	POST /v1/claudio/login/start, /login/poll — device login (no credential; login.go)
 //
 // Security isolation
 //
@@ -81,6 +82,12 @@ type Handler struct {
 	// per-identity rate limiter
 	rateMu   sync.Mutex
 	rateBkts map[string]*bucket
+
+	// logins backs the device login; nil (no SSO) answers both routes 404.
+	logins *Logins
+	// Per-IP limits of the login routes, which skip the identity bucket.
+	startLimit *ipLimiter
+	pollLimit  *ipLimiter
 }
 
 // CatalogueSource is the subset of the proxy.Handler interface that the
@@ -106,9 +113,11 @@ type CatalogueSource interface {
 // "/v1/claudio" is intercepted before ServeMux sees it.
 func New(mux *http.ServeMux, db *store.DB, cat CatalogueSource) *Handler {
 	h := &Handler{
-		db:       db,
-		cat:      cat,
-		rateBkts: make(map[string]*bucket),
+		db:         db,
+		cat:        cat,
+		rateBkts:   make(map[string]*bucket),
+		startLimit: newIPLimiter(loginStartPerMinute),
+		pollLimit:  newIPLimiter(loginPollPerMinute),
 	}
 	// Belt-and-suspenders: also register on the mux for the plain (non-encoded)
 	// case so that any path-through the guard reaches the correct handler.
@@ -174,6 +183,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		strings.Contains(r.URL.Path, "..") ||
 		strings.Contains(r.URL.Path, "//") {
 		writeJSON(w, http.StatusNotFound, apiError("not_found", "claudio: invalid path encoding"))
+		return
+	}
+
+	// The device-login routes carry no credential (every caller would share
+	// the "anon" bucket): they replace it with per-IP limits of their own.
+	// Matched exactly, like the AuthMiddleware exemption.
+	if r.URL.Path == loginStartPath || r.URL.Path == loginPollPath {
+		h.serveLogin(w, r)
 		return
 	}
 

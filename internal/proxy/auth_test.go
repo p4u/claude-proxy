@@ -207,3 +207,59 @@ func TestAuthMiddlewareRevokedTokenWithNoAdminToken(t *testing.T) {
 		}
 	})
 }
+
+// TestAuthMiddlewareClaudioLoginExempt: the two device-login routes pass with
+// no credential and with a stale one (ignored, never validated), and carry no
+// identity; look-alike paths get no exemption.
+func TestAuthMiddlewareClaudioLoginExempt(t *testing.T) {
+	ctx := context.Background()
+	db := openDB(t)
+	ut, err := usertoken.Create(ctx, db, "frank")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := usertoken.SetStatus(ctx, db, ut.ID, usertoken.StatusDisabled); err != nil {
+		t.Fatal(err)
+	}
+	var hit bool
+	var gotID *usertoken.Identity
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit, gotID = true, usertoken.FromContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+	})
+	h := AuthMiddleware("admin-secret", db, true, inner)
+
+	cases := []struct {
+		name, path, bearer string
+		wantCode           int
+		wantHit            bool
+	}{
+		{"start, no credential", "/v1/claudio/login/start", "", 200, true},
+		{"poll, no credential", "/v1/claudio/login/poll", "", 200, true},
+		{"start, stale bearer", "/v1/claudio/login/start", ut.Token, 200, true},
+		{"poll, stale bearer", "/v1/claudio/login/poll", "garbage", 200, true},
+		{"poll, admin bearer ignored", "/v1/claudio/login/poll", "admin-secret", 200, true},
+		{"startx is not exempt", "/v1/claudio/login/startx", "", 401, false},
+		{"dot segment is not exempt", "/v1/claudio/login/../poll", "", 401, false},
+		{"trailing slash is not exempt", "/v1/claudio/login/start/", "", 401, false},
+		{"encoded slash is not exempt", "/v1/claudio/login%2Fstart", "", 401, false},
+		{"other claudio route still needs auth", "/v1/claudio/plugins", "", 401, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hit, gotID = false, nil
+			req := httptest.NewRequest(http.MethodPost, "http://x"+tc.path, nil)
+			if tc.bearer != "" {
+				req.Header.Set("Authorization", "Bearer "+tc.bearer)
+			}
+			rw := httptest.NewRecorder()
+			h.ServeHTTP(rw, req)
+			if rw.Code != tc.wantCode || hit != tc.wantHit {
+				t.Fatalf("got %d hit=%v, want %d hit=%v; body=%s", rw.Code, hit, tc.wantCode, tc.wantHit, rw.Body.String())
+			}
+			if hit && gotID != nil {
+				t.Fatalf("login route carried identity %+v", gotID)
+			}
+		})
+	}
+}

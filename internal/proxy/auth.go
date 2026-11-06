@@ -13,7 +13,9 @@ import (
 // AuthMiddleware authenticates incoming requests.
 //
 // Priority order:
-//  1. /health — always public.
+//  1. /health — always public. So are claudio's two device-login routes
+//     (/v1/claudio/login/start and /poll, exact escaped path): any credential
+//     on them is ignored, never validated, and no identity is attached.
 //  2. When uiEnabled, any path that is not /v1/*, /openai/v1/* or /admin/* is
 //     passed through untouched — the web UI (mounted at "/") does its own
 //     cookie auth.
@@ -28,6 +30,14 @@ import (
 func AuthMiddleware(adminToken string, db *store.DB, uiEnabled bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// claudio's login runs before the client holds a token, and a stale
+		// token must not turn it into a 401. The escaped path is compared
+		// exactly, so encoded or dot-segment variants are not exempt and the
+		// raw-path guard in claudioapi still sees what the client sent.
+		if p := r.URL.EscapedPath(); p == "/v1/claudio/login/start" || p == "/v1/claudio/login/poll" {
 			next.ServeHTTP(w, r)
 			return
 		}
