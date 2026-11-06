@@ -335,6 +335,35 @@ func TestLoginEvictsOldestPastTotal(t *testing.T) {
 	}
 }
 
+func TestLoginEvictsDecidedBeforeOldest(t *testing.T) {
+	s := newLoginStack(t)
+	first, _, err := s.logins.start("203.0.113.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	denied, deniedCode, err := s.logins.start("203.0.113.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.logins.Deny(deniedCode) {
+		t.Fatal("deny failed")
+	}
+	for i := 2; i < maxLogins; i++ {
+		if _, _, err := s.logins.start(fmt.Sprintf("203.0.%d.%d", i/250, i%250)); err != nil {
+			t.Fatalf("start %d: %v", i, err)
+		}
+	}
+	if _, _, err := s.logins.start("198.51.100.9"); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := s.logins.poll(hashCode(denied)); st != pollUnknown {
+		t.Fatalf("denied entry not evicted before the oldest pending: %v", st)
+	}
+	if st, _ := s.logins.poll(hashCode(first)); st != pollPending {
+		t.Fatalf("oldest pending login evicted while a decided one existed: %v", st)
+	}
+}
+
 func TestLoginMalformedAndUnknown(t *testing.T) {
 	s := newLoginStack(t)
 	for _, body := range []string{"", "{", `{"device_code":""}`, `{"device_code":7}`} {

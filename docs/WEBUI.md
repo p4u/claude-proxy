@@ -31,7 +31,7 @@ vendored chart library, committed to the repo under `internal/webui/static/`.
   environment only, never flags. A half-configured SSO stops the server instead of falling back
   to the password. In this mode:
   - Sign-in and administration are split: every verified account of a login domain gets a
-    session, but every `/api/*` route except `/api/session` answers `403 {"error":"not an
+    session, but every `/api/*` route except `/api/session` (and `/api/login`, `/api/logout`, which stay 404 under SSO) answers `403 {"error":"not an
     administrator"}` unless the e-mail is in `_ALLOWED_EMAILS` (when that list is set). Every
     `_ALLOWED_EMAILS` address must belong to a login domain: otherwise the server refuses to
     start, naming the address and the domains.

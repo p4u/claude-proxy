@@ -157,7 +157,15 @@ func (l *Logins) start(ip string) (deviceCode, userCode string, err error) {
 		}
 	}
 	for len(l.byHash) >= maxLogins {
-		l.removeLocked(l.order.Front().Value.(*loginEntry))
+		// Prefer an entry that is already decided or expired; else the oldest.
+		victim := l.order.Front().Value.(*loginEntry)
+		for el := l.order.Front(); el != nil; el = el.Next() {
+			if e := el.Value.(*loginEntry); e.state == stateDenied || !now.Before(e.expires) {
+				victim = e
+				break
+			}
+		}
+		l.removeLocked(victim)
 	}
 	e := &loginEntry{hash: hashCode(deviceCode), userCode: userCode, ip: ip, expires: now.Add(LoginTTL)}
 	e.elem = l.order.PushBack(e)
