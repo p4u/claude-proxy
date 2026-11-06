@@ -632,7 +632,7 @@ Before this, a key added seconds after a refresh stayed invisible for 5 minutes.
 
 | Package | Role |
 |---|---|
-| `cmd/claude-proxy/` | CLI entry point; `serve`, `tui`, `creds`, and `users` subcommands |
+| `cmd/claude-proxy/` | CLI entry point; `serve`, `tui`, `creds`, `users` and `plugins` subcommands |
 | `internal/tui/` | Interactive Bubble Tea management UI (credentials + users tabs) for `claude-proxy tui` |
 | `internal/webui/` | Embedded browser dashboard (`go:embed`), served at `/` when `CLAUDE_PROXY_UI_PASSWORD` or single sign-on (`CLAUDE_PROXY_OAUTH_*`, replaces the password) is set (old `/ui` 308-redirects); cookie-authenticated JSON API under `/api` (contract: `docs/WEBUI.md`) |
 | `internal/provider/` | Per-upstream behaviour table (base URL, model prefixes, refreshability, usage API, `[1m]` support) |
@@ -645,7 +645,8 @@ Before this, a key added seconds after a refresh stayed invisible for 5 minutes.
 | `internal/ingest/` | OAuth `.credentials.json` parser/importer; stores web OAuth sign-ins (`ImportOAuth`, `UpdateFromOAuth`) |
 | `internal/claudeoauth/` | Anthropic subscription sign-in from the web UI: Claude Code's manual-code OAuth flow (PKCE verifier kept in memory, code exchange, profile-based plan detection) |
 | `internal/admin/` | Admin REST API (`/admin/*` routes) |
-| `internal/usertoken/` | Named per-user bearer tokens; request identity (`Identity{IsAdmin,FullCapture,...}` in context); output-token usage limits (`limit.go`) |
+| `internal/plugins/` | Plugins served to claudio (`plugins`, `plugin_env` tables): every validation limit; CLI, `/api/plugins` and `/v1/claudio/plugins` all call it. Env values only leave through `ListForClient` |
+| `internal/usertoken/` | Named per-user bearer tokens (optional unique `email`, `CreateForEmail`/`LookupByEmail` for the claudio login); request identity (`Identity{IsAdmin,FullCapture,...}` in context); output-token usage limits (`limit.go`) |
 | `internal/usage/` | Anthropic usage API client, background poller, history storage + asciigraph chart |
 | `internal/prettylog/` | Custom slog handler with per-credential color output |
 
@@ -775,7 +776,7 @@ without storing raw upstream error text.
 
 ### Storage Schema (SQLite)
 
-Eight tables (`internal/store/schema.go`): `credentials` (incl. `provider`:
+Tables (`internal/store/schema.go`), among them `plugins` and `plugin_env` (claudio plugins, env values are secrets) and `user_tokens.email` (unique when set, partial index added in the ALTER list): `credentials` (incl. `provider`:
 `anthropic` | `glm` | `mimo` | `codex` | `gemini` | `privatemode` | `custom` | `custom_openai`, added via
 the swallow-duplicate `ALTER TABLE` mechanism — its `DEFAULT 'anthropic'` is
 what migrates existing rows, no backfill needed),
@@ -1072,9 +1073,35 @@ sees them (see "Namespace reservation" below).
 | `GET` | `/v1/claudio/pool/health` | same as /v1/* | Coarse provider availability |
 | `GET` | `/v1/claudio/session?id=<claude_session_id>` | same as /v1/* | Which credential serves a Claude Code session |
 | `POST` | `/v1/claudio/session/switch` | same as /v1/* | Move a Claude Code session to another credential |
+| `GET` | `/v1/claudio/plugins` | user token only | Enabled plugins: bundle `{url,sha256}`, `installed_id`, env (secrets); `no-store` |
+| `POST` | `/v1/claudio/login/start` | **none** (SSO configured, else 404) | Device login: `{device_code,user_code,verify_url,interval_s:3,expires_in_s:600}` |
+| `POST` | `/v1/claudio/login/poll` | **none** (SSO configured, else 404) | `{device_code}` → 428/429/200 `{token,email,name}`/410/403/404 |
 
 Unknown paths return a local 404; wrong methods return 405. Neither is written
 to `request_log`.
+
+### Device login (`login.go`, `internal/webui/claudiologin.go`)
+
+`AuthMiddleware` exempts exactly the escaped paths `/v1/claudio/login/start`
+and `/v1/claudio/login/poll`: no identity is attached and a bearer on them is
+ignored, never validated (a stale token must not 401 a login). `ServeHTTP`
+dispatches them before the per-identity bucket, with per-IP fixed-window
+limits instead (start 5/min, poll 40/min; `clientIP` = first
+`X-Forwarded-For`). `claudioapi.Logins` holds pending logins in memory keyed by
+`SHA-256(device_code)` plus the user code (never the plaintext device code,
+never a token): ≤ 8 pending per IP (`429 too_many_pending`), ≤ 4096 total
+(oldest evicted), swept every minute; denied/expired entries answer 403/410
+for 10 min. A poll < 3 s after the previous one is `429 slow_down` without
+touching the IP budget. Approval happens on the web UI page `/claudio/login`
+(`vocauth.Require`, login-domain re-check, same-origin POST — `Origin: null`
+is accepted only with `Sec-Fetch-Site: same-origin`, because the page's
+`Referrer-Policy: no-referrer` makes browsers send null — CSP/XFO/no-store
+headers, no script): it finds or creates the member's token by e-mail
+(`usertoken.CreateForEmail`, `CLAUDIO_DEFAULT_LIMIT`) and stores only the user
+id on the entry. Redemption moves approved → redeeming under the lock (one
+poll wins), re-reads the user (missing → 404, not active → 403 denied) and
+returns its current token. `main.go` wires one `Logins` into both
+(`claudioH.SetLogins`, `webui.Options.Logins`) only when SSO is on.
 
 ### Session → credential (`/v1/claudio/session`)
 
@@ -1165,8 +1192,8 @@ anonymous.  The fix:
    never selects a credential, and never makes an outbound HTTP request.
 2. **No `request_log` writes.** The handler does not call `logRequest`. A test
    asserts zero rows after hitting all endpoints (including bypass paths).
-3. **`/me/stats` identity check.** Admin tokens and anonymous callers (nil or
-   empty `UserTokenID`) receive 403. Queries are scoped by `user_token_id` so
+3. **`/me/stats` and `/plugins` identity check.** Admin tokens and anonymous
+   callers (nil or empty `UserTokenID`) receive 403. Queries are scoped by `user_token_id` so
    user A cannot see user B's data.
 4. **`/pool/health` opacity.** Only a coarse status string per provider is
    returned (`ok|busy|saturated|unavailable`). No credential IDs, labels, raw

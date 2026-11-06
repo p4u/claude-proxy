@@ -891,7 +891,10 @@ the proxy refuses to start otherwise. Sessions last 7 days.
 - **Credentials** — the same actions as the TUI (import, enable/disable,
   refresh, re-weight, update tokens, delete), plus OpenAI Codex OAuth account
   connection and management, from a browser.
-- **Users** — create/rotate/disable/delete per-user bearer tokens, with
+- **Plugins** — the plugins served to claudio: bundle reference, enable,
+  delete, and write-only environment variables (keys shown, values never).
+- **Users** — create/rotate/disable/delete per-user bearer tokens (with the
+  member's e-mail when the token came from a claudio login), with
   per-user stats, a per-user prompt history, an opt-in full-conversation
   capture toggle with a message viewer and markdown export (see below), and a
   per-user usage limit with a live meter (see below).
@@ -973,6 +976,72 @@ accounts appear in the main Credentials table, where they can be disabled,
 weighted, reauthorized, or deleted. Codex weights compete only with other
 Codex accounts. GPT models are advertised to Claude Code as
 `claude-gpt-*` and restored to `gpt-*` on the sidecar wire.
+
+## claudio: browser login and plugins
+
+[claudio](https://github.com/p4u/claudio) talks to the proxy under
+`/v1/claudio` (local routes, never forwarded upstream nor written to
+`request_log`). Two of them onboard a member without an admin:
+
+**Browser login** (needs single sign-on, see [Web UI](#web-ui); without it
+both routes answer 404). `claudio proxy login` calls
+`POST /v1/claudio/login/start`, prints `https://<host>/claudio/login` and an
+8-character code, and polls `POST /v1/claudio/login/poll` every 3 s. The
+member opens the page, signs in with Google, types the code and approves it.
+A verified account of a `CLAUDE_PROXY_LOGIN_DOMAINS` domain with no user
+token gets one on its first approval (name = e-mail, limit =
+`CLAUDIO_DEFAULT_LIMIT`, e.g. `"--tokens 1M --window 24h"`, the arguments of
+`users limit`; empty = unlimited); later logins return the same token. A
+disabled user is refused. Codes live 10 minutes, in memory only (a restart
+drops pending logins), and only the terminal that started a login can redeem
+it. The two login routes are the only `/v1/claudio` routes without a
+credential; a bearer sent to them is ignored. Limits: 5 starts and 40 polls
+per minute per client IP, 8 pending logins per IP, 4096 in total.
+
+The approval page needs a browser that sends `Sec-Fetch-Site` (Safari before
+16.4 does not): such a browser cannot approve a login and sees "your browser
+is too old for this flow"; use a current Chrome, Firefox or Safari 16.4+.
+The per-IP limits read the first `X-Forwarded-For` entry, so they are
+meaningful only when the proxy is reached through Traefik (the compose
+default) or another reverse proxy that overwrites that header; do not expose
+port 8787 directly. A Traefik configured to trust forwarded headers from
+clients (`forwardedHeaders.insecure` or `trustedIPs` covering them) defeats
+the per-IP limits.
+
+| Poll reply | Meaning |
+|---|---|
+| `428 {"error":"authorization_pending"}` | not approved yet |
+| `429 {"error":"slow_down"}` | polled faster than every 3 s (or the IP budget is spent) |
+| `200 {token,email,name}` | approved; the login is consumed |
+| `410 {"error":"expired"}` / `403 {"error":"denied"}` | expired / denied (or the user is disabled) |
+| `404 {"error":"unknown_code"}` | never existed, already used, or the proxy restarted |
+
+Set `OAUTH_ALLOWED_EMAILS` to the administrators **before** members use the
+browser login, or every member who signs in can use the web UI.
+
+**Plugins.** `GET /v1/claudio/plugins` (user tokens only; admin and
+anonymous get 403; `Cache-Control: no-store`) lists the enabled plugins each
+member's claudio loads: a pinned bundle (a release zip of the content repo,
+URL and SHA-256; the proxy never downloads it) and the environment its MCP
+servers and hooks need, secrets included. Every enabled plugin's env goes to
+every active user token; disabling or deleting the user is the revocation.
+Manage them from the web UI's **Plugins** page (values are entered once and
+never shown again) or the CLI, which opens the database directly:
+
+```bash
+claude-proxy plugins set vocdoni-internal --version 1.4.0 \
+  --url https://github.com/vocdoni/skills/releases/download/v1.4.0/vocdoni-internal.zip \
+  --sha256 "$(sha256sum vocdoni-internal.zip | cut -d' ' -f1)" \
+  --installed-id vocdoni-internal@vocdoni
+printf '%s\n' "$KB_TOKEN" "$NOTION_TOKEN" | \
+  claude-proxy plugins env set vocdoni-internal VOCDONI_KB_TOKEN=- NOTION_TOKEN=-
+claude-proxy plugins env set vocdoni-internal --env-file ./plugin.env   # KEY=VALUE lines
+claude-proxy plugins env list vocdoni-internal                          # keys only
+claude-proxy plugins list | enable | disable | delete <name>
+```
+
+`KEY=VALUE` on the command line is accepted but visible in `ps`; prefer
+`KEY=-` (stdin) or `--env-file`.
 
 ## Operator workflow with `make`
 
@@ -1066,12 +1135,20 @@ claude-proxy creds rm            <id>
 claude-proxy creds refresh       <id>
 claude-proxy creds set-weight    <id> <weight>
 
-claude-proxy users create        --name NAME
-claude-proxy users list
+claude-proxy users create        --name NAME [--email ADDR]
+claude-proxy users list                        # includes each token's e-mail
+claude-proxy users email         <id> <addr>   # refuses an address on another token
 claude-proxy users stats         [<id>] [--period 1h|6h|24h|7d|30d]
 claude-proxy users token         <id>
 claude-proxy users disable|enable|rm|refresh  <id>
 claude-proxy users limit         <id> --tokens 1M --window 24h | --none
+
+claude-proxy plugins list
+claude-proxy plugins set         <name> --version V --url https://… --sha256 HEX [--installed-id ID]
+claude-proxy plugins enable|disable|delete <name>
+claude-proxy plugins env set     <name> KEY=-… | --env-file PATH | KEY=VALUE
+claude-proxy plugins env unset   <name> KEY…
+claude-proxy plugins env list    <name>
 ```
 
 `--auth-token` falls back to `CLAUDE_PROXY_AUTH_TOKEN` env var. All `creds`
@@ -1165,8 +1242,12 @@ rr_cursor(k, idx)
 
 user_tokens(
   id, name, token, status, created_at, last_used_at, full_capture,
-  limit_units, limit_window_seconds   -- per-user usage cap; 0/0 = unlimited
+  limit_units, limit_window_seconds,  -- per-user usage cap; 0/0 = unlimited
+  email                               -- member e-mail, unique when set
 )
+
+plugins(name, version, bundle_url, bundle_sha256, installed_id, enabled, updated_at)
+plugin_env(plugin, key, value)        -- secrets served to claudio
 ```
 
 Tokens are stored in plaintext (file mode 0600). KMS / vault integration is
