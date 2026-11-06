@@ -168,7 +168,12 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	writeJSON(w, map[string]any{"authenticated": authenticated, "method": "password"})
+	reply := map[string]any{"authenticated": authenticated, "method": "password"}
+	if authenticated {
+		// The UI password is the administrator's: every password session is one.
+		reply["admin"] = true
+	}
+	writeJSON(w, reply)
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {

@@ -14,7 +14,8 @@ vendored chart library, committed to the repo under `internal/webui/static/`.
   `secret` is 32 random bytes generated once and persisted in the `app_secret` table. Sessions
   therefore survive restarts and deploys, and changing the password ends all of them.
   Sessions last 30 days. 429 after 5 failed attempts per IP per minute.
-- `POST /api/logout` clears the cookie. `GET /api/session` → `{"authenticated":bool}`; a
+- `POST /api/logout` clears the cookie. `GET /api/session` → `{"authenticated":bool}`
+  (plus `"admin":true` when authenticated: the password is the administrator's); a
   valid session past half its lifetime is re-issued there (sliding expiry), so the page-load
   check keeps a regularly used dashboard logged in. The token stays in an `HttpOnly` cookie —
   not `localStorage` — so page scripts can never read it.
@@ -24,17 +25,26 @@ vendored chart library, committed to the repo under `internal/webui/static/`.
   `vocauth` kit (`github.com/vocdoni/oauth/go`, `internal/webui/sso.go`): issuer
   `CLAUDE_PROXY_OAUTH_ISSUER` (default `https://oauth.vocdoni.org`), `_CLIENT_SECRET`,
   `_REDIRECT_URL` (must be `https://<host>/auth/callback`, exactly as registered), `_COOKIE_KEYS`
-  (comma-separated base64 32-byte keys), optional `_ALLOWED_EMAILS` (otherwise every verified
-  `@vocdoni.org` account), `_INSECURE=1` for a localhost dev provider only. Read from the
+  (comma-separated base64 32-byte keys), optional `_ALLOWED_EMAILS` (the administrators;
+  empty makes every signed-in account one), `CLAUDE_PROXY_LOGIN_DOMAINS` (who may sign in at
+  all, default `vocdoni.org`), `_INSECURE=1` for a localhost dev provider only. Read from the
   environment only, never flags. A half-configured SSO stops the server instead of falling back
   to the password. In this mode:
+  - Sign-in and administration are split: every verified account of a login domain gets a
+    session, but every `/api/*` route except `/api/session` answers `403 {"error":"not an
+    administrator"}` unless the e-mail is in `_ALLOWED_EMAILS` (when that list is set). Every
+    `_ALLOWED_EMAILS` address must belong to a login domain: otherwise the server refuses to
+    start, naming the address and the domains.
   - `GET /auth/login` (302 to the provider, PKCE S256), `GET /auth/callback`, `POST /auth/logout`
     (same-origin form only) are the kit's routes; `POST /api/login` and `/api/logout` answer 404
     and no password or `cpui_session` cookie opens anything.
   - The session is the kit's encrypted `vocauth_session` cookie (HttpOnly, Secure, SameSite=Lax),
     absolute 7 days (the kit's maximum; it does not slide).
-  - `GET /api/session` → `{"authenticated":bool,"method":"sso","user":{"email","name"}}`
-    (password mode answers `"method":"password"`); the SPA shows a *Sign in with Vocdoni* link
+  - `GET /api/session` → `{"authenticated":bool,"method":"sso","user":{"email","name"},"admin":bool}`
+    (`user` and `admin` only when authenticated; password mode answers `"method":"password"`).
+    `admin` is whether the e-mail may use `/api/*`; when it is `false` the SPA shows one line,
+    "Signed in as <e-mail>. This account is not an administrator; claudio login is at
+    /claudio/login.", instead of the admin shell. Otherwise the SPA shows a *Sign in with Vocdoni* link
     instead of the password field, the signed-in e-mail in the sidebar, and signs out with a
     same-origin form POST (which does not end the browser's Google session).
   - Because Lax lets the cookie ride a top-level cross-site navigation, every non-GET `/api/*`

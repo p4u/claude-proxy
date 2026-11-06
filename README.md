@@ -856,13 +856,21 @@ OAUTH_CLIENT_ID=claude-proxy
 OAUTH_CLIENT_SECRET=...                     # from the provider registration
 OAUTH_REDIRECT_URL=https://<TLS_DOMAIN>/auth/callback
 OAUTH_COOKIE_KEYS=$(openssl rand -base64 32)
-# OAUTH_ALLOWED_EMAILS=alice@example.org,bob@example.org   # optional narrowing
+OAUTH_ALLOWED_EMAILS=alice@vocdoni.org,bob@vocdoni.org     # the administrators
+# CLAUDE_PROXY_LOGIN_DOMAINS=vocdoni.org                   # who may sign in (default)
 ```
 
 With `OAUTH_CLIENT_ID` set the password login is switched off (`UI_PASSWORD`
-is ignored and `/api/login` answers 404); without it nothing changes. By
-default only verified accounts of the provider's domain (`vocdoni.org`) are
-admitted. Sessions last 7 days.
+is ignored and `/api/login` answers 404); without it nothing changes.
+Sign-in and administration are separate: every verified account of a
+`CLAUDE_PROXY_LOGIN_DOMAINS` domain (default `vocdoni.org`) can sign in, which
+is what the claudio browser login needs, but only the addresses in
+`OAUTH_ALLOWED_EMAILS` may use the web UI and its `/api` (anyone else gets
+`403 not an administrator`). When `OAUTH_ALLOWED_EMAILS` is empty every
+signed-in account is an administrator, as before; the proxy logs a warning
+at start in that case, and it must be set before members use `claudio proxy
+login`. Every administrator's domain must be in `CLAUDE_PROXY_LOGIN_DOMAINS`;
+the proxy refuses to start otherwise. Sessions last 7 days.
 
 **Features:**
 

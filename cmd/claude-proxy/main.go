@@ -309,6 +309,9 @@ func runServe(args []string) {
 			if *uiPassword != "" {
 				logger.Warn("web UI password ignored: single sign-on is configured")
 			}
+			if !sso.HasAdminList() {
+				logger.Warn("CLAUDE_PROXY_OAUTH_ALLOWED_EMAILS is empty: every account that can sign in is a web UI administrator; set it before enabling claudio browser login")
+			}
 		}
 		logger.Info("web UI enabled", "path", "/", "login", login, "secure_cookies", secureCookies)
 	}
@@ -343,26 +346,36 @@ func runServe(args []string) {
 // CLAUDE_PROXY_OAUTH_CLIENT_ID is set and then replaces the password login;
 // unset, it returns nil and the password login applies. They are read from
 // the environment only, never flags, so the client secret stays out of ps.
+//
+// CLAUDE_PROXY_OAUTH_ALLOWED_EMAILS lists the administrators (empty: every
+// signed-in user is one); CLAUDE_PROXY_LOGIN_DOMAINS lists the domains whose
+// verified accounts may sign in at all (default vocdoni.org).
 func ssoFromEnv() (*webui.SSO, error) {
 	clientID := strings.TrimSpace(os.Getenv("CLAUDE_PROXY_OAUTH_CLIENT_ID"))
 	if clientID == "" {
 		return nil, nil
 	}
-	var emails []string
-	for e := range strings.SplitSeq(os.Getenv("CLAUDE_PROXY_OAUTH_ALLOWED_EMAILS"), ",") {
+	return webui.NewSSO(webui.SSOConfig{
+		Issuer:       strings.TrimSpace(os.Getenv("CLAUDE_PROXY_OAUTH_ISSUER")),
+		ClientID:     clientID,
+		ClientSecret: os.Getenv("CLAUDE_PROXY_OAUTH_CLIENT_SECRET"),
+		RedirectURL:  strings.TrimSpace(os.Getenv("CLAUDE_PROXY_OAUTH_REDIRECT_URL")),
+		CookieKeys:   os.Getenv("CLAUDE_PROXY_OAUTH_COOKIE_KEYS"),
+		AdminEmails:  splitList(os.Getenv("CLAUDE_PROXY_OAUTH_ALLOWED_EMAILS")),
+		LoginDomains: splitList(os.Getenv("CLAUDE_PROXY_LOGIN_DOMAINS")),
+		Insecure:     isTruthy(os.Getenv("CLAUDE_PROXY_OAUTH_INSECURE")),
+	})
+}
+
+// splitList splits a comma-separated env value, dropping empty items.
+func splitList(v string) []string {
+	var out []string
+	for e := range strings.SplitSeq(v, ",") {
 		if e = strings.TrimSpace(e); e != "" {
-			emails = append(emails, e)
+			out = append(out, e)
 		}
 	}
-	return webui.NewSSO(webui.SSOConfig{
-		Issuer:        strings.TrimSpace(os.Getenv("CLAUDE_PROXY_OAUTH_ISSUER")),
-		ClientID:      clientID,
-		ClientSecret:  os.Getenv("CLAUDE_PROXY_OAUTH_CLIENT_SECRET"),
-		RedirectURL:   strings.TrimSpace(os.Getenv("CLAUDE_PROXY_OAUTH_REDIRECT_URL")),
-		CookieKeys:    os.Getenv("CLAUDE_PROXY_OAUTH_COOKIE_KEYS"),
-		AllowedEmails: emails,
-		Insecure:      isTruthy(os.Getenv("CLAUDE_PROXY_OAUTH_INSECURE")),
-	})
+	return out
 }
 
 func runTUI(args []string) {

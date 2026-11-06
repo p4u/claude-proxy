@@ -55,9 +55,27 @@ function showLogin() {
 }
 
 function showApp() {
+  // A signed-in member (claudio login only) is not an administrator: every
+  // /api route would answer 403, so show one line instead of the admin shell.
+  if (session.admin === false) {
+    showNotAdmin();
+    return;
+  }
   if (!shellBuilt) buildShell();
   if (!location.hash || !ROUTES[currentRoute()]) location.hash = "#/dashboard";
   route();
+}
+
+// The e-mail goes in as text, never as HTML.
+function showNotAdmin() {
+  shellBuilt = false;
+  clear(appRoot);
+  const who = session.user && session.user.email ? session.user.email : "an unknown account";
+  appRoot.append(el("main", { class: "login-shell" }, [
+    el("p", {
+      text: `Signed in as ${who}. This account is not an administrator; claudio login is at /claudio/login.`,
+    }),
+  ]));
 }
 
 // Single sign-on sign-out must be a same-origin form POST: the provider kit

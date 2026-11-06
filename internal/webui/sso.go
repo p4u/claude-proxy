@@ -2,9 +2,11 @@ package webui
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -25,9 +27,13 @@ type SSOConfig struct {
 	// CookieKeys is a comma-separated list of base64 32-byte keys; the first
 	// encrypts, any decrypts (rotation).
 	CookieKeys string
-	// AllowedEmails narrows sign-in to these addresses. Empty admits every
-	// verified account of the provider's domain (vocdoni.org).
-	AllowedEmails []string
+	// AdminEmails are the administrators: only they may use /api/*. Empty
+	// makes every signed-in user an administrator (the behaviour before
+	// member sign-in existed).
+	AdminEmails []string
+	// LoginDomains admits every verified account of these domains to a
+	// session (admins and members alike). Empty means DefaultLoginDomain.
+	LoginDomains []string
 	// Insecure allows http:// URLs and drops the Secure cookie attribute.
 	// Local development against a dev provider only.
 	Insecure bool
@@ -35,6 +41,9 @@ type SSOConfig struct {
 
 // DefaultSSOIssuer is the central Vocdoni sign-in service.
 const DefaultSSOIssuer = "https://oauth.vocdoni.org"
+
+// DefaultLoginDomain is the login domain when SSOConfig.LoginDomains is empty.
+const DefaultLoginDomain = "vocdoni.org"
 
 // ssoSessionAge is the sign-in lifetime. It is absolute, not sliding, so it
 // is set to the kit's maximum: the password session this replaces lasted 30
@@ -48,6 +57,10 @@ type SSO struct {
 	// origin is scheme://host of the redirect URL, the form a browser sends
 	// in the Origin header; state-changing API calls must come from it.
 	origin string
+	// admins is the lower-cased AdminEmails; empty = every signed-in user.
+	admins map[string]bool
+	// domains is the lower-cased LoginDomains.
+	domains map[string]bool
 }
 
 // NewSSO validates cfg. It does no network I/O: the provider is discovered
@@ -68,22 +81,61 @@ func NewSSO(cfg SSOConfig) (*SSO, error) {
 	if u.Path != "/auth/callback" {
 		return nil, errors.New("sso: redirect URL path must be /auth/callback")
 	}
+	domains := make(map[string]bool)
+	for _, d := range cfg.LoginDomains {
+		if d = strings.ToLower(strings.TrimSpace(d)); d != "" {
+			domains[d] = true
+		}
+	}
+	if len(domains) == 0 {
+		domains[DefaultLoginDomain] = true
+	}
+	allowed := make([]string, 0, len(domains))
+	for d := range domains {
+		allowed = append(allowed, d)
+	}
+	slices.Sort(allowed)
+	admins := make(map[string]bool)
+	for _, e := range cfg.AdminEmails {
+		if e = strings.ToLower(strings.TrimSpace(e)); e != "" {
+			admins[e] = true
+		}
+	}
+	// An administrator outside every login domain could never sign in: fail
+	// at start instead of locking the operator out of the web UI silently.
+	for e := range admins {
+		if !domains[e[strings.LastIndexByte(e, '@')+1:]] {
+			return nil, fmt.Errorf("sso: administrator %s is outside the login domains %s; add its domain to CLAUDE_PROXY_LOGIN_DOMAINS",
+				e, strings.Join(allowed, ","))
+		}
+	}
 	limiter := newSignInLimiter()
+	// Every verified account of a login domain may hold a session; who may
+	// administer is decided per request by isAdmin, not at sign-in.
 	auth, err := vocauth.New(vocauth.Config{
-		Issuer:        issuer,
-		ClientID:      cfg.ClientID,
-		ClientSecret:  cfg.ClientSecret,
-		RedirectURL:   cfg.RedirectURL,
-		CookieKeys:    keys,
-		AllowedEmails: cfg.AllowedEmails,
-		MaxAge:        ssoSessionAge,
-		Insecure:      cfg.Insecure,
-		Limiter:       func(r *http.Request) bool { return limiter.allow(clientIP(r)) },
+		Issuer:         issuer,
+		ClientID:       cfg.ClientID,
+		ClientSecret:   cfg.ClientSecret,
+		RedirectURL:    cfg.RedirectURL,
+		CookieKeys:     keys,
+		AllowedDomains: allowed,
+		MaxAge:         ssoSessionAge,
+		Insecure:       cfg.Insecure,
+		Limiter:        func(r *http.Request) bool { return limiter.allow(clientIP(r)) },
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &SSO{auth: auth, origin: originOf(u)}, nil
+	return &SSO{auth: auth, origin: originOf(u), admins: admins, domains: domains}, nil
+}
+
+// HasAdminList reports whether AdminEmails was set. Without it every member
+// who can sign in is an administrator.
+func (s *SSO) HasAdminList() bool { return len(s.admins) > 0 }
+
+// isAdmin reports whether email may use the admin API.
+func (s *SSO) isAdmin(email string) bool {
+	return len(s.admins) == 0 || s.admins[strings.ToLower(email)]
 }
 
 // originOf is scheme://host lower-cased and without a default port, the form
@@ -169,15 +221,23 @@ func (s *Server) handleSSOSession(w http.ResponseWriter, r *http.Request) {
 		"authenticated": true,
 		"method":        "sso",
 		"user":          map[string]string{"email": u.Email, "name": u.Name},
+		// admin tells the SPA whether to build the admin shell: a member
+		// signed in for the claudio login gets a one-line page instead.
+		"admin": s.sso.isAdmin(u.Email),
 	})
 }
 
 // ssoAuthorize gates an /api request in SSO mode and logs who changed what,
-// since the e-mail is now the operator's identity.
+// since the e-mail is now the operator's identity. Only administrators pass:
+// a member signed in for the claudio login gets 403.
 func (s *Server) ssoAuthorize(w http.ResponseWriter, r *http.Request) bool {
 	u, ok := s.sso.user(w, r)
 	if !ok {
 		writeErr(w, http.StatusUnauthorized, "authentication required")
+		return false
+	}
+	if !s.sso.isAdmin(u.Email) {
+		writeErr(w, http.StatusForbidden, "not an administrator")
 		return false
 	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {

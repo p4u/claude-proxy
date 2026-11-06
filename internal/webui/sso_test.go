@@ -98,12 +98,22 @@ func (op *fakeOP) sign(t *testing.T, claims map[string]any) string {
 
 func newSSOServer(t *testing.T, issuer string) (*store.DB, http.Handler) {
 	t.Helper()
+	return newSSOServerWith(t, issuer, nil)
+}
+
+// newSSOServerWith is newSSOServer with a hook to adjust the SSO config.
+func newSSOServerWith(t *testing.T, issuer string, mut func(*SSOConfig)) (*store.DB, http.Handler) {
+	t.Helper()
 	db, _ := newTestServer(t)
 	keys := base64.StdEncoding.EncodeToString(make([]byte, vocauth.KeySize))
-	sso, err := NewSSO(SSOConfig{
+	cfg := SSOConfig{
 		Issuer: issuer, ClientID: ssoClientID, ClientSecret: "secret",
 		RedirectURL: ssoOrigin + "/auth/callback", CookieKeys: keys, Insecure: true,
-	})
+	}
+	if mut != nil {
+		mut(&cfg)
+	}
+	sso, err := NewSSO(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,11 +263,148 @@ func TestNewSSORejectsBadConfig(t *testing.T) {
 		"short key":     func(c *SSOConfig) { c.CookieKeys = "c2hvcnQ=" },
 		"no secret":     func(c *SSOConfig) { c.ClientSecret = "" },
 		"plain http":    func(c *SSOConfig) { c.RedirectURL = "http://p.test/auth/callback" },
+		"bad domain":    func(c *SSOConfig) { c.LoginDomains = []string{"a@b"} },
 	} {
 		c := good
 		mut(&c)
 		if _, err := NewSSO(c); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+func TestSSOAdminEmailsGateAPI(t *testing.T) {
+	op := newFakeOP(t)
+	_, h := newSSOServerWith(t, op.srv.URL, func(c *SSOConfig) {
+		c.AdminEmails = []string{" Boss@Vocdoni.org "}
+	})
+
+	// A member of the login domain signs in but is not an administrator.
+	member, cb := signIn(t, h, op)
+	if member == nil {
+		t.Fatalf("member sign-in refused: %d %s", cb.Code, cb.Body.String())
+	}
+	w := do(t, h, http.MethodGet, "/api/overview", "", member)
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "not an administrator") {
+		t.Fatalf("member /api/overview = %d %s, want 403 not an administrator", w.Code, w.Body.String())
+	}
+	if w := do(t, h, http.MethodGet, "/api/users", "", member); w.Code != http.StatusForbidden {
+		t.Fatalf("member /api/users = %d, want 403", w.Code)
+	}
+
+	op.mu.Lock()
+	op.email = "boss@vocdoni.org"
+	op.mu.Unlock()
+	admin, cb := signIn(t, h, op)
+	if admin == nil {
+		t.Fatalf("admin sign-in refused: %d %s", cb.Code, cb.Body.String())
+	}
+	if w := do(t, h, http.MethodGet, "/api/overview", "", admin); w.Code != http.StatusOK {
+		t.Fatalf("admin /api/overview = %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestSSOLoginDomains(t *testing.T) {
+	op := newFakeOP(t)
+	op.email = "mallory@example.com"
+	_, h := newSSOServerWith(t, op.srv.URL, func(c *SSOConfig) {
+		c.LoginDomains = []string{"example.com"}
+	})
+	if sess, cb := signIn(t, h, op); sess == nil {
+		t.Fatalf("login-domain account refused: %d %s", cb.Code, cb.Body.String())
+	}
+	op.mu.Lock()
+	op.email = "alice@vocdoni.org"
+	op.mu.Unlock()
+	if sess, cb := signIn(t, h, op); sess != nil || cb.Code != http.StatusForbidden {
+		t.Fatalf("account outside the login domains: code %d, session %v", cb.Code, sess)
+	}
+}
+
+func TestSSOAdminListReported(t *testing.T) {
+	keys := base64.StdEncoding.EncodeToString(make([]byte, vocauth.KeySize))
+	cfg := SSOConfig{ClientID: "c", ClientSecret: "s", RedirectURL: "https://p.test/auth/callback", CookieKeys: keys}
+	open, err := NewSSO(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if open.HasAdminList() {
+		t.Fatal("no AdminEmails: HasAdminList = true")
+	}
+	cfg.AdminEmails = []string{"boss@vocdoni.org"}
+	closed, err := NewSSO(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !closed.HasAdminList() {
+		t.Fatal("AdminEmails set: HasAdminList = false")
+	}
+}
+
+// An administrator outside every login domain could never sign in, so the
+// proxy refuses to start rather than lock the operator out silently.
+func TestNewSSOAdminOutsideLoginDomains(t *testing.T) {
+	keys := base64.StdEncoding.EncodeToString(make([]byte, vocauth.KeySize))
+	cfg := SSOConfig{
+		ClientID: "c", ClientSecret: "s", RedirectURL: "https://p.test/auth/callback", CookieKeys: keys,
+		AdminEmails: []string{"ops@example.com"},
+	}
+	_, err := NewSSO(cfg)
+	if err == nil {
+		t.Fatal("admin outside the default login domain: accepted")
+	}
+	for _, want := range []string{"ops@example.com", "vocdoni.org", "CLAUDE_PROXY_LOGIN_DOMAINS"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q", err, want)
+		}
+	}
+	cfg.LoginDomains = []string{"vocdoni.org", "example.com"}
+	if _, err := NewSSO(cfg); err != nil {
+		t.Fatalf("admin inside an added login domain: %v", err)
+	}
+}
+
+// sessionAdmin reads the "admin" field of GET /api/session; present reports
+// whether the field was in the reply at all.
+func sessionAdmin(t *testing.T, h http.Handler, c *http.Cookie) (admin, present bool) {
+	t.Helper()
+	w := do(t, h, http.MethodGet, "/api/session", "", c)
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("session reply %q: %v", w.Body.String(), err)
+	}
+	v, present := body["admin"]
+	admin, _ = v.(bool)
+	return admin, present
+}
+
+func TestSSOSessionReportsAdmin(t *testing.T) {
+	op := newFakeOP(t)
+	_, h := newSSOServerWith(t, op.srv.URL, func(c *SSOConfig) {
+		c.AdminEmails = []string{"boss@vocdoni.org"}
+	})
+	member, cb := signIn(t, h, op)
+	if member == nil {
+		t.Fatalf("member sign-in refused: %d %s", cb.Code, cb.Body.String())
+	}
+	if admin, present := sessionAdmin(t, h, member); !present || admin {
+		t.Fatalf("member session: admin=%v present=%v, want false/true", admin, present)
+	}
+	op.mu.Lock()
+	op.email = "boss@vocdoni.org"
+	op.mu.Unlock()
+	boss, cb := signIn(t, h, op)
+	if boss == nil {
+		t.Fatalf("admin sign-in refused: %d %s", cb.Code, cb.Body.String())
+	}
+	if admin, present := sessionAdmin(t, h, boss); !present || !admin {
+		t.Fatalf("admin session: admin=%v present=%v, want true/true", admin, present)
+	}
+}
+
+func TestPasswordSessionReportsAdmin(t *testing.T) {
+	_, h := newTestServer(t)
+	if admin, present := sessionAdmin(t, h, loginCookie(t, h)); !present || !admin {
+		t.Fatalf("password session: admin=%v present=%v, want true/true", admin, present)
 	}
 }
