@@ -38,6 +38,11 @@ type Server struct {
 	codex   *codexgateway.Client
 	// claudeLogin holds in-flight Anthropic browser sign-ins.
 	claudeLogin *claudeoauth.Flow
+	// logins is the claudio API's pending device logins, approved on
+	// /claudio/login; nil turns the page off.
+	logins LoginApprover
+	// defaultLimit is given to members created at their first claudio login.
+	defaultLimit MemberLimit
 
 	codexOAuthMu   sync.Mutex
 	codexOAuthLast time.Time
@@ -65,6 +70,11 @@ type Options struct {
 	SSO           *SSO
 	SecureCookies bool
 	Codex         *codexgateway.Client
+	// Logins enables the claudio approval page (/claudio/login); it needs
+	// SSO. Nil leaves the page a 404.
+	Logins LoginApprover
+	// DefaultLimit is the usage limit of members created by a claudio login.
+	DefaultLimit MemberLimit
 }
 
 // NewWithOptions builds the web UI handler.
@@ -91,6 +101,8 @@ func NewWithOptions(db *store.DB, refresher *creds.Refresher, opts Options) http
 		limiter:       newLoginLimiter(),
 		codex:         codex,
 		claudeLogin:   claudeoauth.New(),
+		logins:        opts.Logins,
+		defaultLimit:  opts.DefaultLimit,
 	}
 }
 
@@ -111,6 +123,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case s.sso != nil && strings.HasPrefix(path, "/auth/"):
 		// GET /auth/login, GET /auth/callback, POST /auth/logout.
 		s.sso.auth.Routes().ServeHTTP(w, r)
+	case path == claudioLoginPath:
+		s.serveClaudioLogin(w, r)
 	case path == "/api" || strings.HasPrefix(path, "/api/"):
 		s.serveAPI(w, r, strings.TrimPrefix(path, "/api"))
 	default:

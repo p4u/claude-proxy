@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -292,11 +293,29 @@ func runServe(args []string) {
 		fmt.Fprintf(os.Stderr, "web UI single sign-on: %v\n", err)
 		os.Exit(1)
 	}
+	memberTokens, memberWindow, err := parseDefaultLimit(os.Getenv("CLAUDIO_DEFAULT_LIMIT"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "CLAUDIO_DEFAULT_LIMIT: %v\n", err)
+		os.Exit(1)
+	}
+	// claudio's browser login needs SSO: the member approves the code on
+	// /claudio/login after signing in. Without SSO both login routes are 404.
+	var logins webui.LoginApprover
+	if sso != nil {
+		l := claudioapi.NewLogins(sso.LoginURL())
+		claudioH.SetLogins(l)
+		go l.Run(ctx)
+		logins = l
+		logger.Info("claudio browser login enabled", "verify_url", sso.LoginURL(),
+			"default_limit_tokens", memberTokens, "default_limit_window_s", memberWindow)
+	}
 	uiEnabled := *uiPassword != "" || sso != nil
 	if uiEnabled {
 		secureCookies := isTruthy(os.Getenv("CLAUDE_PROXY_UI_SECURE_COOKIES"))
 		uiH := webui.NewWithOptions(db, r, webui.Options{
 			Password: *uiPassword, SSO: sso, SecureCookies: secureCookies, Codex: codexClient,
+			Logins:       logins,
+			DefaultLimit: webui.MemberLimit{OutputTokens: memberTokens, WindowSeconds: memberWindow},
 		})
 		// The UI owns the root: reserved prefixes (/v1/, /openai/v1/, /admin/, /health) are
 		// registered above and win by ServeMux's longest-match rule; everything
@@ -1085,37 +1104,12 @@ func usersLimit(ctx context.Context, args []string) {
 	id := args[0]
 	fs := flag.NewFlagSet("users limit", flag.ExitOnError)
 	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
-	tokens := fs.String("tokens", "", "limit in output tokens (accepts K/M/G, e.g. 1M)")
-	window := fs.String("window", "", "rolling window: 1h, 6h, 24h, 7d, 30d")
-	none := fs.Bool("none", false, "clear the limit (unlimited)")
+	lf := addLimitFlags(fs)
 	_ = fs.Parse(args[1:])
-
-	var limitTokens, windowSecs int64
-	switch {
-	case *none:
-		if *tokens != "" || *window != "" {
-			fmt.Fprintln(os.Stderr, "--none cannot be combined with --tokens/--window")
-			os.Exit(2)
-		}
-	case *tokens == "" || *window == "":
-		fmt.Fprintln(os.Stderr, "both --tokens and --window are required (or --none to clear)")
+	limitTokens, windowSecs, err := lf.value()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
-	default:
-		u, err := usertoken.ParseTokens(*tokens)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(2)
-		}
-		dur, err := usage.ParsePeriod(*window)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(2)
-		}
-		if u == 0 {
-			fmt.Fprintln(os.Stderr, "--tokens must be greater than 0 (use --none to clear)")
-			os.Exit(2)
-		}
-		limitTokens, windowSecs = u, int64(dur/time.Second)
 	}
 
 	db := openDB(*dbPath)
@@ -1131,6 +1125,66 @@ func usersLimit(ctx context.Context, args []string) {
 	fmt.Printf("%s: limit set to %s output tokens per %s\n",
 		id, usertoken.FormatTokens(limitTokens),
 		usertoken.FormatWindow(time.Duration(windowSecs)*time.Second))
+}
+
+// limitFlags are the limit arguments of `users limit`, shared with
+// CLAUDIO_DEFAULT_LIMIT so both accept exactly the same text.
+type limitFlags struct {
+	tokens, window *string
+	none           *bool
+}
+
+func addLimitFlags(fs *flag.FlagSet) limitFlags {
+	return limitFlags{
+		tokens: fs.String("tokens", "", "limit in output tokens (accepts K/M/G, e.g. 1M)"),
+		window: fs.String("window", "", "rolling window: 1h, 6h, 24h, 7d, 30d"),
+		none:   fs.Bool("none", false, "clear the limit (unlimited)"),
+	}
+}
+
+// value validates the parsed flags; --none is 0, 0.
+func (f limitFlags) value() (limitTokens, windowSecs int64, err error) {
+	switch {
+	case *f.none:
+		if *f.tokens != "" || *f.window != "" {
+			return 0, 0, errors.New("--none cannot be combined with --tokens/--window")
+		}
+		return 0, 0, nil
+	case *f.tokens == "" || *f.window == "":
+		return 0, 0, errors.New("both --tokens and --window are required (or --none to clear)")
+	}
+	u, err := usertoken.ParseTokens(*f.tokens)
+	if err != nil {
+		return 0, 0, err
+	}
+	dur, err := usage.ParsePeriod(*f.window)
+	if err != nil {
+		return 0, 0, err
+	}
+	if u == 0 {
+		return 0, 0, errors.New("--tokens must be greater than 0 (use --none to clear)")
+	}
+	return u, int64(dur / time.Second), nil
+}
+
+// parseDefaultLimit reads CLAUDIO_DEFAULT_LIMIT, the usage limit of members
+// created by a claudio browser login: the arguments of `users limit` after
+// the id ("--tokens 1M --window 24h" or "--none"). Empty or "0" = unlimited.
+func parseDefaultLimit(v string) (limitTokens, windowSecs int64, err error) {
+	v = strings.TrimSpace(v)
+	if v == "" || v == "0" {
+		return 0, 0, nil
+	}
+	fs := flag.NewFlagSet("CLAUDIO_DEFAULT_LIMIT", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	lf := addLimitFlags(fs)
+	if err := fs.Parse(strings.Fields(v)); err != nil {
+		return 0, 0, err
+	}
+	if fs.NArg() > 0 {
+		return 0, 0, fmt.Errorf("unexpected argument %q", fs.Arg(0))
+	}
+	return lf.value()
 }
 
 func usersStats(ctx context.Context, args []string) {
