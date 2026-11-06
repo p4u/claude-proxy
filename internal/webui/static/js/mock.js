@@ -77,6 +77,20 @@ const hasUsageAPI = (c) => providerOf(c) === "anthropic";
 // so usage_pct/blocked are always derived — editing a limit visibly moves the
 // meter. The four users cover every limit state: healthy, near-limit,
 // unlimited, blocked.
+// Plugins served to claudio; mutated in place by the /plugins routes. Values
+// are kept only to mirror the backend: no mock route ever returns them.
+const PLUGINS = [
+  { name: "vocdoni-internal", version: "1.4.0",
+    bundle_url: "https://github.com/vocdoni/skills/releases/download/v1.4.0/vocdoni-internal.zip",
+    bundle_sha256: "9f2c4e1ab0d37c55e8a1f04b6d2e9c7a3b5f8d1e0c2a4b6d8f0e1c3a5b7d9f1e",
+    installed_id: "vocdoni-internal@vocdoni", enabled: true, updated_at: new Date(Date.now() - 86400e3).toISOString(),
+    env: { VOCDONI_KB_TOKEN: "x", NOTION_TOKEN: "x" } },
+];
+const pluginView = (p) => ({
+  name: p.name, version: p.version, bundle_url: p.bundle_url, bundle_sha256: p.bundle_sha256,
+  installed_id: p.installed_id, enabled: p.enabled, updated_at: p.updated_at, env_keys: Object.keys(p.env).sort(),
+});
+
 const USERS = [
   { id: "utok_alice", name: "alice", email: "alice@vocdoni.org", status: "active", full_capture: true, block_suggestions: false,
     limit_output_tokens: 1_000_000, limit_window_seconds: 86400, usage_output_tokens: 302_400 },  // ~30%
@@ -643,6 +657,7 @@ const DB = {
   "/codex/oauth/status": () => ({ status: ++sidecarOAuthPolls.codex > 2 ? "ok" : "wait" }),
   "/gemini/accounts": () => ({ configured: true, accounts: GEMINI_ACCOUNTS }),
   "/gemini/oauth/status": () => ({ status: ++sidecarOAuthPolls.gemini > 2 ? "ok" : "wait" }),
+  "/plugins": () => ({ plugins: PLUGINS.map(pluginView).sort((a, b) => a.name.localeCompare(b.name)) }),
   "/users": () =>
     USERS.map((u, i) => ({
       id: u.id, name: u.name, email: u.email || "", status: u.status, full_capture: u.full_capture,
@@ -809,6 +824,43 @@ window.fetch = async (input, init = {}) => {
   }
   if (path === "/login") return json({ authenticated: true });
   if (path === "/logout") return json({ authenticated: false });
+
+  // Plugins: validated like internal/plugins, stateful for the session.
+  const plm = path.match(/^\/plugins\/([^/]+)(?:\/(enable|disable|env)(?:\/([^/]+))?)?$/);
+  if (plm && method !== "GET") {
+    const name = decodeURIComponent(plm[1]);
+    const p = PLUGINS.find((x) => x.name === name);
+    const b = JSON.parse(init.body || "{}");
+    const touch = (x) => { x.updated_at = new Date().toISOString(); return json(pluginView(x)); };
+    if (!plm[2] && method === "PUT") {
+      if (!/^[a-z0-9-]{1,40}$/.test(name)) return json({ error: "invalid plugin: name must match [a-z0-9-]{1,40}" }, 400);
+      if (!/^https:\/\/[^/@]+/.test(b.bundle_url || "")) return json({ error: "invalid plugin: bundle_url must be an https URL without credentials" }, 400);
+      if (!/^[0-9a-f]{64}$/.test(b.bundle_sha256 || "")) return json({ error: "invalid plugin: bundle_sha256 must be 64 lowercase hex characters" }, 400);
+      if (!b.version) return json({ error: "invalid plugin: version must be 1-64 printable ASCII characters" }, 400);
+      const meta = { version: b.version, bundle_url: b.bundle_url, bundle_sha256: b.bundle_sha256, installed_id: b.installed_id || "" };
+      if (p) return touch(Object.assign(p, meta));
+      const np = { name, enabled: true, env: {}, ...meta };
+      PLUGINS.push(np);
+      return touch(np);
+    }
+    if (!p) return json({ error: "plugin not found" }, 404);
+    if (!plm[2] && method === "DELETE") { PLUGINS.splice(PLUGINS.indexOf(p), 1); return json({ ok: true }); }
+    if (plm[2] === "enable" || plm[2] === "disable") { p.enabled = plm[2] === "enable"; return touch(p); }
+    if (plm[2] === "env" && !plm[3] && method === "PUT") {
+      for (const k of Object.keys(b)) {
+        if (!/^[A-Z_][A-Z0-9_]{0,63}$/.test(k)) return json({ error: `invalid plugin: env key "${k}" must match [A-Z_][A-Z0-9_]{0,63}` }, 400);
+      }
+      Object.assign(p.env, b);
+      return touch(p);
+    }
+    if (plm[2] === "env" && plm[3] && method === "DELETE") {
+      const k = decodeURIComponent(plm[3]);
+      if (!(k in p.env)) return json({ error: "plugin not found" }, 404);
+      delete p.env[k];
+      return touch(p);
+    }
+    return json({ error: "not found" }, 404);
+  }
 
   // Mutations: acknowledge.
   if (method !== "GET") {

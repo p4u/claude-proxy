@@ -368,7 +368,7 @@ through Antigravity's OAuth, served by the same sidecar
 meter.
 
 ### Proxy user management (wraps `internal/usertoken`)
-- `GET /api/users` → list incl. status, created_at, last_used_at.
+- `GET /api/users` → list incl. `email` (`""` for admin-created tokens), status, created_at, last_used_at.
 - `POST /api/users` `{name}` → `{id,name,token}`.
 - `GET /api/users/{id}/token` → `{id,name,token}`, `Cache-Control: no-store`.
   Backs the Users page *Connect* panel, which builds copy-paste client settings
@@ -378,6 +378,19 @@ meter.
 - `POST /api/users/{id}/disable` | `/enable`
 - `POST /api/users/{id}/rotate` → `{token}`
 - `DELETE /api/users/{id}`
+
+### Plugins served to claudio (wraps `internal/plugins`)
+- `GET /api/plugins` → `{plugins:[{name,version,bundle_url,bundle_sha256,installed_id,enabled,updated_at,env_keys:[…]}]}`.
+- `PUT /api/plugins/{name}` `{version,bundle_url,bundle_sha256,installed_id}` → create or replace the
+  bundle reference; env and `enabled` untouched. Returns the plugin view.
+- `POST /api/plugins/{name}/enable` | `/disable`; `DELETE /api/plugins/{name}` (env cascades).
+- `PUT /api/plugins/{name}/env` `{"KEY":"value",…}` → upsert the listed keys only.
+- `DELETE /api/plugins/{name}/env/{KEY}`.
+- Validation errors are `400 {"error":…}` (limits in `internal/plugins`: name `[a-z0-9-]{1,40}`,
+  version 1–64 printable ASCII, https URL, 64 lowercase hex, `installed_id` empty or
+  `name@marketplace`, keys `[A-Z_][A-Z0-9_]{0,63}`, values ≤ 4 KiB without C0 controls other than
+  `\n`/`\t`, ≤ 64 keys, ≤ 32 plugins); unknown plugin or key `404`. **No route ever returns a
+  value**: the Plugins page shows keys with a *replace* action, values go in password fields.
 
 ### Routing activity
 - `GET /api/routing/events?limit=50&before=123` →

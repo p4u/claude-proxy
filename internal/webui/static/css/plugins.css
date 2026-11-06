@@ -1,0 +1,8 @@
+/* Plugins page (js/pages/plugins.js). */
+.plugin-keys { display: flex; flex-wrap: wrap; gap: 6px; max-width: 28rem; }
+.plugin-key { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 11.5px; padding: 2px 4px 2px 8px; border: 1px solid var(--border-strong); border-radius: var(--r-sm); background: var(--surface-2); }
+.plugin-key__btn { font: inherit; font-size: 10.5px; color: var(--ink-muted); background: none; border: 0; padding: 2px 4px; cursor: pointer; border-radius: var(--r-sm); }
+.plugin-key__btn:hover { color: var(--ink); background: var(--surface-1); }
+.env-rows { display: flex; flex-direction: column; gap: 10px; margin-bottom: 10px; }
+.env-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) auto; gap: 8px; align-items: center; }
+.form-hint { margin: 0; font-size: 11.5px; color: var(--ink-muted); }

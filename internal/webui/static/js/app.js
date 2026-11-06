@@ -9,6 +9,7 @@ import * as usage from "./pages/usage.js";
 import * as subscriptionValue from "./pages/subscription-value.js";
 import * as credentials from "./pages/credentials.js";
 import * as users from "./pages/users.js";
+import * as plugins from "./pages/plugins.js";
 import { seriesColors } from "./charts.js";
 
 window.__seriesColors = seriesColors;
@@ -19,6 +20,7 @@ const ROUTES = {
   "subscription-value": { label: "Subscription value", icon: "value", mod: subscriptionValue },
   credentials: { label: "Credentials", icon: "key", mod: credentials },
   users: { label: "Users", icon: "users", mod: users },
+  plugins: { label: "Plugins", icon: "plugin", mod: plugins },
 };
 
 const appRoot = document.getElementById("app");
@@ -212,6 +214,7 @@ const ICONS = {
   gauge: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 15a8 8 0 0 1 16 0"/><path d="M12 15l4-4"/><circle cx="12" cy="15" r="1.3" fill="currentColor" stroke="none"/></svg>',
   key: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v4M21 12v3"/></svg>',
   users: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 20a5.5 5.5 0 0 1 11 0"/><path d="M16 5.2a3.2 3.2 0 0 1 0 6M17.5 20a5.5 5.5 0 0 0-3-4.9"/></svg>',
+  plugin: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M9 3v4M15 3v4"/><rect x="6" y="7" width="12" height="6" rx="1.5"/><path d="M8 13v2a4 4 0 0 0 8 0v-2M12 19v2"/></svg>',
   theme: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="4.2"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.4 1.4M17.6 17.6L19 19M19 5l-1.4 1.4M6.4 17.6L5 19"/></svg>',
   logout: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h8"/><path d="M16 8l4 4-4 4M20 12H9"/></svg>',
   menu: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7h16M4 12h16M4 17h16"/></svg>',

@@ -212,6 +212,8 @@ func (s *Server) serveAuthenticatedAPI(w http.ResponseWriter, r *http.Request, r
 		s.handleSidecar(w, r, codexgateway.GeminiChannel, strings.TrimPrefix(rest, "/gemini"))
 	case rest == "/users" || strings.HasPrefix(rest, "/users/"):
 		s.handleUsers(w, r, strings.TrimPrefix(rest, "/users"))
+	case rest == "/plugins" || strings.HasPrefix(rest, "/plugins/"):
+		s.handlePlugins(w, r, strings.TrimPrefix(rest, "/plugins"))
 	default:
 		writeErr(w, http.StatusNotFound, "not found")
 	}

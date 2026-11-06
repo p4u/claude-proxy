@@ -47,6 +47,8 @@ Usage:
   claude-proxy users rm <id>          [--db PATH]
   claude-proxy users refresh <id>     [--db PATH]
   claude-proxy users limit <id>       --tokens 1M --window 24h | --none [--db PATH]
+  claude-proxy plugins list|set|enable|disable|delete|env …  [--db PATH]
+                                   # plugins served to claudio; 'plugins' alone for help
   claude-proxy tui                 [--db PATH]   # interactive management UI
   claude-proxy creds import        --from FILE [--label NAME] [--weight N]
   claude-proxy creds add-key       --provider glm|mimo|privatemode [--endpoint sgp|https://…]
@@ -83,6 +85,8 @@ func main() {
 		runCreds(os.Args[2:])
 	case "users":
 		runUsers(os.Args[2:])
+	case "plugins":
+		os.Exit(runPlugins(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
 	case "-h", "--help", "help":
 		fmt.Print(helpText)
 	default:

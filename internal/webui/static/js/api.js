@@ -139,6 +139,11 @@ export const api = {
   }),
   users: () => request("GET", "/users"),
 
+  // Plugins served to claudio. Env values are write-only: the API returns keys.
+  plugins: () => request("GET", "/plugins"),
+  setPlugin: (name, meta) => request("PUT", `/plugins/${enc(name)}`, meta),
+  setPluginEnv: (name, env) => request("PUT", `/plugins/${enc(name)}/env`, env),
+
   // Per-user capture mode. `full` true ⇒ store both sides of every conversation.
   setUserCapture: (id, full) => request("POST", `/users/${enc(id)}/capture`, { full: !!full }),
 
