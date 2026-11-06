@@ -157,6 +157,27 @@ CREATE TABLE IF NOT EXISTS codex_account_weight (
   weight  INTEGER NOT NULL DEFAULT 1
 );
 
+-- Claude Code plugins served to claudio (GET /v1/claudio/plugins): a pinned
+-- bundle reference per plugin, never the bundle itself (internal/plugins).
+CREATE TABLE IF NOT EXISTS plugins (
+  name          TEXT PRIMARY KEY,
+  version       TEXT NOT NULL,
+  bundle_url    TEXT NOT NULL,
+  bundle_sha256 TEXT NOT NULL,
+  -- '' or the installed Claude Code plugin id that makes the bundle redundant.
+  installed_id  TEXT NOT NULL DEFAULT '',
+  enabled       INTEGER NOT NULL DEFAULT 1,
+  updated_at    INTEGER NOT NULL
+);
+-- Environment a plugin's MCP servers and hooks need, secrets included; stored
+-- like the other secrets in this file. Never returned by the admin API.
+CREATE TABLE IF NOT EXISTS plugin_env (
+  plugin TEXT NOT NULL REFERENCES plugins(name) ON DELETE CASCADE,
+  key    TEXT NOT NULL,
+  value  TEXT NOT NULL,
+  PRIMARY KEY (plugin, key)
+);
+
 -- Random secrets generated once and kept across restarts (e.g. the web UI
 -- session-signing secret). Never exposed through any API.
 CREATE TABLE IF NOT EXISTS app_secret (

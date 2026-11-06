@@ -13,7 +13,7 @@ func TestOpenAppliesSchemaAndIsIdempotent(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	// Schema applied: all expected tables exist.
-	for _, tbl := range []string{"credentials", "conversations", "rr_cursor", "user_tokens", "request_log", "usage_history"} {
+	for _, tbl := range []string{"credentials", "conversations", "rr_cursor", "user_tokens", "request_log", "usage_history", "plugins", "plugin_env"} {
 		var name string
 		err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, tbl).Scan(&name)
 		if err != nil {
