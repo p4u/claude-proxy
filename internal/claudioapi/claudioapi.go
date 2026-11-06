@@ -16,6 +16,7 @@
 //	GET /v1/claudio/pool/health — coarse per-provider availability
 //	GET /v1/claudio/session?id= — which credential serves a Claude Code session
 //	POST /v1/claudio/session/switch — move a session to another credential
+//	GET /v1/claudio/plugins    — plugins to load, with their env (user token only)
 //
 // Security isolation
 //
@@ -24,8 +25,9 @@
 //     existence is not leaked across users. It exposes the credential's id,
 //     label, provider and plan, never tokens or other secrets. /session/switch
 //     is scoped the same way.
-//   - /me/stats requires a non-empty, non-admin UserTokenID; anonymous
-//     callers and admin tokens receive 403.
+//   - /me/stats and /plugins require a non-empty, non-admin UserTokenID;
+//     anonymous callers and admin tokens receive 403. /plugins carries
+//     secrets: no-store, and logged without values.
 //   - /pool/health exposes no credential IDs, labels, percentages or counts —
 //     only a coarse status string per provider name.
 //   - All caches are keyed by identity so cross-user data is impossible.
@@ -38,12 +40,14 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/p4u/claude-proxy/internal/creds"
+	"github.com/p4u/claude-proxy/internal/plugins"
 	"github.com/p4u/claude-proxy/internal/pool"
 	"github.com/p4u/claude-proxy/internal/provider"
 	"github.com/p4u/claude-proxy/internal/sessionbind"
@@ -198,6 +202,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.methodOnly(w, r, http.MethodGet, h.serveSession)
 	case "/v1/claudio/session/switch":
 		h.methodOnly(w, r, http.MethodPost, h.serveSessionSwitch)
+	case "/v1/claudio/plugins":
+		h.methodOnly(w, r, http.MethodGet, h.servePlugins)
 	default:
 		// Includes /v1/claudiox and any other path that starts with
 		// /v1/claudio but does not match a known route.
@@ -228,7 +234,7 @@ type rootResponse struct {
 func (h *Handler) serveRoot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, rootResponse{
 		Version:      1,
-		Capabilities: []string{"config", "models", "me/stats", "pool/health", "session", "session_switch"},
+		Capabilities: []string{"config", "models", "me/stats", "pool/health", "session", "session_switch", "plugins"},
 	})
 }
 
@@ -487,6 +493,58 @@ func parsePeriod(s string) (time.Duration, string, bool) {
 		return 30 * 24 * time.Hour, "30d", true
 	}
 	return 0, "", false
+}
+
+// ---------------------------------------------------------------------------
+// GET /v1/claudio/plugins
+// ---------------------------------------------------------------------------
+
+type pluginsResponse struct {
+	Plugins []pluginEntry `json:"plugins"`
+}
+
+type pluginEntry struct {
+	Name        string            `json:"name"`
+	Version     string            `json:"version"`
+	Bundle      pluginBundle      `json:"bundle"`
+	InstalledID string            `json:"installed_id"`
+	Env         map[string]string `json:"env"`
+}
+
+type pluginBundle struct {
+	URL    string `json:"url"`
+	SHA256 string `json:"sha256"`
+}
+
+// servePlugins tells a member's claudio which plugins to load. The reply
+// holds the plugins' secrets: user tokens only, never cached, never logged.
+func (h *Handler) servePlugins(w http.ResponseWriter, r *http.Request) {
+	id := usertoken.FromContext(r.Context())
+	if id == nil || id.IsAdmin || id.UserTokenID == "" {
+		writeJSON(w, http.StatusForbidden, apiError("authentication_error",
+			"claudio: /plugins requires a user token identity (admin and anonymous callers not allowed)"))
+		return
+	}
+	list, err := plugins.ListForClient(r.Context(), h.db)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiError("api_error", "claudio: plugins query failed"))
+		return
+	}
+	resp := pluginsResponse{Plugins: make([]pluginEntry, 0, len(list))}
+	keys := 0
+	for _, p := range list {
+		resp.Plugins = append(resp.Plugins, pluginEntry{
+			Name:        p.Name,
+			Version:     p.Version,
+			Bundle:      pluginBundle{URL: p.BundleURL, SHA256: p.BundleSHA256},
+			InstalledID: p.InstalledID,
+			Env:         p.Env,
+		})
+		keys += len(p.Env)
+	}
+	slog.Debug("claudio plugins served", "user", id.UserName, "plugins", len(resp.Plugins), "env_keys", keys)
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (h *Handler) serveStats(w http.ResponseWriter, r *http.Request) {

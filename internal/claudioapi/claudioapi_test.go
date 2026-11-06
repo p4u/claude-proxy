@@ -114,6 +114,7 @@ func TestNoRequestLogWrite(t *testing.T) {
 		"/v1/claudio/config",
 		"/v1/claudio/models",
 		"/v1/claudio/pool/health",
+		"/v1/claudio/plugins",
 	} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		rw := httptest.NewRecorder()
