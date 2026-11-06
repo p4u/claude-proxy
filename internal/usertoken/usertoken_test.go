@@ -115,3 +115,73 @@ func TestSetStatusRefreshDelete(t *testing.T) {
 		t.Fatalf("delete missing: want ErrNotFound, got %v", err)
 	}
 }
+
+func TestEmailLookupAndSet(t *testing.T) {
+	ctx := context.Background()
+	db := testDB(t)
+
+	ut, err := CreateWithEmail(ctx, db, "alice", "  Alice@Vocdoni.org ")
+	if err != nil {
+		t.Fatalf("create with e-mail: %v", err)
+	}
+	if ut.Email != "alice@vocdoni.org" {
+		t.Fatalf("e-mail not normalised: %q", ut.Email)
+	}
+	got, err := LookupByEmail(ctx, db, "ALICE@vocdoni.org")
+	if err != nil || got.ID != ut.ID || got.Email != "alice@vocdoni.org" {
+		t.Fatalf("lookup-by-email: %v %+v", err, got)
+	}
+	if _, err := LookupByEmail(ctx, db, "nobody@vocdoni.org"); err != ErrNotFound {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+
+	bob, _ := Create(ctx, db, "bob")
+	if bob.Email != "" {
+		t.Fatalf("admin-created token has e-mail %q", bob.Email)
+	}
+	if err := SetEmail(ctx, db, bob.ID, "alice@vocdoni.org"); err != ErrEmailTaken {
+		t.Fatalf("duplicate e-mail: want ErrEmailTaken, got %v", err)
+	}
+	if err := SetEmail(ctx, db, bob.ID, "not-an-email"); err == nil {
+		t.Fatal("invalid e-mail accepted")
+	}
+	if err := SetEmail(ctx, db, bob.ID, "Bob@Vocdoni.org"); err != nil {
+		t.Fatalf("set e-mail: %v", err)
+	}
+	if got, _ := Get(ctx, db, bob.ID); got.Email != "bob@vocdoni.org" {
+		t.Fatalf("get after set: %q", got.Email)
+	}
+	if err := SetEmail(ctx, db, "utok_missing", "c@vocdoni.org"); err != ErrNotFound {
+		t.Fatalf("missing id: want ErrNotFound, got %v", err)
+	}
+	if _, err := CreateWithEmail(ctx, db, "alice2", "alice@vocdoni.org"); err != ErrEmailTaken {
+		t.Fatalf("create with taken e-mail: want ErrEmailTaken, got %v", err)
+	}
+}
+
+func TestCreateForEmailSuffixesTakenName(t *testing.T) {
+	ctx := context.Background()
+	db := testDB(t)
+
+	// An admin already used the address as a plain name.
+	if _, err := Create(ctx, db, "dave@vocdoni.org"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Create(ctx, db, "dave@vocdoni.org-2"); err != nil {
+		t.Fatal(err)
+	}
+	ut, err := CreateForEmail(ctx, db, "Dave@vocdoni.org")
+	if err != nil {
+		t.Fatalf("create for e-mail: %v", err)
+	}
+	if ut.Name != "dave@vocdoni.org-3" || ut.Email != "dave@vocdoni.org" || ut.Status != StatusActive {
+		t.Fatalf("unexpected token: %+v", ut)
+	}
+	if _, err := CreateForEmail(ctx, db, "dave@vocdoni.org"); err != ErrEmailTaken {
+		t.Fatalf("second create: want ErrEmailTaken, got %v", err)
+	}
+	fresh, err := CreateForEmail(ctx, db, "erin@vocdoni.org")
+	if err != nil || fresh.Name != "erin@vocdoni.org" {
+		t.Fatalf("untaken name: %v %+v", err, fresh)
+	}
+}

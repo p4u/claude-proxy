@@ -81,3 +81,35 @@ func TestForeignKeysEnabled(t *testing.T) {
 		t.Fatalf("foreign_keys = %d, want 1", on)
 	}
 }
+
+func TestUserTokenEmailUniqueWhenSet(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "email.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insert := func(id, name string, email any) error {
+		_, err := db.Exec(`INSERT INTO user_tokens (id, name, token, created_at, email) VALUES (?, ?, ?, 1, ?)`,
+			id, name, "tok-"+id, email)
+		return err
+	}
+	if err := insert("a", "a", nil); err != nil {
+		t.Fatalf("NULL e-mail: %v", err)
+	}
+	if err := insert("b", "b", nil); err != nil {
+		t.Fatalf("second NULL e-mail must be allowed: %v", err)
+	}
+	if err := insert("c", "c", "x@vocdoni.org"); err != nil {
+		t.Fatalf("first e-mail: %v", err)
+	}
+	if err := insert("d", "d", "x@vocdoni.org"); err == nil {
+		t.Fatal("duplicate e-mail accepted")
+	}
+	_ = db.Close()
+	// The migration is idempotent on an existing file.
+	db, err = Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	_ = db.Close()
+}

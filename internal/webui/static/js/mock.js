@@ -78,7 +78,7 @@ const hasUsageAPI = (c) => providerOf(c) === "anthropic";
 // meter. The four users cover every limit state: healthy, near-limit,
 // unlimited, blocked.
 const USERS = [
-  { id: "utok_alice", name: "alice", status: "active", full_capture: true, block_suggestions: false,
+  { id: "utok_alice", name: "alice", email: "alice@vocdoni.org", status: "active", full_capture: true, block_suggestions: false,
     limit_output_tokens: 1_000_000, limit_window_seconds: 86400, usage_output_tokens: 302_400 },  // ~30%
   { id: "utok_bob", name: "bob", status: "active", full_capture: false, block_suggestions: true,
     limit_output_tokens: 400_000, limit_window_seconds: 21600, usage_output_tokens: 344_900 },    // ~86%
@@ -645,7 +645,7 @@ const DB = {
   "/gemini/oauth/status": () => ({ status: ++sidecarOAuthPolls.gemini > 2 ? "ok" : "wait" }),
   "/users": () =>
     USERS.map((u, i) => ({
-      id: u.id, name: u.name, status: u.status, full_capture: u.full_capture,
+      id: u.id, name: u.name, email: u.email || "", status: u.status, full_capture: u.full_capture,
       block_suggestions: u.block_suggestions,
       ...limitFields(u),
       created_at: now - 86400 * (20 - i * 3),

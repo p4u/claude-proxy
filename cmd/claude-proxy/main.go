@@ -36,8 +36,9 @@ const helpText = `claude-proxy — sticky multi-subscription proxy for Claude Co
 
 Usage:
   claude-proxy serve [flags]
-  claude-proxy users create           --name NAME [--db PATH]
+  claude-proxy users create           --name NAME [--email ADDR] [--db PATH]
   claude-proxy users list             [--db PATH]
+  claude-proxy users email <id> <addr> [--db PATH]
   claude-proxy users stats [<id>]     [--period 1h|6h|24h|7d|30d] [--db PATH]
   claude-proxy users token <id>       [--db PATH]
   claude-proxy users disable <id>     [--db PATH]
@@ -910,7 +911,7 @@ func printUsageBucket(label string, b *usage.Bucket) {
 
 func runUsers(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "users: missing subcommand (create|list|stats|token|disable|enable|rm|refresh|limit|suggestions)")
+		fmt.Fprintln(os.Stderr, "users: missing subcommand (create|list|email|stats|token|disable|enable|rm|refresh|limit|suggestions)")
 		os.Exit(2)
 	}
 	ctx := context.Background()
@@ -919,6 +920,10 @@ func runUsers(args []string) {
 		usersCreate(ctx, args[1:])
 	case "list":
 		usersList(ctx, args[1:])
+	case "email":
+		if code := usersEmail(ctx, args[1:], os.Stdout, os.Stderr); code != 0 {
+			os.Exit(code)
+		}
 	case "stats":
 		usersStats(ctx, args[1:])
 	case "token":
@@ -944,6 +949,7 @@ func runUsers(args []string) {
 func usersCreate(ctx context.Context, args []string) {
 	fs := flag.NewFlagSet("users create", flag.ExitOnError)
 	name := fs.String("name", "", "user name (unique label)")
+	email := fs.String("email", "", "member e-mail the token belongs to (optional, unique)")
 	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
 	_ = fs.Parse(args)
 	if *name == "" {
@@ -952,12 +958,47 @@ func usersCreate(ctx context.Context, args []string) {
 	}
 	db := openDB(*dbPath)
 	defer db.Close()
-	ut, err := usertoken.Create(ctx, db, *name)
+	var (
+		ut  *usertoken.UserToken
+		err error
+	)
+	if *email != "" {
+		ut, err = usertoken.CreateWithEmail(ctx, db, *name, *email)
+	} else {
+		ut, err = usertoken.Create(ctx, db, *name)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "create: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Printf("created %s  name=%q  token=%s\n", ut.ID, ut.Name, ut.Token)
+}
+
+// usersEmail sets the e-mail a user token belongs to. It refuses an address
+// already on another token. Returns the process exit code.
+func usersEmail(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) < 2 || strings.HasPrefix(args[0], "-") || strings.HasPrefix(args[1], "-") {
+		fmt.Fprintln(stderr, "users email <id> <email> [--db PATH]")
+		return 2
+	}
+	fs := flag.NewFlagSet("users email", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
+	if err := fs.Parse(args[2:]); err != nil {
+		return 2
+	}
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "open db %s: %v\n", *dbPath, err)
+		return 1
+	}
+	defer db.Close()
+	if err := usertoken.SetEmail(ctx, db, args[0], args[1]); err != nil {
+		fmt.Fprintf(stderr, "email: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "%s: e-mail set to %s\n", args[0], usertoken.NormalizeEmail(args[1]))
+	return 0
 }
 
 func usersList(ctx context.Context, args []string) {
@@ -966,18 +1007,25 @@ func usersList(ctx context.Context, args []string) {
 	_ = fs.Parse(args)
 	db := openDB(*dbPath)
 	defer db.Close()
-	list, err := usertoken.List(ctx, db)
-	if err != nil {
+	if err := printUsers(ctx, db, os.Stdout); err != nil {
 		fmt.Fprintf(os.Stderr, "list: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// printUsers writes the users table of `users list`.
+func printUsers(ctx context.Context, db *store.DB, w io.Writer) error {
+	list, err := usertoken.List(ctx, db)
+	if err != nil {
+		return err
+	}
 	if len(list) == 0 {
-		fmt.Println("(no user tokens)")
-		return
+		fmt.Fprintln(w, "(no user tokens)")
+		return nil
 	}
 	now := time.Now()
-	fmt.Printf("%-22s  %-20s  %-8s  %-25s  %-25s  %-6s  %-16s  %s\n",
-		"ID", "NAME", "STATUS", "CREATED", "LAST_USED", "SUGG", "LIMIT (OUT TOK)", "USED (OUT TOK)")
+	fmt.Fprintf(w, "%-22s  %-20s  %-28s  %-8s  %-25s  %-25s  %-6s  %-16s  %s\n",
+		"ID", "NAME", "EMAIL", "STATUS", "CREATED", "LAST_USED", "SUGG", "LIMIT (OUT TOK)", "USED (OUT TOK)")
 	for _, ut := range list {
 		lastUsed := "-"
 		if ut.LastUsedAt != nil {
@@ -1004,10 +1052,15 @@ func usersList(ctx context.Context, args []string) {
 		if ut.BlockSuggestions {
 			sugg = "block"
 		}
-		fmt.Printf("%-22s  %-20s  %-8s  %-25s  %-25s  %-6s  %-16s  %s\n",
-			ut.ID, ut.Name, string(ut.Status),
+		email := ut.Email
+		if email == "" {
+			email = "-"
+		}
+		fmt.Fprintf(w, "%-22s  %-20s  %-28s  %-8s  %-25s  %-25s  %-6s  %-16s  %s\n",
+			ut.ID, ut.Name, email, string(ut.Status),
 			ut.CreatedAt.Format(time.RFC3339), lastUsed, sugg, limitCol, usageCol)
 	}
+	return nil
 }
 
 // usersLimit sets or clears a user's rolling-window usage limit.

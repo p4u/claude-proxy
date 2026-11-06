@@ -526,7 +526,11 @@ function userRow(u, s, root) {
     }),
   ]);
   return el("tr", {}, [
-    el("td", {}, [el("span", { class: "cell-strong", text: u.name }), el("span", { class: "cell-id", text: u.id })]),
+    el("td", {}, [
+      el("span", { class: "cell-strong", text: u.name }),
+      u.email ? el("span", { class: "cell-id", text: u.email }) : null,
+      el("span", { class: "cell-id", text: u.id }),
+    ]),
     el("td", {}, statusBadge(u.status)),
     el("td", {}, captureToggle(u)),
     el("td", {}, suggestionsToggle(u)),

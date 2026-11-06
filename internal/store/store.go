@@ -106,6 +106,11 @@ func Open(path string) (*DB, error) {
 		`ALTER TABLE usage_history ADD COLUMN seven_day_scoped_pct REAL`,
 		`ALTER TABLE usage_history ADD COLUMN seven_day_scoped_resets_at INTEGER`,
 		`ALTER TABLE usage_history ADD COLUMN seven_day_scoped_label TEXT`,
+		// The member a user token belongs to, set by the claudio browser login
+		// (or by an admin). NULL for admin-created tokens; stored lower-cased
+		// and trimmed. The index must follow the column for older databases.
+		`ALTER TABLE user_tokens ADD COLUMN email TEXT`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_user_tokens_email ON user_tokens(email) WHERE email IS NOT NULL`,
 	} {
 		if _, err := sdb.Exec(alter); err != nil && !isDuplicateColumn(err) {
 			_ = sdb.Close()

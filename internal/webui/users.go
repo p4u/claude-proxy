@@ -13,6 +13,7 @@ import (
 type userView struct {
 	ID          string  `json:"id"`
 	Name        string  `json:"name"`
+	Email       string  `json:"email"` // member e-mail; "" for admin-created tokens
 	Status      string  `json:"status"`
 	CreatedAt   string  `json:"created_at"`
 	LastUsedAt  *string `json:"last_used_at"`
@@ -132,6 +133,7 @@ func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {
 		v := userView{
 			ID:                 ut.ID,
 			Name:               ut.Name,
+			Email:              ut.Email,
 			Status:             string(ut.Status),
 			CreatedAt:          ut.CreatedAt.Format(time.RFC3339),
 			FullCapture:        ut.FullCapture,
