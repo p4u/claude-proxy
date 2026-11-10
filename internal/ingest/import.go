@@ -81,7 +81,7 @@ func insertVerified(ctx context.Context, db *store.DB, o oauthBlock, label strin
 	}
 
 	fmt.Fprintf(os.Stderr, "verifying credential with Anthropic...\n")
-	accessToken, refreshToken, expires, err := creds.RefreshTokens(ctx, o.RefreshToken)
+	ts, err := creds.RefreshTokens(ctx, o.RefreshToken, time.Time{})
 	if err != nil {
 		return nil, fmt.Errorf("credential is not alive: %w", err)
 	}
@@ -89,7 +89,7 @@ func insertVerified(ctx context.Context, db *store.DB, o oauthBlock, label strin
 	if label == "" {
 		label = o.SubscriptionType
 	}
-	return creds.InsertWithRateLimitTier(ctx, db, label, o.SubscriptionType, accessToken, refreshToken, expires, weight, o.RateLimitTier, time.Time{})
+	return creds.InsertWithRateLimitTier(ctx, db, label, o.SubscriptionType, ts.AccessToken, ts.RefreshToken, ts.ExpiresAt, weight, o.RateLimitTier, ts.RefreshExpiresAt)
 }
 
 // Import reads a Claude Code .credentials.json and inserts it into the pool.
@@ -147,11 +147,11 @@ func updateVerified(ctx context.Context, db *store.DB, id string, o oauthBlock) 
 		return nil, err
 	}
 	fmt.Fprintf(os.Stderr, "verifying credential with Anthropic...\n")
-	accessToken, refreshToken, expires, err := creds.RefreshTokens(ctx, o.RefreshToken)
+	ts, err := creds.RefreshTokens(ctx, o.RefreshToken, time.Time{})
 	if err != nil {
 		return nil, fmt.Errorf("credential is not alive: %w", err)
 	}
-	if err := creds.UpdateTokensWithSubscription(ctx, db, id, accessToken, refreshToken, expires, o.SubscriptionType, o.RateLimitTier, time.Time{}); err != nil {
+	if err := creds.UpdateTokensWithSubscription(ctx, db, id, ts.AccessToken, ts.RefreshToken, ts.ExpiresAt, o.SubscriptionType, o.RateLimitTier, ts.RefreshExpiresAt); err != nil {
 		return nil, err
 	}
 	return creds.Get(ctx, db, id)

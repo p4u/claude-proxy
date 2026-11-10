@@ -762,7 +762,7 @@ func credsRefresh(ctx context.Context, args []string) {
 	db := openDB(*dbPath)
 	defer db.Close()
 	r := creds.NewRefresher(db)
-	c, err := r.Refresh(ctx, args[0])
+	c, _, err := r.Refresh(ctx, args[0])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "refresh: %v\n", err)
 		os.Exit(1)
