@@ -70,6 +70,21 @@ const endpointNameOf = (c) => {
   return p ? (p.endpoints.find((e) => e.url === endpointOf(c))?.name || "") : "";
 };
 const hasUsageAPI = (c) => providerOf(c) === "anthropic";
+// Anthropic logins with a known deadline: the first is a year-long sign-in,
+// the second an 8-hour login whose deadline is 3 days out (the warning
+// state); the rest predate the field and omit both.
+const loginDeadlines = (c, i) => {
+  if (providerOf(c) !== "anthropic" || i > 1) return {};
+  const now = Math.floor(Date.now() / 1000);
+  const iso = (s) => new Date(s * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+  if (i === 0) {
+    const year = now + 365 * 86400;
+    return { expires_at: year, login_ends_at: iso(year), refresh_deadline_at: iso(now + 27 * 86400) };
+  }
+  return { login_ends_at: iso(now + 3 * 86400), refresh_deadline_at: iso(now + 3 * 86400) };
+};
+// The refresh action alternates "refreshed" and "still valid" so both toasts show.
+let mockRefreshes = 0;
 // full_capture and the usage limit are mutated in place by
 // POST /users/{id}/capture and POST /users/{id}/limit, so both toggles stay
 // stateful for the whole mock session.
@@ -651,6 +666,7 @@ const DB = {
       models: c.models || [],
       request_count: [8200, 5400, 1200, 3600, 40, 970][i], last_request_at: c.status === "disabled" ? null : now - 60 * (i + 1),
       expires_at: now + 3600 * (5 - i), created_at: now - 86400 * (30 - i * 4),
+      ...loginDeadlines(c, i),
     })),
   "/credentials/endpoints": () => MOCK_ENDPOINTS,
   "/codex/accounts": () => ({ configured: true, accounts: CODEX_ACCOUNTS }),
@@ -962,6 +978,7 @@ window.fetch = async (input, init = {}) => {
       else if (credentialAction[2] === "enable") c.status = "active";
       else if (credentialAction[2] === "disable") c.status = "disabled";
       else if (credentialAction[2] === "weight") c.weight = JSON.parse(init.body || "{}").weight;
+      else if (credentialAction[2] === "refresh") return json({ ok: true, id: c.id, refreshed: mockRefreshes++ % 2 === 0 });
       return json({ ok: true });
     }
     const mdl = path.match(/^\/credentials\/([^/]+)\/models$/);

@@ -213,8 +213,8 @@ function endpointLabel(c) {
   try { return new URL(c.endpoint).host; } catch { return c.endpoint; }
 }
 
-function stat(val, label) {
-  return el("div", { class: "cred-stat" }, [
+function stat(val, label, warn = false) {
+  return el("div", { class: "cred-stat" + (warn ? " cred-stat--warn" : "") }, [
     el("span", { class: "cred-stat__val", text: val }),
     el("span", { class: "cred-stat__label", text: label }),
   ]);
@@ -242,7 +242,11 @@ function credCard(c, root) {
     ...(!isKey ? [
       {
         label: "Refresh token",
-        onClick: () => act(() => api.post(`/credentials/${id}/refresh`), "Token refreshed", root),
+        onClick: () => act(
+          () => api.post(`/credentials/${id}/refresh`),
+          (out) => (out && out.refreshed === false ? "Token still valid, nothing to refresh" : "Token refreshed"),
+          root,
+        ),
       },
       {
         label: "Update tokens",
@@ -275,7 +279,7 @@ function credCard(c, root) {
   const typeText = c.subscription_type || (modelIDs ? `${(c.models || []).length} model(s)` : "—");
   const wt = c.weight ?? "—";
   const lastUsed = c.last_request_at ? relTime(tsOf(c.last_request_at)) : "never";
-  const expires = isKey ? "never" : (c.expires_at ? localTime(tsOf(c.expires_at)) : "—");
+  const expires = isKey ? "never" : (c.expires_at ? whenOf(tsOf(c.expires_at)) : "—");
 
   return el("article", { class: "card cred-card" + (disabled ? " cred-card--disabled" : "") }, [
     el("div", { class: "cred-card__identity" }, [
@@ -295,8 +299,34 @@ function credCard(c, root) {
       stat(compactNum(c.request_count ?? c.requests ?? 0), "requests"),
       stat(lastUsed, "last used"),
       stat(expires, "expires"),
+      ...loginStats(c),
     ]),
   ]);
+}
+
+// "login ends" (warning under a week out, and once past) and "refresh until",
+// shown only when the login's deadline is known.
+function loginStats(c) {
+  const out = [];
+  if (c.login_ends_at) {
+    const left = tsOf(c.login_ends_at) - Date.now() / 1000;
+    out.push(left <= 0
+      ? stat("login ended — sign in again", "login ends", true)
+      : stat(dateOf(tsOf(c.login_ends_at)), "login ends", left < 7 * 86400));
+  }
+  if (c.refresh_deadline_at) out.push(stat(dateOf(tsOf(c.refresh_deadline_at)), "refresh until"));
+  return out;
+}
+
+// A date with its year: a login can end a year out, which localTime's
+// month-day form would make read as this year.
+function dateOf(tsSec) {
+  return new Date(tsSec * 1000).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+}
+
+// An expiry: the time of day within the next 24 h, otherwise the dated form.
+function whenOf(tsSec) {
+  return tsSec - Date.now() / 1000 > 86400 ? dateOf(tsSec) : localTime(tsSec);
 }
 
 function sidecarCredCard(c, root) {
@@ -390,10 +420,11 @@ function tsOf(v) {
   return isNaN(t) ? 0 : t / 1000;
 }
 
+// okMsg is a string, or a function of the response returning one.
 async function act(fn, okMsg, root) {
   try {
-    await fn();
-    toast(okMsg, "good");
+    const out = await fn();
+    toast(typeof okMsg === "function" ? okMsg(out) : okMsg, "good");
     render(root);
   } catch (e) {
     toast(e.message, "critical", 6000);
@@ -505,7 +536,7 @@ function weightModal(id, current, root, options = {}) {
 const KINDS = {
   anthropic: {
     label: "Anthropic subscription",
-    blurb: "A Pro/Max/Team/Enterprise login. The proxy keeps its token refreshed for you.",
+    blurb: "A Pro/Max/Team/Enterprise login, valid for up to a year.",
     needsJSON: true,
     claudeLogin: true,
   },

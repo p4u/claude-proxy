@@ -47,6 +47,11 @@ type credView struct {
 	ErrorCount          int64         `json:"error_count"`
 	Weight              int           `json:"weight"`
 	ActiveConversations int           `json:"active_conversations"`
+
+	// LoginEndsAt (creds.LoginEndsAt) and RefreshDeadlineAt, RFC3339 UTC, are
+	// present only when the login's deadline is known.
+	LoginEndsAt       string `json:"login_ends_at,omitempty"`
+	RefreshDeadlineAt string `json:"refresh_deadline_at,omitempty"`
 }
 
 // handleCredentials routes /credentials and /credentials/{id}/{action}. `rest`
@@ -327,6 +332,12 @@ func (s *Server) listCreds(w http.ResponseWriter, r *http.Request) {
 		}
 		if c.LastRequestAt != nil {
 			v.LastRequestAt = c.LastRequestAt.Format(time.RFC3339)
+		}
+		if t, ok := c.LoginEndsAt(); ok {
+			v.LoginEndsAt = t.UTC().Format(time.RFC3339)
+		}
+		if !c.RefreshExpiresAt.IsZero() {
+			v.RefreshDeadlineAt = c.RefreshExpiresAt.UTC().Format(time.RFC3339)
 		}
 		if c.RetryAfter != nil {
 			v.RetryAfter = c.RetryAfter.Format(time.RFC3339)
