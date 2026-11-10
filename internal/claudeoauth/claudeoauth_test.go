@@ -346,3 +346,28 @@ func TestSessionsAreBounded(t *testing.T) {
 	}
 	f.Cancel(first)
 }
+
+// A 307 from the token endpoint must not re-post the code and PKCE verifier
+// to Location: the exchange fails and the redirect target sees nothing.
+func TestExchangeDoesNotFollowRedirect(t *testing.T) {
+	fake := &fakeAnthropic{orgType: "claude_max", scope: strings.Join(Scopes, " ")}
+	fake.serve(t)
+	target := creds.TokenURL
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(redirect.Close)
+	creds.TokenURL = redirect.URL
+	t.Cleanup(func() { creds.TokenURL = target })
+
+	f := New()
+	id, state, challenge := start(t, f)
+	fake.challenge = challenge
+	_, err := f.Exchange(context.Background(), id, "the-code#"+state)
+	if fake.exchanges != 0 {
+		t.Fatalf("redirect target received %d exchanges, want 0", fake.exchanges)
+	}
+	if err == nil {
+		t.Fatal("a redirected exchange must fail")
+	}
+}

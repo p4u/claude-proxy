@@ -91,7 +91,7 @@ type Flow struct {
 func New() *Flow {
 	return &Flow{
 		sessions: map[string]pending{},
-		client:   &http.Client{Timeout: 30 * time.Second},
+		client:   &http.Client{Timeout: 30 * time.Second, CheckRedirect: creds.RefuseRedirects},
 		now:      time.Now,
 	}
 }

@@ -65,9 +65,16 @@ type failure struct {
 func NewRefresher(db *store.DB) *Refresher {
 	return &Refresher{
 		db:     db,
-		client: &http.Client{Timeout: 30 * time.Second},
+		client: &http.Client{Timeout: 30 * time.Second, CheckRedirect: RefuseRedirects},
 		log:    slog.New(slog.DiscardHandler),
 	}
+}
+
+// RefuseRedirects keeps OAuth secrets (refresh tokens, codes, bearer headers)
+// from following a Location header: a 3xx from these endpoints is returned to
+// the caller, which treats it as an ordinary non-2xx failure.
+func RefuseRedirects(_ *http.Request, _ []*http.Request) error {
+	return http.ErrUseLastResponse
 }
 
 // SetLogger sets where refresh outcomes are logged; without it they are
@@ -113,7 +120,7 @@ type TokenSet struct {
 	RefreshExpiresAt time.Time
 }
 
-var importClient = &http.Client{Timeout: 30 * time.Second}
+var importClient = &http.Client{Timeout: 30 * time.Second, CheckRedirect: RefuseRedirects}
 
 // RefreshTokens performs a stateless refresh (no DB record required), used
 // during import to verify a credential is alive before storing it. deadline

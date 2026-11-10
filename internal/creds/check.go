@@ -16,7 +16,7 @@ var ProfileURL = "https://api.anthropic.com/api/oauth/profile"
 // ErrTokenRejected means Anthropic answered 401 to the access token itself.
 var ErrTokenRejected = errors.New("access token rejected by Anthropic")
 
-var checkClient = &http.Client{Timeout: 10 * time.Second}
+var checkClient = &http.Client{Timeout: 10 * time.Second, CheckRedirect: RefuseRedirects}
 
 // CheckToken asks Anthropic's profile endpoint whether accessToken still
 // works, with the headers the web sign-in sends. nil means 200 and
