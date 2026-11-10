@@ -85,7 +85,8 @@ Claude Code (ANTHROPIC_BASE_URL → proxy)
         it strips an incoming Anthropic-Version while querying providers and
         reinjects it only for Anthropic, because the Codex sidecar's translated
         catalogue becomes obfuscated when that header is forwarded
-      → on 401: OAuth credential → refresher triggers token refresh → retry;
+      → on 401: OAuth credential → RefreshRejected: refresh + retry once only
+        if /api/oauth/profile also rejects the token, else relay upstream's 401;
         API key → marked revoked immediately (nothing to refresh);
         delegated-auth gateway (Codex sidecar) → relayed, status untouched
       → on 429: mark credential "limited", synthesize Retry-After if missing → pass 429 to client
@@ -652,7 +653,7 @@ Before this, a key added seconds after a refresh stayed invisible for 5 minutes.
 
 ### Background Goroutines
 
-- **Credential Refresher** (`internal/creds/refresh.go`): proactively refreshes tokens every 60s when `expires_at < now+5min`; reactively refreshes on 401 and retries
+- **Credential Refresher** (`internal/creds/refresh.go`): every 60s refreshes only tokens whose `expires_at < now+5min`, logging failures and revocations; on an upstream 401 it refreshes and retries only after `/api/oauth/profile` confirms the token is dead (`RefreshRejected`)
 - **Pool Janitor** (`internal/pool/pool.go`): cleans up stale conversation→credential bindings
 - **Usage Poller** (`internal/usage/`): periodically fetches 5h/7d utilization per credential into `usage_history` (this feeds the selection score)
 
@@ -904,14 +905,59 @@ existing credential.
 
 The flow uses Claude Code's client ID and its manual redirect
 (`platform.claude.com/oauth/code/callback`), the only registered redirect that
-is not a localhost port, so it works for a proxy on a remote host; the scopes
-match a Claude Code subscription login, so the result is interchangeable with an
-imported `.credentials.json`. The PKCE verifier never leaves the server, a
-session is single-use and expires after 10 minutes, and the new token must read
-`/api/oauth/profile` — which also yields the plan (`max`/`pro`/`team`/
-`enterprise`) — before anything is stored. A fresh sign-in creates a new grant;
-it does not invalidate the account's other Claude Code logins, unlike
-re-importing a `.credentials.json` that another process also refreshes.
+is not a localhost port, so it works for a proxy on a remote host. The PKCE
+verifier never leaves the server, a session is single-use and expires after 10
+minutes, and the new token must read `/api/oauth/profile` — which also yields
+the plan (`max`/`pro`/`team`/`enterprise`) — before anything is stored. Once
+the exchange starts it completes even if the browser disconnects
+(`context.WithoutCancel`), because the code cannot be used twice. A fresh
+sign-in creates a new grant; it does not invalidate the account's other Claude
+Code logins, unlike re-importing a `.credentials.json` that another process
+also refreshes.
+
+**Long-lived logins.** The sign-in asks only for `user:profile user:inference`
+(`claudeoauth.Scopes`): the narrowest grant that serves `/v1/messages`,
+`/v1/models`, plan detection and the usage API, so it no longer mirrors Claude
+Code's scope set. It sends `expires_in: 31536000` (`LoginLifetimeSeconds`) at
+the code exchange, which Anthropic answers with a one-year access token. Every
+Anthropic login also has an absolute refresh deadline
+(`refresh_token_expires_in`, about 27 days): a refresh never moves it, returns
+an 8-hour token whatever `expires_in` it is sent, and is refused (400) once the
+deadline has passed. The deadline is stored in `credentials.refresh_expires_at`
+(0 = unknown, as for every login that predates the column) with Claude Code's
+rule (`creds.nextDeadline`): a new login replaces it, a refresh only ever
+lowers it, and an unknown one stays unknown. The web UI shows "login ends"
+(`Credential.LoginEndsAt`, the later of the token expiry and the deadline,
+warning under 7 days) and "refresh until"; `creds list` prints `LOGIN_ENDS` and
+`REFRESH_UNTIL`; `creds export` carries `refreshTokenExpiresAt`.
+
+**A working token is never refreshed**, since one refresh drops a year-long
+token to 8 hours for good. The refresher calls the token endpoint only when the
+stored expiry is within 5 minutes, for a `revoked` login, or after an upstream
+401 that a liveness check confirms (`Refresher.RefreshRejected`). A 401 can
+describe the request rather than the token (its headers and path come from the
+client), so the proxy first reads `/api/oauth/profile` with the stored token
+(`creds.CheckToken`, the sign-in's headers): a 200, or any answer other than
+401, relays upstream's 401 and changes nothing; only a confirmed 401 refreshes
+and retries once, and concurrent 401s on one token share one refresh. Manual
+refresh (web UI, TUI `r`, `creds refresh`) follows the same rule and reports
+the token as still valid instead. Imports never rotate a long-lived file: a
+`.credentials.json` or export line whose `expiresAt` is more than a day away is
+checked with `CheckToken` and stored as it is. A token-endpoint 400/401 revokes
+the credential (`creds.ErrLoginRejected`, logged at ERROR); every other failure
+is transient: the status stays, `retry_after` moves 60 s out so new
+conversations avoid the credential, and the error is replayed for 30 s without
+another token call. A refresh Anthropic has answered is stored on a context the
+caller cannot cancel, with `store.Retry`. `expired` is no longer produced, and
+legacy `expired` Anthropic rows are healed to `active` at startup.
+
+> Not yet observed: a one-year token serving past its login's refresh deadline.
+> Until a production credential passes its deadline (the canary, about 27 days
+> after the first reconnect; record the result here), "refresh until" stays
+> visible and an early rejection logs at ERROR "long-lived token rejected
+> before its expiry". The proxy cannot revoke a token at Anthropic: deleting or
+> reconnecting a credential leaves its old token valid, and whether the account
+> can end that session from its Claude settings is unverified.
 
 ```bash
 make import FROM=path/to/.credentials.json LABEL=myaccount [WEIGHT=5]
@@ -923,7 +969,7 @@ make usage ID=cred_xxx           # Fetch Anthropic usage for one credential
 make usage-history PERIOD=24h    # Chart stored usage history (optional ID=cred_xxx)
 make disable ID=...              # Exclude from selection
 make rm ID=...                   # Delete credential
-make refresh ID=...              # Force token refresh
+make refresh ID=...              # Refresh a token near expiry (skips a working one)
 make weight ID=... W=N           # Adjust selection weight
 make export-credentials > f.jsonl  # Backup current tokens to file
 cat f.jsonl | make import-credentials  # Restore from backup
