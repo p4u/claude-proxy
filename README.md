@@ -157,6 +157,14 @@ rm -f ~/cp-creds/acct-A/.credentials.json
 > tokens. Re-importing the original `credentials.json` after the proxy has
 > been running will not work — the original refresh token is long since
 > superseded.
+>
+> Logins added with *Sign in with Claude* carry a one-year access token, so an
+> export holds tokens usable for up to a year: guard `backup.jsonl` like a
+> password file. `import-bulk` restores such a login exactly as exported,
+> verified against Anthropic's profile endpoint and never refreshed. The proxy
+> cannot revoke a token at Anthropic: deleting or reconnecting a credential
+> leaves its old token valid, and whether the account can end that session from
+> its Claude settings is unverified.
 
 Repeat for each account. Then point Claude Code at the proxy:
 
@@ -1081,7 +1089,7 @@ Credentials
   make usage ID=cred_xxx    Fetch usage % for a single credential
   make disable ID=cred_xxx  Mark a credential disabled (excluded from selection)
   make rm ID=cred_xxx       Remove a credential row
-  make refresh ID=cred_xxx  Force-refresh a credential's tokens
+  make refresh ID=cred_xxx  Refresh a credential's tokens if near expiry or revoked
   make weight ID=... W=...  Set the selection weight
 
 User tokens (per-user bearer auth)

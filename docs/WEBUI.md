@@ -212,6 +212,12 @@ value claims.
   false for providers publishing no utilization endpoint; the UI uses it to hide
   the usage meters, the expiry date and the OAuth-only row actions (Refresh,
   Update tokens) rather than showing 0% and a synthetic far-future date.
+  `refresh_deadline_at` and `login_ends_at` (RFC3339 UTC) are present only when
+  the login's refresh deadline is known: the first is that deadline, after
+  which the token endpoint refuses the refresh token; the second is when the
+  login stops serving, the later of the deadline and `expires_at`. The UI shows
+  them as "refresh until" and "login ends" (warning style under 7 days,
+  "login ended — sign in again" once past).
 - `POST /api/credentials` `{credentials_json, label, weight?}` → import pasted
   `.credentials.json` (use `ingest.ImportFromJSON`; verifies liveness, rejects dupes).
 - `POST /api/credentials/{id}/tier` `{tier:string}` → `{ok:true}`. Updates only
@@ -286,7 +292,12 @@ value claims.
   → `{ok,id,label,status,subscription_type,weight}`. `code` is what Anthropic
   displayed (`code#state`), a full callback URL, or a bare code; a state from a
   different sign-in is refused before contacting Anthropic. The code is
-  exchanged at the token endpoint the refresher uses, then
+  exchanged at the token endpoint the refresher uses, for the scopes
+  `user:profile user:inference` and with `expires_in: 31536000` (a one-year
+  access token; Anthropic honours it only at the exchange, never on a
+  refresh), and the login's refresh deadline (`refresh_token_expires_in`) is
+  stored with it. Once the exchange starts it completes even if the browser
+  disconnects, since the code cannot be used twice. Then
   `GET api.anthropic.com/api/oauth/profile` proves the token works and maps
   `organization_type` to the plan (`claude_max` → `max`, …; an account without a
   subscription is refused). Without `credential_id` a new credential is added
@@ -297,7 +308,13 @@ value claims.
   rejected before the code is spent. Responses never contain tokens.
 - `POST /api/credentials/oauth/cancel` `{session}` → forget a pending sign-in.
 - `POST /api/credentials/{id}/disable` | `/enable` (SetStatus disabled/active)
-- `POST /api/credentials/{id}/refresh` → force OAuth token refresh (`Refresher.RefreshNow`)
+- `POST /api/credentials/{id}/refresh` → `{ok,id,refreshed,expires_at}`. Not
+  forced (`Refresher.Refresh`): the token endpoint is called only when the
+  access token expires within 5 minutes or the login is `revoked`, because a
+  refresh replaces a year-long token with an 8-hour one for good. Otherwise
+  nothing changes and `refreshed` is false; the UI toasts "Token refreshed" or
+  "Token still valid, nothing to refresh". `502` with the error on a failed
+  refresh.
 - `POST /api/credentials/{id}/weight` `{weight}` (creds.SetWeight)
 - `POST /api/credentials/{id}/settings` `{label, weight}` → atomically edit the
   native credential's display name and selection weight. Labels are trimmed,

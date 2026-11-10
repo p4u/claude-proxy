@@ -215,7 +215,7 @@ rm: ## Remove a credential (ID=cred_xxx).
 	$(RUN) creds rm "$(ID)" --db $(DB)
 
 # usage: make refresh ID=cred_xxx
-refresh: ## Force-refresh a credential's tokens (ID=cred_xxx).
+refresh: ## Refresh a credential's tokens if near expiry or revoked (ID=cred_xxx).
 	@if [ -z "$(ID)" ]; then echo "usage: make refresh ID=cred_xxx"; exit 2; fi
 	$(RUN) creds refresh "$(ID)" --db $(DB)
 
