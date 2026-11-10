@@ -243,24 +243,6 @@ func (r *Refresher) Refresh(ctx context.Context, id string) (c *Credential, refr
 	return r.refreshLocked(ctx, c)
 }
 
-// RefreshNow forces a refresh. Transitional: its last callers (web UI, TUI)
-// move to Refresh in a later change, which deletes it.
-func (r *Refresher) RefreshNow(ctx context.Context, id string) (*Credential, error) {
-	mu := r.lockFor(id)
-	mu.Lock()
-	defer mu.Unlock()
-	ctx = context.WithoutCancel(ctx)
-	c, err := Get(ctx, r.db, id)
-	if err != nil {
-		return nil, err
-	}
-	if !provider.Get(c.Provider).Refreshable {
-		return c, ErrNotRefreshable
-	}
-	c, _, err = r.refreshLocked(ctx, c)
-	return c, err
-}
-
 // RefreshRejected handles an upstream 401 on rejected, the access token the
 // request carried. It refreshes only when the token is really dead: another
 // request may already have replaced it, and a 401 can describe the request

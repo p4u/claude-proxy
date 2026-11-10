@@ -99,12 +99,18 @@ func (s *Server) credAction(w http.ResponseWriter, r *http.Request, id, action s
 		}
 		writeJSON(w, map[string]any{"ok": true, "id": id})
 	case action == "refresh" && r.Method == http.MethodPost:
-		c, err := s.refresher.RefreshNow(ctx, id)
+		// Not forced: refreshing a working long-lived token would replace it
+		// with an 8-hour one for good, so only a token near expiry (or a
+		// revoked login) reaches the token endpoint.
+		c, refreshed, err := s.refresher.Refresh(ctx, id)
 		if err != nil {
 			writeErr(w, http.StatusBadGateway, err.Error())
 			return
 		}
-		writeJSON(w, map[string]any{"ok": true, "id": id, "expires_at": c.ExpiresAt.UTC().Format(time.RFC3339)})
+		writeJSON(w, map[string]any{
+			"ok": true, "id": id, "refreshed": refreshed,
+			"expires_at": c.ExpiresAt.UTC().Format(time.RFC3339),
+		})
 	case action == "endpoint" && r.Method == http.MethodPost:
 		var body struct {
 			Endpoint string `json:"endpoint"`

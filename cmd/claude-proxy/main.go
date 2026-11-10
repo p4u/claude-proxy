@@ -221,6 +221,7 @@ func runServe(args []string) {
 	logger := slog.New(handler)
 
 	r := creds.NewRefresher(db)
+	r.SetLogger(logger)
 	go r.Loop(ctx)
 
 	codexClient, err := codexgateway.New(codexgateway.Config{
@@ -666,17 +667,24 @@ func credsList(ctx context.Context, args []string) {
 	_ = fs.Parse(args)
 	db := openDB(*dbPath)
 	defer db.Close()
-	list, err := creds.List(ctx, db)
-	if err != nil {
+	if err := printCreds(ctx, db, os.Stdout); err != nil {
 		fmt.Fprintf(os.Stderr, "list: %v\n", err)
 		os.Exit(1)
 	}
-	if len(list) == 0 {
-		fmt.Println("(no credentials)")
-		return
+}
+
+// printCreds writes the credentials table behind `creds list`.
+func printCreds(ctx context.Context, db *store.DB, w io.Writer) error {
+	list, err := creds.List(ctx, db)
+	if err != nil {
+		return err
 	}
-	fmt.Printf("%-30s  %-9s  %-10s  %-6s  %3s  %-9s  %-25s  %5s/%5s/%5s  %s\n",
-		"ID", "PROVIDER", "LABEL", "SUB", "WT", "STATUS", "EXPIRES", "REQ", "OK", "ERR", "LAST_REQ")
+	if len(list) == 0 {
+		fmt.Fprintln(w, "(no credentials)")
+		return nil
+	}
+	fmt.Fprintf(w, "%-30s  %-9s  %-10s  %-6s  %3s  %-9s  %-25s  %-25s  %-25s  %5s/%5s/%5s  %s\n",
+		"ID", "PROVIDER", "LABEL", "SUB", "WT", "STATUS", "EXPIRES", "LOGIN_ENDS", "REFRESH_UNTIL", "REQ", "OK", "ERR", "LAST_REQ")
 	for _, c := range list {
 		lastReq := "-"
 		if c.LastRequestAt != nil {
@@ -688,11 +696,19 @@ func credsList(ctx context.Context, args []string) {
 		if !provider.Get(c.Provider).Refreshable {
 			expires = "never (api key)"
 		}
-		fmt.Printf("%-30s  %-9s  %-10s  %-6s  %3d  %-9s  %-25s  %5d/%5d/%5d  %s\n",
+		loginEnds, refreshUntil := "-", "-"
+		if t, ok := c.LoginEndsAt(); ok {
+			loginEnds = t.Format(time.RFC3339)
+		}
+		if !c.RefreshExpiresAt.IsZero() {
+			refreshUntil = c.RefreshExpiresAt.Format(time.RFC3339)
+		}
+		fmt.Fprintf(w, "%-30s  %-9s  %-10s  %-6s  %3d  %-9s  %-25s  %-25s  %-25s  %5d/%5d/%5d  %s\n",
 			c.ID, provider.Get(c.Provider).ID, c.Label, c.SubscriptionType, c.Weight, string(c.Status),
-			expires,
+			expires, loginEnds, refreshUntil,
 			c.RequestCount, c.SuccessCount, c.ErrorCount, lastReq)
 	}
+	return nil
 }
 
 func credsDisable(ctx context.Context, args []string) {
@@ -761,13 +777,26 @@ func credsRefresh(ctx context.Context, args []string) {
 	_ = fs.Parse(args[1:])
 	db := openDB(*dbPath)
 	defer db.Close()
-	r := creds.NewRefresher(db)
-	c, _, err := r.Refresh(ctx, args[0])
-	if err != nil {
+	if err := refreshCred(ctx, db, args[0], os.Stdout); err != nil {
 		fmt.Fprintf(os.Stderr, "refresh: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("refreshed %s expires=%s\n", c.ID, c.ExpiresAt.Format(time.RFC3339))
+}
+
+// refreshCred runs `creds refresh`: the token endpoint is called only for a
+// token near expiry or a revoked login, so a working token is reported as
+// skipped rather than downgraded.
+func refreshCred(ctx context.Context, db *store.DB, id string, w io.Writer) error {
+	c, refreshed, err := creds.NewRefresher(db).Refresh(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !refreshed {
+		fmt.Fprintf(w, "skipped %s: access token valid until %s\n", c.ID, c.ExpiresAt.Format(time.RFC3339))
+		return nil
+	}
+	fmt.Fprintf(w, "refreshed %s expires=%s\n", c.ID, c.ExpiresAt.Format(time.RFC3339))
+	return nil
 }
 
 // exportLine is the JSONL format used by creds export / import-bulk.

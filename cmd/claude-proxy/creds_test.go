@@ -78,3 +78,56 @@ func TestCredsExportImportBulkKeepsLongLivedLogin(t *testing.T) {
 		t.Fatalf("dead token restore = %v, want credential is not alive", err)
 	}
 }
+
+// AC10: creds list shows the login's end and refresh deadline, and creds
+// refresh reports a working token as skipped.
+func TestCredsListAndRefresh(t *testing.T) {
+	ctx := context.Background()
+	tokenCalls, _ := fakeAnthropicCLI(t)
+	_, db := cliDB(t)
+	expires := time.Now().AddDate(1, 0, 0).Truncate(time.Second)
+	deadline := time.Now().Add(20 * 24 * time.Hour).Truncate(time.Second)
+	c, err := creds.InsertWithRateLimitTier(ctx, db, "team-a", "team", "sk-ant-oat-year", "ref-year", expires, 5, "", deadline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := creds.Insert(ctx, db, "legacy", "max", "sk-ant-oat-old", "ref-old", time.Now().Add(time.Hour), 5); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := printCreds(ctx, db, &out); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	header := strings.Fields(lines[0])
+	if len(lines) != 3 || header[6] != "EXPIRES" || header[7] != "LOGIN_ENDS" || header[8] != "REFRESH_UNTIL" {
+		t.Fatalf("list output:\n%s", out.String())
+	}
+	// creds.List orders by created_at alone and both rows share a second, so
+	// pick each row by its label rather than its position.
+	row := func(label string) []string {
+		for _, l := range lines[1:] {
+			if f := strings.Fields(l); len(f) > 8 && f[2] == label {
+				return f
+			}
+		}
+		t.Fatalf("no row labelled %q:\n%s", label, out.String())
+		return nil
+	}
+	if f := row("team-a"); f[6] != expires.Format(time.RFC3339) || f[7] != expires.Format(time.RFC3339) || f[8] != deadline.Format(time.RFC3339) {
+		t.Fatalf("long-lived row: %q", f)
+	}
+	if f := row("legacy"); f[7] != "-" || f[8] != "-" {
+		t.Fatalf("legacy row should show - for unknown: %q", f)
+	}
+
+	out.Reset()
+	if err := refreshCred(ctx, db, c.ID, &out); err != nil {
+		t.Fatal(err)
+	}
+	want := "skipped " + c.ID + ": access token valid until " + expires.Format(time.RFC3339) + "\n"
+	if out.String() != want || tokenCalls.Load() != 0 {
+		t.Fatalf("refresh printed %q (token calls %d), want %q", out.String(), tokenCalls.Load(), want)
+	}
+}

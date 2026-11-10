@@ -116,3 +116,43 @@ func TestPasteImport(t *testing.T) {
 		t.Fatalf("expected refreshed access token, got %q", list[0].AccessToken)
 	}
 }
+
+// AC5b: the TUI's r leaves a working long-lived token alone and says why.
+func TestRefreshKeyLeavesLiveTokenAlone(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		_, _ = w.Write([]byte(`{"access_token":"sk-ant-oat-fresh","refresh_token":"ref-fresh","expires_in":28800}`))
+	}))
+	defer srv.Close()
+	prev := creds.TokenURL
+	creds.SetTokenURL(srv.URL)
+	defer creds.SetTokenURL(prev)
+	c, err := creds.Insert(ctx, db, "acct-A", "max", "sk-ant-oat-x", "ref", time.Now().AddDate(1, 0, 0), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, _ := creds.Get(ctx, db, c.ID)
+
+	m := &model{db: db, refresher: creds.NewRefresher(db)}
+	m.initTables()
+	m.Update(m.loadCreds()())
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	if cmd == nil {
+		t.Fatal("r should return a refresh command")
+	}
+	done, ok := cmd().(actionDoneMsg)
+	want := "skipped " + c.ID + ": access token valid until " + stored.ExpiresAt.Format(time.RFC3339)
+	if !ok || done.err != nil || done.msg != want {
+		t.Fatalf("r = %+v, want %q", done, want)
+	}
+	if calls != 0 {
+		t.Fatalf("r made %d token calls for a year-long token", calls)
+	}
+}

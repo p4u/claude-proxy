@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
@@ -186,7 +187,7 @@ func (m *model) handleCredKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 	switch msg.String() {
-	case "r": // force token refresh
+	case "r": // refresh the token if it is near expiry or revoked
 		m.busy = true
 		m.status = "refreshing " + c.ID + "…"
 		return m, m.refreshCred(c.ID)
@@ -409,11 +410,14 @@ func (m *model) submitInput() (tea.Model, tea.Cmd) {
 func (m *model) refreshCred(id string) tea.Cmd {
 	r := m.refresher
 	return func() tea.Msg {
-		c, err := r.RefreshNow(context.Background(), id)
+		c, refreshed, err := r.Refresh(context.Background(), id)
 		if err != nil {
 			return actionDoneMsg{err: fmt.Errorf("refresh %s: %w", id, err)}
 		}
-		return actionDoneMsg{msg: fmt.Sprintf("refreshed %s (expires %s)", id, c.ExpiresAt.Local().Format("15:04"))}
+		if !refreshed {
+			return actionDoneMsg{msg: fmt.Sprintf("skipped %s: access token valid until %s", id, c.ExpiresAt.Format(time.RFC3339))}
+		}
+		return actionDoneMsg{msg: fmt.Sprintf("refreshed %s (expires %s)", id, c.ExpiresAt.Format(time.RFC3339))}
 	}
 }
 
