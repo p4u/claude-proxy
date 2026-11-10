@@ -383,8 +383,9 @@ type forwardResult struct {
 }
 
 // forward sends the request upstream and streams the response back. If
-// allowRetry is true and upstream returns 401, it refreshes the credential and
-// retries once, before any response bytes have been sent to the client.
+// allowRetry is true and upstream returns 401 on a token the refresher
+// confirms is dead, it refreshes the credential and retries once, before any
+// response bytes have been sent to the client.
 // requestedModel is the model exactly as the client sent it, before the
 // advertising alias was stripped. Successful responses carry it back to the
 // client (see restoreModel below), so what the client records about a turn is
@@ -568,22 +569,37 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, r
 	}
 
 	if resp.StatusCode == http.StatusUnauthorized && allowRetry && !up.DelegatedAuth {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		// A 401 can describe the request (its headers and path come from the
+		// client) rather than the token, and refreshing a long-lived token
+		// downgrades it for good, so the refresher first confirms the token is
+		// dead. The body is kept whole in case it is relayed.
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 		_ = resp.Body.Close()
 		errorType := upstreamErrorType(raw, resp.Header.Get("Content-Encoding"))
-		h.log.Warn("upstream 401; attempting refresh",
-			"cred", cred.ID,
-			"error_type", errorType)
-		fresh, rerr := h.refresher.RefreshNow(r.Context(), cred.ID)
-		if rerr != nil {
-			_ = creds.SetStatus(r.Context(), h.db, cred.ID, creds.StatusExpired)
+		fresh, refreshed, rerr := h.refresher.RefreshRejected(r.Context(), cred.ID, cred.AccessToken)
+		switch {
+		case rerr == nil:
+			h.log.Info("upstream 401; retrying with the stored token",
+				"cred", cred.ID, "label", cred.Label, "refreshed", refreshed)
+			return h.forward(w, r, body, requestedModel, fresh, false, captureText, captureSummary)
+		case errors.Is(rerr, creds.ErrTokenAlive):
+			// Not the token's fault: relay upstream's answer as it came. The
+			// generic >= 400 branch below runs MarkError; no status changes.
+			h.log.Warn("upstream 401 on a live token; relayed without a refresh",
+				"cred", cred.ID, "label", cred.Label, "path", r.URL.Path,
+				"error_type", errorType, "err", rerr)
+			resp.Body = io.NopCloser(bytes.NewReader(raw))
+		case errors.Is(rerr, creds.ErrLoginRejected):
+			// The refresher logged the revocation.
 			_ = creds.MarkError(r.Context(), h.db, cred.ID)
-			h.log.Error("refresh failed after 401; marked expired", "cred", cred.ID, "err", rerr)
-			http.Error(w, "proxy: credential expired", http.StatusBadGateway)
+			http.Error(w, "proxy: credential revoked by Anthropic; sign in again", http.StatusBadGateway)
+			return forwardResult{status: http.StatusUnauthorized, errorType: errorType}
+		default:
+			// Transient: the refresher logged it and set a short retry_after.
+			_ = creds.MarkError(r.Context(), h.db, cred.ID)
+			http.Error(w, "proxy: token refresh failed; retry", http.StatusBadGateway)
 			return forwardResult{status: http.StatusUnauthorized, errorType: errorType}
 		}
-		h.log.Info("refresh succeeded; retrying upstream", "cred", cred.ID)
-		return h.forward(w, r, body, requestedModel, fresh, false, captureText, captureSummary)
 	}
 
 	if resp.StatusCode == http.StatusTooManyRequests {

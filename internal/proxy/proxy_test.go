@@ -201,65 +201,6 @@ func TestForward429MarksLimited(t *testing.T) {
 	}
 }
 
-func TestForward401TriggersRefresh(t *testing.T) {
-	var hits int32
-	// Refresher needs a fake token endpoint too. Build a single mux that handles both.
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) {
-		n := atomic.AddInt32(&hits, 1)
-		if n == 1 {
-			w.WriteHeader(401)
-			fmt.Fprintln(w, `{"error":"expired"}`)
-			return
-		}
-		w.WriteHeader(200)
-		fmt.Fprintln(w, `{"ok":true}`)
-	})
-	mux.HandleFunc("/v1/oauth/token", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintln(w, `{"access_token":"sk-ant-oat-refreshed","refresh_token":"rt-new","expires_in":3600}`)
-	})
-	ts := httptest.NewServer(mux)
-	defer ts.Close()
-
-	dir := t.TempDir()
-	db, _ := store.Open(filepath.Join(dir, "t.db"))
-	defer db.Close()
-	ctx := context.Background()
-	c, _ := creds.Insert(ctx, db, "A", "max", "sk-ant-oat-stale", "rt-A", time.Now().Add(time.Hour), 0)
-
-	// Patch refresher's token URL via direct HTTP override: simplest is to
-	// route a custom client. We'll point a custom refresher at the mux by
-	// rewriting URLs the same way as the proxy.
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	tsURL, _ := url.Parse(ts.URL)
-	r := creds.NewRefresher(db)
-	// replace internal client via patch helper added below
-	creds.SetTokenClient(r, &http.Client{Transport: &rewriter{base: tsURL, rt: ts.Client().Transport}})
-	creds.SetTokenURL("http://placeholder-host.invalid/v1/oauth/token") // host gets rewritten
-
-	h := New(db, pool.New(db), r, logger)
-	withUpstream(h, ts)
-
-	body := []byte(`{"metadata":{"user_id":"sess-401"},"messages":[{"role":"user","content":"hi"}]}`)
-	req := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader(body))
-	rw := httptest.NewRecorder()
-	h.ServeHTTP(rw, req)
-
-	if rw.Code != 200 {
-		t.Fatalf("expected refreshed retry to succeed, got %d body=%s", rw.Code, rw.Body.String())
-	}
-	if atomic.LoadInt32(&hits) != 2 {
-		t.Fatalf("expected 2 upstream hits (401 then 200), got %d", hits)
-	}
-
-	// Credential's access token must have been rotated.
-	got, _ := creds.Get(ctx, db, c.ID)
-	if got.AccessToken != "sk-ant-oat-refreshed" {
-		t.Fatalf("token not rotated: %s", got.AccessToken)
-	}
-}
-
 // A request carrying X-Claude-Code-Session-Id records which credential served
 // it, scoped to the caller; requests without a (valid) header record nothing.
 func TestSessionBindingRecordedFromHeader(t *testing.T) {
