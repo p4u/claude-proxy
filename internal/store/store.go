@@ -111,11 +111,21 @@ func Open(path string) (*DB, error) {
 		// and trimmed. The index must follow the column for older databases.
 		`ALTER TABLE user_tokens ADD COLUMN email TEXT`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_user_tokens_email ON user_tokens(email) WHERE email IS NOT NULL`,
+		// Login refresh deadline in Unix seconds. The default 0 means unknown,
+		// which is what every row that predates the column reads as.
+		`ALTER TABLE credentials ADD COLUMN refresh_expires_at INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := sdb.Exec(alter); err != nil && !isDuplicateColumn(err) {
 			_ = sdb.Close()
 			return nil, fmt.Errorf("migrate %q: %w", alter, err)
 		}
+	}
+	// A failed refresh no longer produces "expired": it is either a rejection
+	// (revoked) or transient (status unchanged). Legacy rows go back to active
+	// so the refresher and the 401 path judge their tokens again.
+	if _, err := sdb.Exec(`UPDATE credentials SET status='active' WHERE status='expired' AND provider='anthropic'`); err != nil {
+		_ = sdb.Close()
+		return nil, fmt.Errorf("heal expired credentials: %w", err)
 	}
 	// Must follow the bound_at migration for databases created before it existed.
 	if _, err := sdb.Exec(`CREATE INDEX IF NOT EXISTS idx_conversations_bound_at ON conversations(bound_at)`); err != nil {

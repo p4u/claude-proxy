@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/p4u/claude-proxy/internal/claudeoauth"
 	"github.com/p4u/claude-proxy/internal/creds"
@@ -88,7 +89,7 @@ func insertVerified(ctx context.Context, db *store.DB, o oauthBlock, label strin
 	if label == "" {
 		label = o.SubscriptionType
 	}
-	return creds.InsertWithRateLimitTier(ctx, db, label, o.SubscriptionType, accessToken, refreshToken, expires, weight, o.RateLimitTier)
+	return creds.InsertWithRateLimitTier(ctx, db, label, o.SubscriptionType, accessToken, refreshToken, expires, weight, o.RateLimitTier, time.Time{})
 }
 
 // Import reads a Claude Code .credentials.json and inserts it into the pool.
@@ -150,7 +151,7 @@ func updateVerified(ctx context.Context, db *store.DB, id string, o oauthBlock) 
 	if err != nil {
 		return nil, fmt.Errorf("credential is not alive: %w", err)
 	}
-	if err := creds.UpdateTokensWithSubscription(ctx, db, id, accessToken, refreshToken, expires, o.SubscriptionType, o.RateLimitTier); err != nil {
+	if err := creds.UpdateTokensWithSubscription(ctx, db, id, accessToken, refreshToken, expires, o.SubscriptionType, o.RateLimitTier, time.Time{}); err != nil {
 		return nil, err
 	}
 	return creds.Get(ctx, db, id)
@@ -175,7 +176,7 @@ func ImportOAuth(ctx context.Context, db *store.DB, t *claudeoauth.Tokens, label
 	if label == "" {
 		label = t.SubscriptionType
 	}
-	return creds.InsertWithRateLimitTier(ctx, db, label, t.SubscriptionType, t.AccessToken, t.RefreshToken, t.ExpiresAt, weight, t.RateLimitTier)
+	return creds.InsertWithRateLimitTier(ctx, db, label, t.SubscriptionType, t.AccessToken, t.RefreshToken, t.ExpiresAt, weight, t.RateLimitTier, time.Time{})
 }
 
 // UpdateFromOAuth re-points an existing credential at a fresh OAuth sign-in,
@@ -188,7 +189,7 @@ func UpdateFromOAuth(ctx context.Context, db *store.DB, id string, t *claudeoaut
 	if c.Provider != provider.Anthropic {
 		return nil, fmt.Errorf("%s is not an Anthropic subscription", id)
 	}
-	if err := creds.UpdateTokensWithSubscription(ctx, db, id, t.AccessToken, t.RefreshToken, t.ExpiresAt, t.SubscriptionType, t.RateLimitTier); err != nil {
+	if err := creds.UpdateTokensWithSubscription(ctx, db, id, t.AccessToken, t.RefreshToken, t.ExpiresAt, t.SubscriptionType, t.RateLimitTier, time.Time{}); err != nil {
 		return nil, err
 	}
 	return creds.Get(ctx, db, id)

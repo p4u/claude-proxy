@@ -124,7 +124,7 @@ func TestStaleRefreshDoesNotUndoReplacedTokens(t *testing.T) {
 			go func() { _, err := r.RefreshNow(ctx, c.ID); done <- err }()
 
 			<-entered
-			if err := UpdateTokens(ctx, db, c.ID, "sk-ant-oat-relogin", "ref-relogin", time.Now().Add(8*time.Hour)); err != nil {
+			if err := UpdateTokensWithSubscription(ctx, db, c.ID, "sk-ant-oat-relogin", "ref-relogin", time.Now().Add(8*time.Hour), "", "", time.Time{}); err != nil {
 				t.Fatal(err)
 			}
 			close(release)

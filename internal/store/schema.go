@@ -18,6 +18,9 @@ CREATE TABLE IF NOT EXISTS credentials (
   access_token      TEXT NOT NULL,
   refresh_token     TEXT NOT NULL,
   expires_at        INTEGER NOT NULL,
+  -- Login deadline Anthropic reports as refresh_token_expires_in, in Unix
+  -- seconds; 0 = unknown. Refreshes never move it (creds.nextDeadline).
+  refresh_expires_at INTEGER NOT NULL DEFAULT 0,
   status            TEXT NOT NULL,
   retry_after       INTEGER,
   last_success_at   INTEGER,

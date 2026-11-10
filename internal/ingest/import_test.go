@@ -141,7 +141,7 @@ func TestReconnectTierMetadata(t *testing.T) {
 		} {
 			t.Run(source+"/"+tt.name, func(t *testing.T) {
 				db := testDB(t)
-				c, err := creds.InsertWithRateLimitTier(ctx, db, "old", "max", "sk-ant-oat-old", "ref-old", future(), 11, "20x")
+				c, err := creds.InsertWithRateLimitTier(ctx, db, "old", "max", "sk-ant-oat-old", "ref-old", future(), 11, "20x", time.Time{})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -182,7 +182,7 @@ func TestImportInvalidTierBeforeRefresh(t *testing.T) {
 	prev := creds.TokenURL
 	creds.SetTokenURL(srv.URL)
 	t.Cleanup(func() { creds.SetTokenURL(prev); srv.Close() })
-	c, err := creds.InsertWithRateLimitTier(ctx, db, "old", "max", "sk-ant-oat-old", "ref-old", future(), 5, "20x")
+	c, err := creds.InsertWithRateLimitTier(ctx, db, "old", "max", "sk-ant-oat-old", "ref-old", future(), 5, "20x", time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}

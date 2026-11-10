@@ -66,7 +66,7 @@ func TestInsertGetList(t *testing.T) {
 func TestRateLimitTierPersistence(t *testing.T) {
 	ctx := context.Background()
 	db := testDB(t)
-	c, err := InsertWithRateLimitTier(ctx, db, "tiered", "max", "sk-ant-oat-access", "ref", time.Now().Add(time.Hour), 0, " default_claude_max_20x ")
+	c, err := InsertWithRateLimitTier(ctx, db, "tiered", "max", "sk-ant-oat-access", "ref", time.Now().Add(time.Hour), 0, " default_claude_max_20x ", time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +153,7 @@ func TestRateLimitTierRejectsInvalid(t *testing.T) {
 		if err := SetRateLimitTier(ctx, db, c.ID, tier); !errors.Is(err, ErrInvalidRateLimitTier) {
 			t.Fatalf("set invalid %q: %v", tier, err)
 		}
-		if _, err := InsertWithRateLimitTier(ctx, db, "invalid", "max", "fake", "fake", time.Now(), 5, tier); !errors.Is(err, ErrInvalidRateLimitTier) {
+		if _, err := InsertWithRateLimitTier(ctx, db, "invalid", "max", "fake", "fake", time.Now(), 5, tier, time.Time{}); !errors.Is(err, ErrInvalidRateLimitTier) {
 			t.Fatalf("insert invalid %q: %v", tier, err)
 		}
 	}
@@ -296,7 +296,7 @@ func TestSetStatusAndUpdateTokens(t *testing.T) {
 	}
 
 	exp := time.Now().Add(2 * time.Hour)
-	if err := UpdateTokens(ctx, db, c.ID, "sk-ant-oat-new", "ref-new", exp); err != nil {
+	if err := UpdateTokensWithSubscription(ctx, db, c.ID, "sk-ant-oat-new", "ref-new", exp, "", "", time.Time{}); err != nil {
 		t.Fatalf("update-tokens: %v", err)
 	}
 	got, _ = Get(ctx, db, c.ID)
@@ -316,7 +316,7 @@ func TestSetStatusAndUpdateTokens(t *testing.T) {
 
 func TestUpdateTokensWithSubscriptionMissing(t *testing.T) {
 	err := UpdateTokensWithSubscription(context.Background(), testDB(t), "cred_missing",
-		"sk-ant-oat-new", "ref-new", time.Now().Add(time.Hour), "max", "20x")
+		"sk-ant-oat-new", "ref-new", time.Now().Add(time.Hour), "max", "20x", time.Time{})
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing ID: %v", err)
 	}

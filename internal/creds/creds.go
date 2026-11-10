@@ -58,6 +58,10 @@ type Credential struct {
 	ErrorCount    int64
 	Weight        int
 	CreatedAt     time.Time
+
+	// RefreshExpiresAt is the login's refresh deadline: after it the token
+	// endpoint refuses the refresh token. Zero when Anthropic never reported it.
+	RefreshExpiresAt time.Time
 }
 
 // Model is one entry in a credential's own catalogue.
@@ -147,13 +151,14 @@ func newID() string {
 // Insert stores an Anthropic OAuth credential (access + refresh token pair).
 // For static API keys from other providers, use InsertKey.
 func Insert(ctx context.Context, db *store.DB, label, subType, access, refresh string, expiresAt time.Time, weight int) (*Credential, error) {
-	return InsertWithRateLimitTier(ctx, db, label, subType, access, refresh, expiresAt, weight, "")
+	return InsertWithRateLimitTier(ctx, db, label, subType, access, refresh, expiresAt, weight, "", time.Time{})
 }
 
 // InsertWithRateLimitTier stores an OAuth credential and its known tier in one
 // write. Insert remains the backward-compatible entry point for unknown tiers.
-func InsertWithRateLimitTier(ctx context.Context, db *store.DB, label, subType, access, refresh string, expiresAt time.Time, weight int, tier string) (*Credential, error) {
-	return insert(ctx, db, provider.Anthropic, "", nil, label, subType, access, refresh, expiresAt, weight, tier)
+// refreshExpiresAt is the login's refresh deadline, zero when unknown.
+func InsertWithRateLimitTier(ctx context.Context, db *store.DB, label, subType, access, refresh string, expiresAt time.Time, weight int, tier string, refreshExpiresAt time.Time) (*Credential, error) {
+	return insert(ctx, db, provider.Anthropic, "", nil, label, subType, access, refresh, expiresAt, refreshExpiresAt, weight, tier)
 }
 
 // keyExpiry is the stored expires_at for API-key credentials. They never
@@ -167,23 +172,23 @@ func keyExpiry() time.Time { return time.Now().AddDate(100, 0, 0) }
 // InsertKey stores a static API-key credential (GLM and any future key-based
 // provider). There is no refresh token and no meaningful expiry.
 func InsertKey(ctx context.Context, db *store.DB, p provider.ID, label, plan, apiKey, baseURL string, weight int) (*Credential, error) {
-	return insert(ctx, db, p, baseURL, nil, label, plan, apiKey, "", keyExpiry(), weight, "")
+	return insert(ctx, db, p, baseURL, nil, label, plan, apiKey, "", keyExpiry(), time.Time{}, weight, "")
 }
 
 // InsertCustomKey stores a key for a custom Anthropic-compatible host, which
 // carries its own base URL and model catalogue.
 func InsertCustomKey(ctx context.Context, db *store.DB, label, apiKey, baseURL string, models []Model, weight int) (*Credential, error) {
-	return insert(ctx, db, provider.Custom, baseURL, models, label, "", apiKey, "", keyExpiry(), weight, "")
+	return insert(ctx, db, provider.Custom, baseURL, models, label, "", apiKey, "", keyExpiry(), time.Time{}, weight, "")
 }
 
 // InsertCustomOpenAIKey stores a bearer token for a custom OpenAI-compatible
 // Chat Completions host. Like a custom Anthropic host, it carries its own base
 // URL and model catalogue.
 func InsertCustomOpenAIKey(ctx context.Context, db *store.DB, label, apiKey, baseURL string, models []Model, weight int) (*Credential, error) {
-	return insert(ctx, db, provider.CustomOpenAI, baseURL, models, label, "", apiKey, "", keyExpiry(), weight, "")
+	return insert(ctx, db, provider.CustomOpenAI, baseURL, models, label, "", apiKey, "", keyExpiry(), time.Time{}, weight, "")
 }
 
-func insert(ctx context.Context, db *store.DB, p provider.ID, baseURL string, models []Model, label, subType, access, refresh string, expiresAt time.Time, weight int, tier string) (*Credential, error) {
+func insert(ctx context.Context, db *store.DB, p provider.ID, baseURL string, models []Model, label, subType, access, refresh string, expiresAt, refreshExpiresAt time.Time, weight int, tier string) (*Credential, error) {
 	tier, err := NormalizeRateLimitTier(tier)
 	if err != nil {
 		return nil, err
@@ -205,20 +210,42 @@ func insert(ctx context.Context, db *store.DB, p provider.ID, baseURL string, mo
 		AccessToken:      access,
 		RefreshToken:     refresh,
 		ExpiresAt:        expiresAt,
+		RefreshExpiresAt: refreshExpiresAt,
 		Status:           StatusActive,
 		Weight:           weight,
 		CreatedAt:        time.Now(),
 	}
 	_, err = db.ExecContext(
 		ctx, `
-		INSERT INTO credentials (id, label, subscription_type, rate_limit_tier, provider, base_url, models, access_token, refresh_token, expires_at, status, weight, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		c.ID, c.Label, c.SubscriptionType, c.RateLimitTier, string(c.Provider), c.BaseURL, encodeModels(c.Models), c.AccessToken, c.RefreshToken, c.ExpiresAt.Unix(), string(c.Status), c.Weight, c.CreatedAt.Unix(),
+		INSERT INTO credentials (id, label, subscription_type, rate_limit_tier, provider, base_url, models, access_token, refresh_token, expires_at, refresh_expires_at, status, weight, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.ID, c.Label, c.SubscriptionType, c.RateLimitTier, string(c.Provider), c.BaseURL, encodeModels(c.Models), c.AccessToken, c.RefreshToken, c.ExpiresAt.Unix(), unixOrZero(c.RefreshExpiresAt), string(c.Status), c.Weight, c.CreatedAt.Unix(),
 	)
 	if err != nil {
 		return nil, err
 	}
 	return c, nil
+}
+
+// unixOrZero stores an unknown (zero) time as 0 rather than year 1's Unix value.
+func unixOrZero(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.Unix()
+}
+
+// LoginEndsAt reports when an OAuth login stops serving: the later of the
+// access-token expiry and the refresh deadline. ok is false for providers
+// without OAuth refresh and for logins whose deadline is unknown.
+func (c *Credential) LoginEndsAt() (time.Time, bool) {
+	if !provider.Get(c.Provider).Refreshable || c.RefreshExpiresAt.IsZero() {
+		return time.Time{}, false
+	}
+	if c.ExpiresAt.After(c.RefreshExpiresAt) {
+		return c.ExpiresAt, true
+	}
+	return c.RefreshExpiresAt, true
 }
 
 // ErrInvalidRateLimitTier identifies malformed tier metadata, distinct from a
@@ -302,7 +329,8 @@ const SelectCols = `id, COALESCE(label,''), COALESCE(subscription_type,''), rate
        COALESCE(provider,'anthropic'), COALESCE(base_url,''), COALESCE(models,''),
        access_token, refresh_token, expires_at, status,
        retry_after, last_success_at, last_429_at, last_request_at,
-       request_count, success_count, error_count, weight, created_at`
+       request_count, success_count, error_count, weight, created_at,
+       refresh_expires_at`
 
 const credSelectCols = SelectCols
 
@@ -321,7 +349,7 @@ func scanCred(rs interface {
 },
 ) (*Credential, error) {
 	c := &Credential{}
-	var exp, created int64
+	var exp, created, refreshExp int64
 	var ra, ls, l429, lreq sql.NullInt64
 	var status, prov, models string
 	if err := rs.Scan(
@@ -329,12 +357,16 @@ func scanCred(rs interface {
 		&c.AccessToken, &c.RefreshToken, &exp, &status,
 		&ra, &ls, &l429, &lreq,
 		&c.RequestCount, &c.SuccessCount, &c.ErrorCount, &c.Weight, &created,
+		&refreshExp,
 	); err != nil {
 		return nil, err
 	}
 	c.Provider = provider.ID(prov)
 	c.Models = decodeModels(models)
 	c.ExpiresAt = time.Unix(exp, 0)
+	if refreshExp > 0 {
+		c.RefreshExpiresAt = time.Unix(refreshExp, 0)
+	}
 	c.Status = Status(status)
 	c.CreatedAt = time.Unix(created, 0)
 	if ra.Valid {
@@ -441,30 +473,25 @@ func SetStatus(ctx context.Context, db *store.DB, id string, s Status) error {
 	return err
 }
 
-func UpdateTokens(ctx context.Context, db *store.DB, id, access, refresh string, expiresAt time.Time) error {
-	_, err := db.ExecContext(ctx, `
-		UPDATE credentials SET access_token=?, refresh_token=?, expires_at=?, status='active'
-		WHERE id=?`, access, refresh, expiresAt.Unix(), id)
-	return err
-}
-
 // UpdateTokensWithSubscription atomically reconnects a credential and records
 // known subscription metadata. Absent values retain existing metadata, except
 // that a changed broad plan clears a stale tier when no replacement is supplied.
-// Weight is never derived from the tier or changed during a reconnect.
-func UpdateTokensWithSubscription(ctx context.Context, db *store.DB, id, access, refresh string, expiresAt time.Time, subType, tier string) error {
+// Weight is never derived from the tier or changed during a reconnect. A new
+// login has its own deadline, so refreshExpiresAt replaces the stored one
+// (zero stores unknown).
+func UpdateTokensWithSubscription(ctx context.Context, db *store.DB, id, access, refresh string, expiresAt time.Time, subType, tier string, refreshExpiresAt time.Time) error {
 	tier, err := NormalizeRateLimitTier(tier)
 	if err != nil {
 		return err
 	}
 	res, err := db.ExecContext(ctx, `UPDATE credentials
-		SET access_token=?, refresh_token=?, expires_at=?, status='active',
+		SET access_token=?, refresh_token=?, expires_at=?, refresh_expires_at=?, status='active',
 		    rate_limit_tier=CASE
 		        WHEN ?<>'' THEN ?
 		        WHEN ?<>'' AND ?<>COALESCE(subscription_type,'') THEN ''
 		        ELSE rate_limit_tier END,
 		    subscription_type=CASE WHEN ?<>'' THEN ? ELSE subscription_type END
-		WHERE id=?`, access, refresh, expiresAt.Unix(), tier, tier, subType, subType, subType, subType, id)
+		WHERE id=?`, access, refresh, expiresAt.Unix(), unixOrZero(refreshExpiresAt), tier, tier, subType, subType, subType, subType, id)
 	if err != nil {
 		return err
 	}
