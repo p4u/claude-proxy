@@ -1,6 +1,6 @@
 # Anthropic login lifetime: design
 
-Status: audited (2026-11-10)   Class: architectural
+Status: approved (2026-11-10)   Class: architectural
 Owner decisions so far:
 - 2026-11-10: web sign-in moves to long-lived logins (only the scopes the proxy uses, plus a
   1-year access token at the code exchange), with each login's deadline stored and shown.
