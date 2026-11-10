@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -20,6 +21,18 @@ type oauthBlock struct {
 	Scopes           []string `json:"scopes"`
 	SubscriptionType string   `json:"subscriptionType"`
 	RateLimitTier    string   `json:"rateLimitTier"`
+
+	// RefreshTokenExpiresAt is the login's refresh deadline in milliseconds,
+	// as Claude Code records it; 0 or absent means unknown.
+	RefreshTokenExpiresAt int64 `json:"refreshTokenExpiresAt,omitempty"`
+}
+
+// deadline returns the file's refresh deadline, zero when unknown.
+func (o oauthBlock) deadline() time.Time {
+	if o.RefreshTokenExpiresAt <= 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(o.RefreshTokenExpiresAt)
 }
 
 type credFile struct {
@@ -67,10 +80,36 @@ func parseCredFile(path string) (oauthBlock, error) {
 	return parseCredBytes(raw, path)
 }
 
+// verifyFile proves a file's login is alive and returns the tokens to store.
+// A long-lived login (access token valid for more than a day, which an 8-hour
+// token never is) is checked against the profile endpoint and kept as it is:
+// a refresh would replace its year-long token with an 8-hour one for good.
+// Any other file is refreshed, which also yields an authoritative expiry.
+func verifyFile(ctx context.Context, o oauthBlock) (creds.TokenSet, error) {
+	fmt.Fprintf(os.Stderr, "verifying credential with Anthropic...\n")
+	expires := time.UnixMilli(o.ExpiresAt)
+	if time.Until(expires) > creds.LongLived {
+		if err := creds.CheckToken(ctx, o.AccessToken); err != nil {
+			if errors.Is(err, creds.ErrTokenRejected) {
+				return creds.TokenSet{}, fmt.Errorf("credential is not alive: %w", err)
+			}
+			return creds.TokenSet{}, err
+		}
+		return creds.TokenSet{
+			AccessToken: o.AccessToken, RefreshToken: o.RefreshToken,
+			ExpiresAt: expires, RefreshExpiresAt: o.deadline(),
+		}, nil
+	}
+	ts, err := creds.RefreshTokens(ctx, o.RefreshToken, o.deadline())
+	if err != nil {
+		return creds.TokenSet{}, fmt.Errorf("credential is not alive: %w", err)
+	}
+	return ts, nil
+}
+
 // insertVerified runs the shared liveness-check + insert path used by Import and
-// ImportFromJSON: it refreshes the token to confirm the credential is alive
-// (yielding a fresh access token + authoritative expiry), rejects duplicates,
-// and inserts. label defaults to the subscription type when empty.
+// ImportFromJSON: it verifies the login (verifyFile), rejects duplicates, and
+// inserts. label defaults to the subscription type when empty.
 func insertVerified(ctx context.Context, db *store.DB, o oauthBlock, label string, weight int) (*creds.Credential, error) {
 	dup, err := creds.HasRefreshToken(ctx, db, o.RefreshToken)
 	if err != nil {
@@ -80,10 +119,9 @@ func insertVerified(ctx context.Context, db *store.DB, o oauthBlock, label strin
 		return nil, fmt.Errorf("credential already imported (refresh token already exists in the pool)")
 	}
 
-	fmt.Fprintf(os.Stderr, "verifying credential with Anthropic...\n")
-	ts, err := creds.RefreshTokens(ctx, o.RefreshToken, time.Time{})
+	ts, err := verifyFile(ctx, o)
 	if err != nil {
-		return nil, fmt.Errorf("credential is not alive: %w", err)
+		return nil, err
 	}
 
 	if label == "" {
@@ -115,9 +153,9 @@ func ImportFromJSON(ctx context.Context, db *store.DB, raw []byte, label string,
 
 // UpdateFromFile re-points an existing credential at a freshly re-logged-in
 // .credentials.json — used when a subscription's OAuth lineage was reset and
-// the stored refresh token no longer works. It verifies the new token is alive
-// (which also yields a fresh access token + authoritative expiry) and writes it
-// over the existing credential's tokens, healing its status back to active.
+// the stored refresh token no longer works. It verifies the new login is alive
+// (verifyFile) and writes it over the existing credential's tokens, healing its
+// status back to active.
 //
 // Unlike Import it does not run the duplicate-refresh-token check: a credential
 // legitimately re-uses its own lineage, and the file may even carry the same
@@ -146,10 +184,9 @@ func updateVerified(ctx context.Context, db *store.DB, id string, o oauthBlock) 
 	if _, err := creds.Get(ctx, db, id); err != nil {
 		return nil, err
 	}
-	fmt.Fprintf(os.Stderr, "verifying credential with Anthropic...\n")
-	ts, err := creds.RefreshTokens(ctx, o.RefreshToken, time.Time{})
+	ts, err := verifyFile(ctx, o)
 	if err != nil {
-		return nil, fmt.Errorf("credential is not alive: %w", err)
+		return nil, err
 	}
 	if err := creds.UpdateTokensWithSubscription(ctx, db, id, ts.AccessToken, ts.RefreshToken, ts.ExpiresAt, o.SubscriptionType, o.RateLimitTier, ts.RefreshExpiresAt); err != nil {
 		return nil, err
@@ -176,7 +213,7 @@ func ImportOAuth(ctx context.Context, db *store.DB, t *claudeoauth.Tokens, label
 	if label == "" {
 		label = t.SubscriptionType
 	}
-	return creds.InsertWithRateLimitTier(ctx, db, label, t.SubscriptionType, t.AccessToken, t.RefreshToken, t.ExpiresAt, weight, t.RateLimitTier, time.Time{})
+	return creds.InsertWithRateLimitTier(ctx, db, label, t.SubscriptionType, t.AccessToken, t.RefreshToken, t.ExpiresAt, weight, t.RateLimitTier, t.RefreshTokenExpiresAt)
 }
 
 // UpdateFromOAuth re-points an existing credential at a fresh OAuth sign-in,
@@ -189,7 +226,7 @@ func UpdateFromOAuth(ctx context.Context, db *store.DB, id string, t *claudeoaut
 	if c.Provider != provider.Anthropic {
 		return nil, fmt.Errorf("%s is not an Anthropic subscription", id)
 	}
-	if err := creds.UpdateTokensWithSubscription(ctx, db, id, t.AccessToken, t.RefreshToken, t.ExpiresAt, t.SubscriptionType, t.RateLimitTier, time.Time{}); err != nil {
+	if err := creds.UpdateTokensWithSubscription(ctx, db, id, t.AccessToken, t.RefreshToken, t.ExpiresAt, t.SubscriptionType, t.RateLimitTier, t.RefreshTokenExpiresAt); err != nil {
 		return nil, err
 	}
 	return creds.Get(ctx, db, id)

@@ -784,6 +784,9 @@ type exportLine struct {
 		Scopes           []string `json:"scopes"`
 		SubscriptionType string   `json:"subscriptionType"`
 		RateLimitTier    string   `json:"rateLimitTier"`
+
+		// RefreshTokenExpiresAt is the stored login deadline (ms), omitted when unknown.
+		RefreshTokenExpiresAt int64 `json:"refreshTokenExpiresAt,omitempty"`
 	} `json:"claudeAiOauth"`
 }
 
@@ -797,13 +800,19 @@ func credsExport(ctx context.Context, args []string) {
 	_ = fs.Parse(args)
 	db := openDB(*dbPath)
 	defer db.Close()
-
-	list, err := creds.List(ctx, db)
-	if err != nil {
+	if err := exportCreds(ctx, db, os.Stdout); err != nil {
 		fmt.Fprintf(os.Stderr, "export: %v\n", err)
 		os.Exit(1)
 	}
-	enc := json.NewEncoder(os.Stdout)
+}
+
+// exportCreds writes every credential to w as one exportLine per line.
+func exportCreds(ctx context.Context, db *store.DB, w io.Writer) error {
+	list, err := creds.List(ctx, db)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(w)
 	for _, c := range list {
 		var line exportLine
 		line.Label = c.Label
@@ -811,14 +820,17 @@ func credsExport(ctx context.Context, args []string) {
 		line.ClaudeAiOauth.AccessToken = c.AccessToken
 		line.ClaudeAiOauth.RefreshToken = c.RefreshToken
 		line.ClaudeAiOauth.ExpiresAt = c.ExpiresAt.UnixMilli()
+		if !c.RefreshExpiresAt.IsZero() {
+			line.ClaudeAiOauth.RefreshTokenExpiresAt = c.RefreshExpiresAt.UnixMilli()
+		}
 		line.ClaudeAiOauth.Scopes = []string{"user:inference", "user:profile"}
 		line.ClaudeAiOauth.SubscriptionType = c.SubscriptionType
 		line.ClaudeAiOauth.RateLimitTier = c.RateLimitTier
 		if err := enc.Encode(line); err != nil {
-			fmt.Fprintf(os.Stderr, "export: encode %s: %v\n", c.ID, err)
-			os.Exit(1)
+			return fmt.Errorf("encode %s: %w", c.ID, err)
 		}
 	}
+	return nil
 }
 
 // credsImportBulk reads JSONL from stdin (produced by creds export) and
@@ -831,8 +843,18 @@ func credsImportBulk(ctx context.Context, args []string) {
 	_ = fs.Parse(args)
 	db := openDB(*dbPath)
 	defer db.Close()
+	n, err := importBulk(ctx, db, os.Stdin, os.Stdout)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "import-bulk: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("imported %d credential(s)\n", n)
+}
 
-	scanner := bufio.NewScanner(os.Stdin)
+// importBulk imports the JSONL exportCreds writes, stopping at the first line
+// that fails, and returns how many credentials it imported.
+func importBulk(ctx context.Context, db *store.DB, in io.Reader, out io.Writer) (int, error) {
+	scanner := bufio.NewScanner(in)
 	scanner.Buffer(make([]byte, 4<<20), 4<<20)
 	n := 0
 	for scanner.Scan() {
@@ -842,14 +864,12 @@ func credsImportBulk(ctx context.Context, args []string) {
 		}
 		var el exportLine
 		if err := json.Unmarshal([]byte(line), &el); err != nil {
-			fmt.Fprintf(os.Stderr, "import-bulk: parse line %d: %v\n", n+1, err)
-			os.Exit(1)
+			return n, fmt.Errorf("parse line %d: %w", n+1, err)
 		}
 		// Write to a temp file so ingest.Import can read it.
 		tmp, err := os.CreateTemp("", "claude-proxy-import-*.json")
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "import-bulk: temp file: %v\n", err)
-			os.Exit(1)
+			return n, fmt.Errorf("temp file: %w", err)
 		}
 		// Re-encode only the claudeAiOauth wrapper that ingest expects.
 		type credFile struct {
@@ -858,26 +878,23 @@ func credsImportBulk(ctx context.Context, args []string) {
 		if err := json.NewEncoder(tmp).Encode(credFile{ClaudeAiOauth: el.ClaudeAiOauth}); err != nil {
 			tmp.Close()
 			_ = os.Remove(tmp.Name())
-			fmt.Fprintf(os.Stderr, "import-bulk: write temp: %v\n", err)
-			os.Exit(1)
+			return n, fmt.Errorf("write temp: %w", err)
 		}
 		tmp.Close()
 
 		c, err := ingest.Import(ctx, db, tmp.Name(), el.Label, el.Weight)
 		_ = os.Remove(tmp.Name())
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "import-bulk: import %q: %v\n", el.Label, err)
-			os.Exit(1)
+			return n, fmt.Errorf("import %q: %w", el.Label, err)
 		}
-		fmt.Printf("imported %s  label=%q  sub=%s  weight=%d  expires=%s\n",
+		fmt.Fprintf(out, "imported %s  label=%q  sub=%s  weight=%d  expires=%s\n",
 			c.ID, c.Label, c.SubscriptionType, c.Weight, c.ExpiresAt.Format(time.RFC3339))
 		n++
 	}
 	if err := scanner.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "import-bulk: read stdin: %v\n", err)
-		os.Exit(1)
+		return n, fmt.Errorf("read stdin: %w", err)
 	}
-	fmt.Printf("imported %d credential(s)\n", n)
+	return n, nil
 }
 
 // credsUsage fetches live usage from Anthropic for each credential (or one).

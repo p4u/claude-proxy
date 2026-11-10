@@ -38,13 +38,19 @@ func mockToken(t *testing.T) {
 	t.Cleanup(func() { creds.SetTokenURL(prev); srv.Close() })
 }
 
+// shortExpiry is an 8-hour login's expiresAt (ms): such files take the
+// refresh-to-verify path. A far-future value would be a long-lived login.
+func shortExpiry() int64 { return time.Now().Add(time.Hour).UnixMilli() }
+
 // writeCredFile writes a synthetic .credentials.json with mode 0600.
 func writeCredFile(t *testing.T, access, refresh string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), ".credentials.json")
-	body := `{"claudeAiOauth":{"accessToken":"` + access + `","refreshToken":"` + refresh +
-		`","expiresAt":9999999999000,"scopes":["user:inference"],"subscriptionType":"max","rateLimitTier":"default_claude_max_20x"}}`
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+	body, _ := json.Marshal(map[string]any{"claudeAiOauth": map[string]any{
+		"accessToken": access, "refreshToken": refresh, "expiresAt": shortExpiry(),
+		"scopes": []string{"user:inference"}, "subscriptionType": "max", "rateLimitTier": "default_claude_max_20x",
+	}})
+	if err := os.WriteFile(path, body, 0o600); err != nil {
 		t.Fatalf("write cred file: %v", err)
 	}
 	return path
@@ -110,7 +116,7 @@ func TestImportTierSources(t *testing.T) {
 func tierJSON(t *testing.T, plan, tier string) []byte {
 	t.Helper()
 	block := map[string]any{
-		"accessToken": "sk-ant-oat-input", "refreshToken": "ref-input", "expiresAt": 9999999999000,
+		"accessToken": "sk-ant-oat-input", "refreshToken": "ref-input", "expiresAt": shortExpiry(),
 	}
 	if plan != "" {
 		block["subscriptionType"] = plan

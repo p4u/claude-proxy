@@ -1,6 +1,7 @@
 package webui
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
@@ -61,7 +62,9 @@ func (s *Server) exchangeClaudeLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "sidecar gateways are managed through their accounts panels")
 		return
 	}
-	ctx := r.Context()
+	// The code is single-use and each login needs a human approval, so once
+	// the exchange starts a browser disconnect must not discard its result.
+	ctx := context.WithoutCancel(r.Context())
 	if target != "" {
 		// Fail before consuming the single-use code on a typo'd ID.
 		if _, err := creds.Get(ctx, s.db, target); err != nil {

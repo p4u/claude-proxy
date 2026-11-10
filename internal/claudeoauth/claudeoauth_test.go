@@ -26,6 +26,11 @@ type fakeAnthropic struct {
 	scope     string
 	tokenCode int
 	exchanges int
+	// expiresIn and deadlineIn are the granted lifetime and
+	// refresh_token_expires_in; 0 means 28800 and omitted.
+	expiresIn  int
+	deadlineIn int
+	body       map[string]any // the last exchange request
 }
 
 func (f *fakeAnthropic) serve(t *testing.T) *httptest.Server {
@@ -34,11 +39,13 @@ func (f *fakeAnthropic) serve(t *testing.T) *httptest.Server {
 		switch r.URL.Path {
 		case "/v1/oauth/token":
 			f.exchanges++
-			var b map[string]string
+			var b map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&b)
-			sum := sha256.Sum256([]byte(b["code_verifier"]))
-			if b["grant_type"] != "authorization_code" || b["code"] != "the-code" ||
-				b["client_id"] != creds.ClientID || b["redirect_uri"] != RedirectURL ||
+			f.body = b
+			str := func(k string) string { v, _ := b[k].(string); return v }
+			sum := sha256.Sum256([]byte(str("code_verifier")))
+			if str("grant_type") != "authorization_code" || str("code") != "the-code" ||
+				str("client_id") != creds.ClientID || str("redirect_uri") != RedirectURL ||
 				base64.RawURLEncoding.EncodeToString(sum[:]) != f.challenge {
 				w.WriteHeader(http.StatusBadRequest)
 				_, _ = w.Write([]byte(`{"error":"invalid_grant","error_description":"bad code","access_token":"sk-ant-oat-leak"}`))
@@ -49,11 +56,19 @@ func (f *fakeAnthropic) serve(t *testing.T) *httptest.Server {
 				_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
 				return
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
+			expiresIn := f.expiresIn
+			if expiresIn == 0 {
+				expiresIn = 28800
+			}
+			resp := map[string]any{
 				"access_token": "sk-ant-oat01-new", "refresh_token": "sk-ant-ort01-new",
-				"expires_in": 28800, "scope": f.scope,
+				"expires_in": expiresIn, "scope": f.scope,
 				"account": map[string]string{"email_address": "token@example.com"},
-			})
+			}
+			if f.deadlineIn > 0 {
+				resp["refresh_token_expires_in"] = f.deadlineIn
+			}
+			_ = json.NewEncoder(w).Encode(resp)
 		case "/api/oauth/profile":
 			if r.Header.Get("Authorization") != "Bearer sk-ant-oat01-new" {
 				w.WriteHeader(http.StatusUnauthorized)
@@ -128,6 +143,51 @@ func TestExchangeHappyPath(t *testing.T) {
 	if _, err := f.Exchange(context.Background(), id, "the-code#"+state); err == nil ||
 		!strings.Contains(err.Error(), "expired or unknown") {
 		t.Fatalf("second exchange = %v, want the session to be single-use", err)
+	}
+}
+
+// AC1: the sign-in asks for the narrow scope pair and a one-year token at the
+// exchange, and stores the lifetime and deadline Anthropic grants.
+func TestExchangeRequestsLongLivedLogin(t *testing.T) {
+	ctx := context.Background()
+	fake := &fakeAnthropic{orgType: "claude_team", scope: "user:profile user:inference",
+		expiresIn: LoginLifetimeSeconds, deadlineIn: 2352492}
+	fake.serve(t)
+	f := New()
+	_, raw, err := f.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, _ := url.Parse(raw)
+	if got := u.Query().Get("scope"); got != "user:profile user:inference" {
+		t.Fatalf("scope = %q, want exactly user:profile user:inference", got)
+	}
+
+	id, state, challenge := start(t, f)
+	fake.challenge = challenge
+	tok, err := f.Exchange(ctx, id, "the-code#"+state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := fake.body["expires_in"].(float64); !ok || v != LoginLifetimeSeconds {
+		t.Fatalf("exchange expires_in = %#v, want the number %d", fake.body["expires_in"], LoginLifetimeSeconds)
+	}
+	if d := time.Until(tok.ExpiresAt); d < 364*24*time.Hour || d > 365*24*time.Hour {
+		t.Fatalf("expiry %v from now, want 365 days minus the 5m margin", d)
+	}
+	if d := time.Until(tok.RefreshTokenExpiresAt); d < 27*24*time.Hour || d > 28*24*time.Hour {
+		t.Fatalf("deadline %v from now, want 27.2 days", d)
+	}
+
+	// A shorter grant is stored as granted, and a missing deadline stays unknown.
+	fake.expiresIn, fake.deadlineIn = 28800, 0
+	id, state, challenge = start(t, f)
+	fake.challenge = challenge
+	if tok, err = f.Exchange(ctx, id, "the-code#"+state); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Until(tok.ExpiresAt); d > 8*time.Hour || !tok.RefreshTokenExpiresAt.IsZero() {
+		t.Fatalf("short grant: expiry in %v, deadline %v", d, tok.RefreshTokenExpiresAt)
 	}
 }
 

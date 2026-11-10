@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -86,7 +87,9 @@ func TestPasteImport(t *testing.T) {
 	}
 
 	// Paste the JSON and submit with ctrl+s → chains to the label prompt.
-	m.paste.SetValue(`{"claudeAiOauth":{"accessToken":"sk-ant-oat-x","refreshToken":"ref-x","expiresAt":9999999999000,"subscriptionType":"max"}}`)
+	// An 8-hour expiry, so the import takes the refresh-to-verify path.
+	m.paste.SetValue(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"sk-ant-oat-x","refreshToken":"ref-x","expiresAt":%d,"subscriptionType":"max"}}`,
+		time.Now().Add(time.Hour).UnixMilli()))
 	m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 	if m.inputKind != inputImportLabel {
 		t.Fatalf("ctrl+s should advance to label prompt, got %v", m.inputKind)

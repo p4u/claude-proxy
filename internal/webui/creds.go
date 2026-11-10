@@ -174,7 +174,9 @@ func (s *Server) credAction(w http.ResponseWriter, r *http.Request, id, action s
 			writeErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		c, err := ingest.UpdateFromJSON(ctx, s.db, id, []byte(body.CredentialsJSON))
+		// Verifying may rotate the file's single-use refresh token, so once it
+		// starts a browser disconnect must not discard its result.
+		c, err := ingest.UpdateFromJSON(context.WithoutCancel(ctx), s.db, id, []byte(body.CredentialsJSON))
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, err.Error())
 			return
@@ -348,7 +350,9 @@ func (s *Server) importCred(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	c, err := ingest.ImportFromJSON(r.Context(), s.db, []byte(body.CredentialsJSON), body.Label, body.Weight)
+	// Verifying may rotate the file's single-use refresh token, so once it
+	// starts a browser disconnect must not discard its result.
+	c, err := ingest.ImportFromJSON(context.WithoutCancel(r.Context()), s.db, []byte(body.CredentialsJSON), body.Label, body.Weight)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return

@@ -31,22 +31,24 @@ import (
 )
 
 // The values below mirror Claude Code's production OAuth configuration
-// (`CLAUDE_AI_AUTHORIZE_URL`, `MANUAL_REDIRECT_URL` and the subscription login
-// scope set). The redirect URI must be the manual one: it is the only
-// registered redirect that is not a localhost port, and Anthropic's page there
-// displays the code for the user to copy.
+// (`CLAUDE_AI_AUTHORIZE_URL`, `MANUAL_REDIRECT_URL`). The redirect URI must be
+// the manual one: it is the only registered redirect that is not a localhost
+// port, and Anthropic's page there displays the code for the user to copy.
 const (
 	AuthorizeURL = "https://claude.com/cai/oauth/authorize"
 	RedirectURL  = "https://platform.claude.com/oauth/code/callback"
 )
 
-// Scopes is the scope set Claude Code requests for a claude.ai subscription
-// login, so a token minted here is interchangeable with one copied out of
-// .credentials.json — the refresher keeps the same grant either way.
-var Scopes = []string{
-	"org:create_api_key", "user:profile", "user:inference",
-	"user:sessions:claude_code", "user:mcp_servers", "user:file_upload", "user:plugins",
-}
+// Scopes deliberately no longer mirror Claude Code's login set. The proxy
+// holds the narrowest grant that serves its traffic: user:inference for
+// /v1/messages and /v1/models, user:profile for plan detection and the usage
+// API. The sessions, MCP, file and plugin scopes are not needed.
+var Scopes = []string{"user:profile", "user:inference"}
+
+// LoginLifetimeSeconds is the access-token lifetime requested at the code
+// exchange (one year). Anthropic honours it only there, never on a refresh,
+// so a login minted here must not be refreshed while its token works.
+const LoginLifetimeSeconds = 31536000
 
 // ProfileURL is a var so tests can point it at a fake server. The token
 // endpoint is shared with the refresher (creds.TokenURL).
@@ -65,6 +67,10 @@ type Tokens struct {
 	SubscriptionType string // "max", "pro", "team", "enterprise"
 	RateLimitTier    string // profile metadata; empty when not published
 	Email            string
+
+	// RefreshTokenExpiresAt is the login's refresh deadline, from the
+	// exchange's refresh_token_expires_in; zero when not reported.
+	RefreshTokenExpiresAt time.Time
 }
 
 type pending struct {
@@ -188,14 +194,21 @@ func (f *Flow) Exchange(ctx context.Context, id, pasted string) (*Tokens, error)
 	if email == "" {
 		email = tok.Account.Email
 	}
+	now := f.now()
+	var deadline time.Time
+	if tok.RefreshTokenExpiresIn > 0 {
+		deadline = now.Add(time.Duration(tok.RefreshTokenExpiresIn) * time.Second)
+	}
 	return &Tokens{
 		AccessToken:  tok.AccessToken,
 		RefreshToken: tok.RefreshToken,
-		// Same safety margin the refresher applies to every expiry it stores.
-		ExpiresAt:        f.now().Add(time.Duration(tok.ExpiresIn)*time.Second - 5*time.Minute),
-		SubscriptionType: sub,
-		RateLimitTier:    tier,
-		Email:            email,
+		// The lifetime Anthropic granted, which may be shorter than requested,
+		// with the safety margin the refresher applies to every expiry.
+		ExpiresAt:             now.Add(time.Duration(tok.ExpiresIn)*time.Second - 5*time.Minute),
+		RefreshTokenExpiresAt: deadline,
+		SubscriptionType:      sub,
+		RateLimitTier:         tier,
+		Email:                 email,
 	}, nil
 }
 
@@ -207,16 +220,20 @@ type tokenResp struct {
 	Account      struct {
 		Email string `json:"email_address"`
 	} `json:"account"`
+
+	// The login's refresh deadline in seconds; a refresh never moves it.
+	RefreshTokenExpiresIn int `json:"refresh_token_expires_in"`
 }
 
 func (f *Flow) exchange(ctx context.Context, code string, p pending) (*tokenResp, error) {
-	body, _ := json.Marshal(map[string]string{
+	body, _ := json.Marshal(map[string]any{
 		"grant_type":    "authorization_code",
 		"code":          code,
 		"redirect_uri":  RedirectURL,
 		"client_id":     creds.ClientID,
 		"code_verifier": p.verifier,
 		"state":         p.state,
+		"expires_in":    LoginLifetimeSeconds,
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, creds.TokenURL, bytes.NewReader(body))
 	if err != nil {

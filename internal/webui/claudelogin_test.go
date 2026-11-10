@@ -120,3 +120,58 @@ func TestClaudeBrowserLogin(t *testing.T) {
 		t.Fatalf("cancelled session = %d %s", rec.Code, rec.Body.String())
 	}
 }
+
+// AC1b: a browser that disconnects once the code is exchanged still gets its
+// credential stored, with the one-year expiry and the login's deadline.
+func TestClaudeBrowserLoginSurvivesDisconnect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"access_token": "sk-ant-oat01-year", "refresh_token": "sk-ant-ort01-year",
+				"expires_in": 31536000, "refresh_token_expires_in": 2352492,
+				"scope": "user:profile user:inference",
+			})
+		case "/profile":
+			cancel() // the browser goes away after the exchange
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"account":      map[string]string{"email": "owner@example.com"},
+				"organization": map[string]string{"organization_type": "claude_team"},
+			})
+		}
+	}))
+	t.Cleanup(upstream.Close)
+	oldToken, oldProfile := creds.TokenURL, claudeoauth.ProfileURL
+	creds.TokenURL, claudeoauth.ProfileURL = upstream.URL+"/token", upstream.URL+"/profile"
+	t.Cleanup(func() { creds.TokenURL, claudeoauth.ProfileURL = oldToken, oldProfile })
+	db, err := store.Open(filepath.Join(t.TempDir(), "webui.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	s := &Server{db: db, claudeLogin: claudeoauth.New()}
+
+	rec := httptest.NewRecorder()
+	s.handleCredentials(rec, httptest.NewRequest(http.MethodPost, "/api/credentials/oauth/start", nil), "/oauth/start")
+	var out struct{ Session, URL string }
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	u, _ := url.Parse(out.URL)
+	payload, _ := json.Marshal(map[string]any{"session": out.Session, "code": "c#" + u.Query().Get("state")})
+	req := httptest.NewRequest(http.MethodPost, "/api/credentials/oauth/exchange", strings.NewReader(string(payload))).WithContext(ctx)
+	s.handleCredentials(httptest.NewRecorder(), req, "/oauth/exchange")
+
+	list, err := creds.List(context.Background(), db)
+	if err != nil || len(list) != 1 || list[0].AccessToken != "sk-ant-oat01-year" {
+		t.Fatalf("credential not stored after the browser left: %d rows, %v", len(list), err)
+	}
+	if d := time.Until(list[0].ExpiresAt); d < 364*24*time.Hour {
+		t.Fatalf("expiry %v from now, want about a year", d)
+	}
+	if d := time.Until(list[0].RefreshExpiresAt); d < 27*24*time.Hour || d > 28*24*time.Hour {
+		t.Fatalf("deadline %v from now, want 27.2 days", d)
+	}
+}
