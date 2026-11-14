@@ -45,7 +45,8 @@ no env opt-in), along with
 - The anti-affinity applies only when a binding is first created. A later re-pin or rebalance
   does not consider siblings.
 - Forks (subagents that start with the parent's history) and subagents already running when
-  this ships are not spread; they keep the parent's subscription and its prompt cache.
+  this ships are not spread: their binding is created on the session's subscription, so they
+  keep its prompt cache.
 - No global (proxy-wide) switch, and no behaviour keyed on `x-claude-code-agent-type` or
   `x-claude-code-request-class`. Claude Code sends those only with the client-side
   `CLAUDE_CODE_GATEWAY_HINT_HEADERS` opt-in.
@@ -126,25 +127,30 @@ A nested subagent (with a parent-agent id) is keyed by its own agent id under th
 
 ### Which key a subagent request uses
 
-The pool resolves the key of a subagent candidate under `p.mu`, before any session state is
-read:
+Every request of a subagent candidate uses its child key (ruling R9, after the plan audit).
+The first request of the subagent decides how the child binding is created:
 
-- the child row exists in `conversations`: the child key. `AccountBound` is latched on the
-  child binding exactly as on any other, so a subagent that becomes account-scoped stays on the
-  account it started on;
-- no child row, and the request may start a child (`StartChild`): the child key, created with
-  the anti-affinity pick;
-- otherwise: the parent key, as today.
+- a request that may start a child (`StartChild`) gets the anti-affinity pick;
+- any other request binds the child to the session's current credential: that of the `Family`
+  row, when the row exists and its credential is `active` or `limited`. Otherwise it gets the
+  ordinary pick.
 
-A request may start a child only when it is portable (`portableRebalanceRequest(body)`) and no
+Once the child row exists, the subagent stays on it like any conversation. `AccountBound` is
+latched on the child binding exactly as on any other, so a subagent that becomes
+account-scoped stays on the account it started on.
+
+`StartChild` holds only when the request is portable (`portableRebalanceRequest(body)`) and no
 element of its `messages` array has `role` `"assistant"`, i.e. it is the first turn of a fresh
-subagent. A fork, and a subagent that was already running before its child row existed, carry
-assistant turns: they find no child row and keep the session key for their whole life.
+subagent. A fork, and a subagent that was already running, carry assistant turns, so their
+child binding is created on the session's subscription. Their later requests use the same
+binding. That includes side requests sent with the subagent's context (WebFetch's haiku call
+passes `agentContext`) and the first request after a compaction, so neither moves them.
 
 `pool.RequestOptions` gains `Family` (the parent's raw key), `Child` (the child's raw key) and
 `StartChild bool`; all are empty for every request that is not a subagent candidate. The proxy
-always passes the parent key as `convID`; `AcquireScoped` swaps it for `Child` per the rule
-above and reports the raw key it used in `Lease.ConvID`. The proxy derives the logged and
+always passes the parent key as `convID`; `AcquireScoped` swaps it for `Child` when the options
+are valid (`Family == convID`, `Child` under `Family`, an unscoped Anthropic binding) and reports
+the raw key it used in `Lease.ConvID`. The proxy derives the logged and
 recorded `convID` from `Lease.ConvID` (`pool.KeyScoped`) and uses it for `request_log`,
 `prompt_log` and `conversation_message`. A spread request is one whose `Lease.ConvID` is the
 child key.
@@ -228,12 +234,14 @@ value is logged, and never the raw `metadata.user_id`.
 - **Clients.** Claude Code before the agent-id header behaves as today. Clients sending the
   header for a non-Anthropic model behave as today.
 - **API.** The new endpoint and JSON field are additive. `mock.js` gains the route.
-- **Prompt cache.** Only a subagent's first turn can move it to another subscription, so the
-  cost is that subagent's own system prompt and tools written once there. Forks and subagents
-  already running at deploy time stay on the parent's subscription and its cache.
+- **Prompt cache.** Only a fresh subagent's first turn can place it on another subscription,
+  so the cost is that subagent's own system prompt and tools, written once there. Forks and
+  subagents already running at deploy time are bound to the session's subscription and keep
+  its cache. If the main thread later moves (a switch or rebalance), a fork stays where it
+  was bound.
 - **Rollback and credential deletion.** On rollback, child rows are inert and subagents share
   the parent binding again. Deleting a credential removes its child rows; a running subagent
-  then has assistant turns and keeps the session key.
+  then has assistant turns and is re-bound on the session's credential.
 - **Stats.** `request_log.conv_id`, `prompt_log` and `conversation_message` record the child
   key, so a subagent shows as its own conversation in the user's conversation list and in
   captured transcripts. Token and request totals per user are unchanged; conversation counts
@@ -256,8 +264,8 @@ value is logged, and never the raw `metadata.user_id`.
 - **Restart:** families are rebuilt from `conversations`.
 - **Concurrency:** covered by `p.mu` and the bind transaction. The range lookup runs inside the
   same transaction as the insert.
-- **Account-scoped resources:** a subagent request that is account-scoped before its child
-  binding exists uses the session key (the resources can only be the parent's). Once the child
+- **Account-scoped resources:** a subagent whose first request is account-scoped is bound to
+  the session's credential (the resources can only be the parent's). Once the child
   binding exists the subagent never leaves it; a later account-scoped request latches
   `account_bound` on the child row.
 
@@ -290,9 +298,11 @@ value is logged, and never the raw `metadata.user_id`.
   has `account_bound=1`, and the parent row's `account_bound` is unchanged.
 - [ ] AC13: pool test: a child binding on a credential marked limited moves to an active
   credential on its next request; a main binding in the same state keeps its pin.
-- [ ] AC14: proxy test: a subagent request with the header, an assistant turn in its history and
-  no child row binds the parent key; a request with only user turns and a new agent id binds a
-  child key.
+- [ ] AC14: proxy test: a fork's request (header, assistant turn in its history, no child row)
+  creates its child row on the main thread's credential. The same agent's haiku request,
+  `count_tokens` request and single-user-message request (as after a compaction) stay on that
+  credential under the child key. A fresh haiku subagent (no assistant turn) binds a credential
+  other than the main thread's.
 - [ ] AC15: proxy test: a subagent request under the admin token, and one with no identity (no
   auth configured), each bind a child key.
 - [ ] AC16: proxy test: with the agent header, a request keyed by `X-Router-Conversation-ID`,
