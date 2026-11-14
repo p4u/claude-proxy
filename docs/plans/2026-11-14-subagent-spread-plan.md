@@ -2,7 +2,7 @@
 
 Spec: docs/specs/2026-11-14-subagent-spread-design.md
 Class: architectural
-Repos and branches: /home/p4u/claude-proxy → feat/subagent-spread (base <plan commit>), implemented in the worktree ~/.cache/claude-proxy/wt/subagent-spread
+Repos and branches: /home/p4u/claude-proxy → feat/subagent-spread (base 3f8041e), implemented in the worktree ~/.cache/claude-proxy/wt/subagent-spread
 
 ## Global Constraints
 - Commit convention: conventional commits `type(scope): lowercase summary`; no AI attribution, no Co-Authored-By or similar trailers.
