@@ -54,9 +54,10 @@ Appending **`?mock=1`** to the UI URL makes `index.html` import
 `static/js/mock.js`, which intercepts `fetch` for `/api/*` and serves realistic
 sample credentials, users, and usage series. That is the fast path for frontend
 work: no proxy, no database, no real subscriptions. The mock keeps per-session
-state for the toggles it exposes (`full_capture`, `block_suggestions`, the usage
-limit) so switch behaviour can be exercised end-to-end. When adding an endpoint
-to `/api`, add it to `mock.js` too or the UI silently loses its offline mode.
+state for the toggles it exposes (`full_capture`, `block_suggestions`,
+`spread_subagents`, the usage limit) so switch behaviour can be exercised
+end-to-end. When adding an endpoint to `/api`, add it to `mock.js` too or the UI
+silently loses its offline mode.
 
 ## Architecture
 
@@ -75,6 +76,10 @@ Claude Code (ANTHROPIC_BASE_URL → proxy)
       → enforceUserLimit(): POST /v1/messages only — 429 + X-Router-Reason: user-quota
         when the user is over their rolling usage cap (internal/proxy/userlimit.go)
       → router.Derive(): compute stable conversation key (4-priority algorithm)
+      → subagentChild(): a subagent candidate (Anthropic, keyed by metadata.user_id,
+        valid X-Claude-Code-Agent-Id, user's spread_subagents on) passes
+        RequestOptions{Family, Child, StartChild}; the pool binds the child key
+        (internal/proxy/subagent.go, internal/pool/subagent.go)
       → pool.AcquireScoped(): get/create the sticky binding + request lease;
         emergency rebind for unusable or saturated pins; when enabled, announce
         and later revalidate a proactive rebalance of long-lived Anthropic pins
@@ -629,6 +634,10 @@ Before this, a key added seconds after a refresh stayed invisible for 5 minutes.
 3. SHA256(system_prompt + first_user_message)
 4. SHA256(remote_addr + body[:4096]) — fallback
 
+A subagent request keyed by `metadata.user_id` binds a child key under the
+session key, `router.SubagentKey(parent, agentID)` = `parent + "/a_" +
+shorten(agentID)`; see [Subagents on their own subscriptions](#subagents-on-their-own-subscriptions-internalpoolsubagentgo).
+
 ### Package Responsibilities
 
 | Package | Role |
@@ -781,7 +790,7 @@ Tables (`internal/store/schema.go`), among them `plugins` and `plugin_env` (clau
 `anthropic` | `glm` | `mimo` | `codex` | `gemini` | `privatemode` | `custom` | `custom_openai`, added via
 the swallow-duplicate `ALTER TABLE` mechanism — its `DEFAULT 'anthropic'` is
 what migrates existing rows, no backfill needed),
-`conversations` (whose `id` is the provider-qualified sticky key), `rr_cursor` (legacy round-robin state), `user_tokens` (named bearer tokens, plus the per-user usage cap `limit_output_tokens` / `limit_window_seconds`, `0` = unlimited, and `block_suggestions` = suppress Claude Code's prompt-suggestion requests), `request_log` (one row per forwarded request, for per-user stats), `usage_history` (utilization snapshots driving selection), `prompt_log` (last user prompt per `POST /v1/messages`, `user_token_id` FK `ON DELETE SET NULL`; never stores responses, gated + retained by `CLAUDE_PROXY_PROMPT_RETENTION_DAYS`, captured in `internal/proxy/promptcapture.go` and pruned by its hourly janitor), `conversation_message` (opt-in whole-conversation capture: `UNIQUE(conv_id, seq)` where `seq` is the message's index in the request's `messages` array, so re-sent history is idempotent; same retention window and janitor as `prompt_log`). Deleting a credential cascades to `usage_history` (`ON DELETE CASCADE`); `conversations` bindings are cleared inside `creds.Delete`'s transaction, since older DBs created that FK without a cascade clause. `request_log` additionally carries per-request token usage columns (`model`, `input_tokens`, `output_tokens`, `cache_creation_tokens`, `cache_read_tokens`), added via the existing swallow-duplicate `ALTER TABLE` migration mechanism and populated by `internal/proxy/usagecapture.go` from the tee'd response stream (SSE and non-streaming JSON) — this feeds the web UI's token stats and never affects what the client receives. Core dependency: `modernc.org/sqlite` (pure Go, no CGO required); `guptarohit/asciigraph` for usage charts and `charmbracelet/bubbletea`+`lipgloss`+`bubbles` for the management TUI.
+`conversations` (whose `id` is the provider-qualified sticky key), `rr_cursor` (legacy round-robin state), `user_tokens` (named bearer tokens, plus the per-user usage cap `limit_output_tokens` / `limit_window_seconds`, `0` = unlimited, `block_suggestions` = suppress Claude Code's prompt-suggestion requests, and `spread_subagents` = give each Claude Code subagent its own binding, default `1`), `request_log` (one row per forwarded request, for per-user stats), `usage_history` (utilization snapshots driving selection), `prompt_log` (last user prompt per `POST /v1/messages`, `user_token_id` FK `ON DELETE SET NULL`; never stores responses, gated + retained by `CLAUDE_PROXY_PROMPT_RETENTION_DAYS`, captured in `internal/proxy/promptcapture.go` and pruned by its hourly janitor), `conversation_message` (opt-in whole-conversation capture: `UNIQUE(conv_id, seq)` where `seq` is the message's index in the request's `messages` array, so re-sent history is idempotent; same retention window and janitor as `prompt_log`). Deleting a credential cascades to `usage_history` (`ON DELETE CASCADE`); `conversations` bindings are cleared inside `creds.Delete`'s transaction, since older DBs created that FK without a cascade clause. `request_log` additionally carries per-request token usage columns (`model`, `input_tokens`, `output_tokens`, `cache_creation_tokens`, `cache_read_tokens`), added via the existing swallow-duplicate `ALTER TABLE` migration mechanism and populated by `internal/proxy/usagecapture.go` from the tee'd response stream (SSE and non-streaming JSON) — this feeds the web UI's token stats and never affects what the client receives. Core dependency: `modernc.org/sqlite` (pure Go, no CGO required); `guptarohit/asciigraph` for usage charts and `charmbracelet/bubbletea`+`lipgloss`+`bubbles` for the management TUI.
 
 ### Write contention (`internal/store/store.go`, `retry.go`)
 
@@ -989,7 +998,7 @@ make user-token ID=utok_xxx          # Print a user's bearer token
 make user-disable / user-enable / user-rm / user-refresh ID=utok_xxx
 ```
 
-CLI equivalents live under `claude-proxy users <create|list|stats|token|disable|enable|rm|refresh|limit|suggestions>`.
+CLI equivalents live under `claude-proxy users <create|list|stats|token|disable|enable|rm|refresh|limit|suggestions|subagents>`.
 
 ### Blocking prompt suggestions per user
 
@@ -1001,6 +1010,17 @@ claude-proxy users list                       # SUGG column shows block/fwd
 
 Also a switch in the web UI's Users table. See the section below for what these
 requests are and why suppressing them is safe.
+
+### Subagents on their own subscriptions per user
+
+```bash
+claude-proxy users subagents utok_xxx off   # subagents share the session's subscription
+claude-proxy users subagents utok_xxx on    # each subagent gets its own binding (default)
+claude-proxy users list                     # SUBAGENTS column shows spread/share
+```
+
+Also a switch in the web UI's Users table (`POST /api/users/{id}/subagents`). See
+[Subagents on their own subscriptions](#subagents-on-their-own-subscriptions-internalpoolsubagentgo).
 
 ### Per-user usage limits
 
@@ -1078,6 +1098,39 @@ Matching only the opening marker rather than the whole prompt means a reworded
 body still matches; a **renamed** marker stops matching and requests are
 forwarded exactly as before. That is the intended failure direction — a miss
 costs one request, a false positive would silently swallow a real prompt.
+
+## Subagents on their own subscriptions (`internal/pool/subagent.go`)
+
+Claude Code sends `X-Claude-Code-Agent-Id` on every request a subagent makes,
+side calls such as WebFetch's haiku request included, with the session's
+`metadata.user_id`. A request is a **subagent candidate** (`proxy.subagentChild`)
+when it is sticky, Anthropic with no custom host, keyed by `metadata.user_id`,
+carries a valid agent id (1-128 of `[0-9A-Za-z_-]`, `router.ValidAgentID`) and
+`usertoken.SpreadSubagentsFor` is true (no identity and the admin token: always;
+a user token: `user_tokens.spread_subagents`, default 1). The proxy still passes
+the session key; `AcquireScoped` swaps in the child key (`subagentKey`) and
+reports it in `Lease.ConvID`. The subagent's first request decides how the
+child row is created, inside the bind transaction:
+
+- `StartChild` (portable and no `assistant` message: a fresh subagent's first
+  turn): the anti-affinity pick;
+- anything else (a fork, a subagent running before this shipped, an
+  account-scoped first turn): the session row's credential while it is active
+  or limited, else the ordinary pick. Its side requests and post-compaction
+  turns then stay on that binding and its prompt cache.
+
+The anti-affinity pick excludes the **family's credentials** (`familyQuery`: the
+session row at any age, plus child rows seen in the last 15 minutes, a
+primary-key range `id >= F||'/' AND id < F||'0'` bound as Go strings) while
+another candidate keeps headroom `Room(5h) × Room(7d)^1.5 ≥ 0.25`; candidates
+below the floor are dropped, and with none left the ordinary pick runs.
+`account_bound` latches on a child row as on any binding. A child binding on a
+`limited` credential (retry_after in the future, not account-bound) moves to an
+active credential on its next request; a main binding keeps waiting for
+claudio's switch. Subagent requests skip `Sessions.RecordRequest`, so
+`/v1/claudio/session` keeps describing the main conversation. `request_log`,
+`prompt_log` and `conversation_message` record the child key, and the `bind`
+line adds `agent` and `family`. Rows are pruned only with their credential.
 
 ## Admin API
 
