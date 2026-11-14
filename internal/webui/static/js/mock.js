@@ -107,13 +107,13 @@ const pluginView = (p) => ({
 });
 
 const USERS = [
-  { id: "utok_alice", name: "alice", email: "alice@vocdoni.org", status: "active", full_capture: true, block_suggestions: false,
+  { id: "utok_alice", name: "alice", email: "alice@vocdoni.org", status: "active", full_capture: true, block_suggestions: false, spread_subagents: true,
     limit_output_tokens: 1_000_000, limit_window_seconds: 86400, usage_output_tokens: 302_400 },  // ~30%
-  { id: "utok_bob", name: "bob", status: "active", full_capture: false, block_suggestions: true,
+  { id: "utok_bob", name: "bob", status: "active", full_capture: false, block_suggestions: true, spread_subagents: true,
     limit_output_tokens: 400_000, limit_window_seconds: 21600, usage_output_tokens: 344_900 },    // ~86%
-  { id: "utok_carol", name: "carol", status: "disabled", full_capture: false, block_suggestions: false,
+  { id: "utok_carol", name: "carol", status: "disabled", full_capture: false, block_suggestions: false, spread_subagents: true,
     limit_output_tokens: 0, limit_window_seconds: 0, usage_output_tokens: 0 },                     // unlimited
-  { id: "utok_ci", name: "ci-runner", status: "active", full_capture: false, block_suggestions: true,
+  { id: "utok_ci", name: "ci-runner", status: "active", full_capture: false, block_suggestions: true, spread_subagents: false,
     limit_output_tokens: 100_000, limit_window_seconds: 3600, usage_output_tokens: 122_400 },     // ~122%, blocked
 ];
 
@@ -677,7 +677,7 @@ const DB = {
   "/users": () =>
     USERS.map((u, i) => ({
       id: u.id, name: u.name, email: u.email || "", status: u.status, full_capture: u.full_capture,
-      block_suggestions: u.block_suggestions,
+      block_suggestions: u.block_suggestions, spread_subagents: u.spread_subagents,
       ...limitFields(u),
       created_at: now - 86400 * (20 - i * 3),
       last_used_at: u.status === "disabled" ? now - 86400 * 4 : now - 120 * (i + 1),
@@ -1074,6 +1074,15 @@ window.fetch = async (input, init = {}) => {
       if (!u) return json({ error: "unknown user" }, 404);
       u.block_suggestions = !!JSON.parse(init.body || "{}").block;
       return json({ ok: true, block_suggestions: u.block_suggestions });
+    }
+
+    // Per-user subagent spreading — stateful for the session.
+    const sa = path.match(/^\/users\/([^/]+)\/subagents$/);
+    if (sa && method === "POST") {
+      const u = userById(decodeURIComponent(sa[1]));
+      if (!u) return json({ error: "unknown user" }, 404);
+      u.spread_subagents = !!JSON.parse(init.body || "{}").spread;
+      return json({ ok: true, spread_subagents: u.spread_subagents });
     }
 
     // Per-user usage limit — stateful, and validated exactly like the backend:

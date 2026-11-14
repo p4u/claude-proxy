@@ -73,3 +73,52 @@ func TestUsersEmailRefusesDuplicate(t *testing.T) {
 		t.Fatalf("missing argument: exit %d", code)
 	}
 }
+
+func TestUsersSubagents(t *testing.T) {
+	ctx := context.Background()
+	path, db := cliDB(t)
+	ut, err := usertoken.Create(ctx, db, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	list := func() []string {
+		t.Helper()
+		var out bytes.Buffer
+		if err := printUsers(ctx, db, &out); err != nil {
+			t.Fatal(err)
+		}
+		return strings.Split(strings.TrimSpace(out.String()), "\n")
+	}
+	if lines := list(); !strings.Contains(lines[0], "SUBAGENTS") || !strings.Contains(lines[1], " spread ") {
+		t.Fatalf("list output:\n%s", strings.Join(lines, "\n"))
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := usersSubagents(ctx, []string{ut.ID, "off", "--db", path}, &stdout, &stderr); code != 0 {
+		t.Fatalf("off: exit %d, stderr %q", code, stderr.String())
+	}
+	if got, _ := usertoken.Get(ctx, db, ut.ID); got.SpreadSubagents {
+		t.Fatal("off not persisted")
+	}
+	if lines := list(); !strings.Contains(lines[1], " share ") {
+		t.Fatalf("row after off: %q", lines[1])
+	}
+	if code := usersSubagents(ctx, []string{ut.ID, "on", "--db", path}, &stdout, &stderr); code != 0 {
+		t.Fatalf("on: exit %d, stderr %q", code, stderr.String())
+	}
+	if got, _ := usertoken.Get(ctx, db, ut.ID); !got.SpreadSubagents {
+		t.Fatal("on not persisted")
+	}
+
+	stderr.Reset()
+	if code := usersSubagents(ctx, []string{"utok_missing", "on", "--db", path}, &stdout, &stderr); code != 1 ||
+		!strings.Contains(stderr.String(), "not found") {
+		t.Fatalf("unknown id: exit %d, stderr %q", code, stderr.String())
+	}
+	if code := usersSubagents(ctx, []string{ut.ID, "maybe", "--db", path}, &stdout, &stderr); code != 2 {
+		t.Fatalf("bad value: exit %d", code)
+	}
+	if code := usersSubagents(ctx, []string{ut.ID}, &stdout, &stderr); code != 2 {
+		t.Fatalf("missing value: exit %d", code)
+	}
+}

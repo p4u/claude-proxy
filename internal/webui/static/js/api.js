@@ -152,6 +152,11 @@ export const api = {
   setUserSuggestions: (id, block) =>
     request("POST", `/users/${enc(id)}/suggestions`, { block: !!block }),
 
+  // Per-user subagent spreading. `spread` true ⇒ each Claude Code subagent gets
+  // its own binding, preferring a subscription its session is not using.
+  setUserSubagents: (id, spread) =>
+    request("POST", `/users/${enc(id)}/subagents`, { spread: !!spread }),
+
   // Per-user rolling usage limit, in output tokens. Both values 0 clears the
   // limit; the backend rejects a negative value, or one set and the other zero,
   // with a 400 whose message is meant to be shown to the operator verbatim.

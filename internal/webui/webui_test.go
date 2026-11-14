@@ -1198,3 +1198,54 @@ func TestUserTokenEndpoint(t *testing.T) {
 		t.Fatalf("unknown user = %d, want 404", w.Code)
 	}
 }
+
+// AC8: subagent spreading is on for a new user, the admin route toggles and
+// persists it, the list reflects it, and an unknown user is a 404.
+func TestUserSubagentsToggle(t *testing.T) {
+	db, h := newTestServer(t)
+	ctx := context.Background()
+	ut, _ := usertoken.Create(ctx, db, "ivan")
+	cookie := loginCookie(t, h)
+
+	users := func() []userView {
+		t.Helper()
+		w := do(t, h, http.MethodGet, "/api/users", "", cookie)
+		if w.Code != http.StatusOK {
+			t.Fatalf("users = %d: %s", w.Code, w.Body.String())
+		}
+		var out []userView
+		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode: %v (%s)", err, w.Body.String())
+		}
+		return out
+	}
+	if got := users(); len(got) != 1 || !got[0].SpreadSubagents {
+		t.Fatalf("default spread_subagents should be true: %+v", got)
+	}
+
+	w := do(t, h, http.MethodPost, "/api/users/"+ut.ID+"/subagents", `{"spread":false}`, cookie)
+	if w.Code != http.StatusOK {
+		t.Fatalf("subagents = %d: %s", w.Code, w.Body.String())
+	}
+	var res struct {
+		OK              bool `json:"ok"`
+		SpreadSubagents bool `json:"spread_subagents"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil || !res.OK || res.SpreadSubagents {
+		t.Fatalf("subagents response = %s", w.Body.String())
+	}
+	if got := users(); got[0].SpreadSubagents {
+		t.Fatal("spread_subagents off not reflected in users list")
+	}
+	if reloaded, err := usertoken.Get(ctx, db, ut.ID); err != nil || reloaded.SpreadSubagents {
+		t.Fatalf("usertoken.Get spread_subagents = %v (err %v)", reloaded, err)
+	}
+
+	do(t, h, http.MethodPost, "/api/users/"+ut.ID+"/subagents", `{"spread":true}`, cookie)
+	if got := users(); !got[0].SpreadSubagents {
+		t.Fatal("spread_subagents not turned back on")
+	}
+	if w := do(t, h, http.MethodPost, "/api/users/nope/subagents", `{"spread":true}`, cookie); w.Code != http.StatusNotFound {
+		t.Fatalf("unknown user subagents = %d, want 404", w.Code)
+	}
+}

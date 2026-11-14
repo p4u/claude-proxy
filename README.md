@@ -1358,6 +1358,32 @@ Only requests whose *last* message opens with the marker match, so quoting the
 suggestion prompt inside a real question is unaffected. If Anthropic renames the
 marker the match stops firing and requests are forwarded as before.
 
+### Subagents on their own subscriptions (per user, on by default)
+
+Claude Code sends every request of a subagent (the Agent tool, workflows) with
+the session's `metadata.user_id`, so without help all of a session's subagents
+run on the main conversation's subscription. The proxy reads the
+`X-Claude-Code-Agent-Id` header Claude Code adds to subagent requests and gives
+each subagent its own sticky binding. Its first binding prefers an Anthropic
+subscription the session is not already using, for the main conversation or
+another live subagent, as long as one has room; with more subagents than
+subscriptions they share. Forks and subagents already running start on
+the session's subscription, keeping its prompt cache, and stay there.
+
+Each user token carries a `spread_subagents` flag, **on** by default (also for
+the admin token and for deployments without auth). Only Anthropic models and
+subscriptions are affected.
+
+```bash
+claude-proxy users subagents utok_xxx off   # subagents share the session's subscription
+claude-proxy users subagents utok_xxx on    # back to the default
+claude-proxy users list                     # SUBAGENTS column: spread | share
+```
+
+Or flip the **Subagents** switch on the Users page. A subagent shows as its own
+conversation in stats and captured transcripts, and its `bind` log line carries
+`agent` and `family` fields.
+
 ## Operational gotchas
 
 - **Don't reuse a `credentials.json` after import** — see [Generating credentials](#generating-credentials-do-this-once-per-account) for the full explanation. Short version: the proxy owns the token chain after import; any other consumer of the same file causes immediate revocation.

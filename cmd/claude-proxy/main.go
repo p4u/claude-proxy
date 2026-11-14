@@ -47,6 +47,7 @@ Usage:
   claude-proxy users rm <id>          [--db PATH]
   claude-proxy users refresh <id>     [--db PATH]
   claude-proxy users limit <id>       --tokens 1M --window 24h | --none [--db PATH]
+  claude-proxy users subagents <id> on|off [--db PATH]   # subagents on their own subscriptions (default on)
   claude-proxy plugins list|set|enable|disable|delete|env …  [--db PATH]
                                    # plugins served to claudio; 'plugins' alone for help
   claude-proxy tui                 [--db PATH]   # interactive management UI
@@ -993,7 +994,7 @@ func printUsageBucket(label string, b *usage.Bucket) {
 
 func runUsers(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "users: missing subcommand (create|list|email|stats|token|disable|enable|rm|refresh|limit|suggestions)")
+		fmt.Fprintln(os.Stderr, "users: missing subcommand (create|list|email|stats|token|disable|enable|rm|refresh|limit|suggestions|subagents)")
 		os.Exit(2)
 	}
 	ctx := context.Background()
@@ -1022,6 +1023,10 @@ func runUsers(args []string) {
 		usersLimit(ctx, args[1:])
 	case "suggestions":
 		usersSuggestions(ctx, args[1:])
+	case "subagents":
+		if code := usersSubagents(ctx, args[1:], os.Stdout, os.Stderr); code != 0 {
+			os.Exit(code)
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "users: unknown subcommand %q\n", args[0])
 		os.Exit(2)
@@ -1106,8 +1111,8 @@ func printUsers(ctx context.Context, db *store.DB, w io.Writer) error {
 		return nil
 	}
 	now := time.Now()
-	fmt.Fprintf(w, "%-22s  %-20s  %-28s  %-8s  %-25s  %-25s  %-6s  %-16s  %s\n",
-		"ID", "NAME", "EMAIL", "STATUS", "CREATED", "LAST_USED", "SUGG", "LIMIT (OUT TOK)", "USED (OUT TOK)")
+	fmt.Fprintf(w, "%-22s  %-20s  %-28s  %-8s  %-25s  %-25s  %-6s  %-9s  %-16s  %s\n",
+		"ID", "NAME", "EMAIL", "STATUS", "CREATED", "LAST_USED", "SUGG", "SUBAGENTS", "LIMIT (OUT TOK)", "USED (OUT TOK)")
 	for _, ut := range list {
 		lastUsed := "-"
 		if ut.LastUsedAt != nil {
@@ -1134,13 +1139,19 @@ func printUsers(ctx context.Context, db *store.DB, w io.Writer) error {
 		if ut.BlockSuggestions {
 			sugg = "block"
 		}
+		// SUBAGENTS reads "spread" when each subagent gets its own binding,
+		// "share" when subagents stay on the session's subscription.
+		agents := "share"
+		if ut.SpreadSubagents {
+			agents = "spread"
+		}
 		email := ut.Email
 		if email == "" {
 			email = "-"
 		}
-		fmt.Fprintf(w, "%-22s  %-20s  %-28s  %-8s  %-25s  %-25s  %-6s  %-16s  %s\n",
+		fmt.Fprintf(w, "%-22s  %-20s  %-28s  %-8s  %-25s  %-25s  %-6s  %-9s  %-16s  %s\n",
 			ut.ID, ut.Name, email, string(ut.Status),
-			ut.CreatedAt.Format(time.RFC3339), lastUsed, sugg, limitCol, usageCol)
+			ut.CreatedAt.Format(time.RFC3339), lastUsed, sugg, agents, limitCol, usageCol)
 	}
 	return nil
 }
@@ -1315,6 +1326,49 @@ func usersToken(ctx context.Context, args []string) {
 		os.Exit(1)
 	}
 	fmt.Println(ut.Token)
+}
+
+// usersSubagents turns subagent spreading on or off for a user: on gives each
+// Claude Code subagent its own binding, preferring a subscription its session
+// is not using; off keeps subagents on the session's subscription.
+func usersSubagents(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) < 2 || strings.HasPrefix(args[0], "-") {
+		fmt.Fprintln(stderr, "users subagents <id> on|off [--db PATH]")
+		fmt.Fprintln(stderr, "  on  = each subagent gets its own binding, preferring an unused subscription (default)")
+		fmt.Fprintln(stderr, "  off = subagents share the session's subscription")
+		return 2
+	}
+	var on bool
+	switch strings.ToLower(args[1]) {
+	case "on", "spread", "true", "1":
+		on = true
+	case "off", "share", "false", "0":
+	default:
+		fmt.Fprintf(stderr, "users subagents: expected on|off, got %q\n", args[1])
+		return 2
+	}
+	fs := flag.NewFlagSet("users subagents", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	dbPath := fs.String("db", "./proxy.db", "sqlite database path")
+	if err := fs.Parse(args[2:]); err != nil {
+		return 2
+	}
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "open db %s: %v\n", *dbPath, err)
+		return 1
+	}
+	defer db.Close()
+	if err := usertoken.SetSpreadSubagents(ctx, db, args[0], on); err != nil {
+		fmt.Fprintf(stderr, "subagents: %v\n", err)
+		return 1
+	}
+	if on {
+		fmt.Fprintln(stdout, "subagents get their own subscriptions for", args[0])
+	} else {
+		fmt.Fprintln(stdout, "subagents share the session's subscription for", args[0])
+	}
+	return 0
 }
 
 // usersSuggestions toggles whether the proxy answers Claude Code's
