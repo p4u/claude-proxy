@@ -185,3 +185,50 @@ func TestCreateForEmailSuffixesTakenName(t *testing.T) {
 		t.Fatalf("untaken name: %v %+v", err, fresh)
 	}
 }
+
+// The subagent-spread switch is on for new users, persists when changed, and
+// SpreadSubagentsFor is on for anonymous and admin callers.
+func TestSpreadSubagents(t *testing.T) {
+	ctx := context.Background()
+	db := testDB(t)
+	ut, err := Create(ctx, db, "dave")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ut.SpreadSubagents {
+		t.Fatal("Create: SpreadSubagents should default to true")
+	}
+	if got, _ := Get(ctx, db, ut.ID); !got.SpreadSubagents {
+		t.Fatal("Get: SpreadSubagents should default to true")
+	}
+	if err := SetSpreadSubagents(ctx, db, ut.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := LookupByToken(ctx, db, ut.Token); got.SpreadSubagents {
+		t.Fatal("SetSpreadSubagents(false) not persisted")
+	}
+	if err := SetSpreadSubagents(ctx, db, ut.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := Get(ctx, db, ut.ID); !got.SpreadSubagents {
+		t.Fatal("SetSpreadSubagents(true) not persisted")
+	}
+	if err := SetSpreadSubagents(ctx, db, "utok_missing", true); err != ErrNotFound {
+		t.Fatalf("unknown id: %v, want ErrNotFound", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		id   *Identity
+		want bool
+	}{
+		{"anonymous", nil, true},
+		{"admin", &Identity{IsAdmin: true}, true},
+		{"user on", &Identity{UserTokenID: "u", SpreadSubagents: true}, true},
+		{"user off", &Identity{UserTokenID: "u"}, false},
+	} {
+		if got := SpreadSubagentsFor(tc.id); got != tc.want {
+			t.Errorf("SpreadSubagentsFor(%s) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

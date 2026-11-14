@@ -325,6 +325,12 @@ const SUGGESTIONS_HELP =
   "reply: no quota spent, nothing forwarded, and they stop cluttering captured prompts. " +
   "The only visible effect for the user is that typing suggestions stop appearing.";
 
+const SUBAGENTS_HELP =
+  "On (the default), each subagent Claude Code launches gets its own binding, on a " +
+  "subscription the session is not already using while one has room, so parallel " +
+  "subagents spread their load. Off, subagents share the session's subscription. " +
+  "Anthropic subscriptions only.";
+
 const LIMIT_METRIC = "Counts output tokens only — input and cache tokens are ignored.";
 const LIMIT_HELP =
   "Blocks a user once their output tokens over a rolling window exceed the cap. " +
@@ -451,6 +457,10 @@ function buildMgmtTable(users, statById, root) {
         el("span", { text: "Block suggestions" }),
         el("span", { class: "th-info", "aria-hidden": "true", text: "?" }),
       ]),
+      el("th", { scope: "col", title: SUBAGENTS_HELP }, [
+        el("span", { text: "Subagents" }),
+        el("span", { class: "th-info", "aria-hidden": "true", text: "?" }),
+      ]),
       el("th", { scope: "col", class: "limit-col", title: LIMIT_HELP }, [
         el("span", { text: "Usage limit" }),
         el("span", { class: "th-info", "aria-hidden": "true", text: "?" }),
@@ -534,6 +544,7 @@ function userRow(u, s, root) {
     el("td", {}, statusBadge(u.status)),
     el("td", {}, captureToggle(u)),
     el("td", {}, suggestionsToggle(u)),
+    el("td", {}, subagentsToggle(u)),
     el("td", { class: "limit-col" }, limitCell(u)),
     el("td", { class: "num", text: compactNum(s.requests || 0) }),
     el("td", { class: "num " + errTone, text: fullNum(s.errors || 0) }),
@@ -842,6 +853,28 @@ function suggestionsToggle(u) {
       on ? "good" : "warning",
     ],
     failure: "Couldn't change suggestion handling",
+  });
+}
+
+function subagentsToggle(u) {
+  return switchToggle({
+    initial: u.spread_subagents,
+    ariaLabel: `Give ${u.name}'s subagents their own subscriptions`,
+    help: SUBAGENTS_HELP,
+    save: async (want) => {
+      const r = await api.setUserSubagents(u.id, want);
+      const applied =
+        r && typeof r.spread_subagents === "boolean" ? r.spread_subagents : want;
+      u.spread_subagents = applied;
+      return applied;
+    },
+    announce: (on) => [
+      on
+        ? `Subagents spread for ${u.name}: each one prefers a subscription the session is not using.`
+        : `Subagents shared for ${u.name}: they stay on the session's subscription.`,
+      on ? "good" : "warning",
+    ],
+    failure: "Couldn't change subagent handling",
   });
 }
 

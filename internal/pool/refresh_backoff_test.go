@@ -29,7 +29,7 @@ func TestTransientRefreshFailureLeavesActiveCandidates(t *testing.T) {
 	if _, _, err := creds.NewRefresher(db).Refresh(ctx, cs[0].ID); err == nil {
 		t.Fatal("want a transient refresh error")
 	}
-	entries, err := activeCandidates(ctx, db, provider.Anthropic, nil, "", time.Now())
+	entries, err := activeCandidates(ctx, db, provider.Anthropic, nil, nil, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}

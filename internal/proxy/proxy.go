@@ -199,6 +199,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			opts.Compaction, opts.ObserveOnly = classifyCompaction(r, body, dr.Source)
 			captureSummary = opts.Compaction.Phase == pool.CompactionSummary && opts.Compaction.Request != ([32]byte{})
 		}
+		// A subagent candidate passes the session key plus its child key; the
+		// pool resolves the key. It may start a child on another subscription
+		// only for a portable request with no assistant turn.
+		if child := subagentChild(r, dr, prov, custom.Model); child != "" {
+			opts.Family, opts.Child = dr.ConvID, child
+			opts.StartChild = directSubscription && !accountBound && noAssistantTurn(body)
+		}
 		lease, err := h.pool.AcquireScoped(r.Context(), dr.ConvID, prov, custom.Model, custom.CredIDs, opts)
 		if err != nil {
 			h.log.Warn("bind failed", "err", err, "conv", convID, "src", string(convSrc), "provider", string(prov))
@@ -213,21 +220,30 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}()
 		notice.state, notice.reason = lease.Rebalance, lease.RebalanceReason
 		cred = lease.Credential
+		// Logs, request_log and the captures name the binding the pool used.
+		convID = pool.KeyScoped(lease.ConvID, prov, custom.Model)
+		spread := opts.Child != "" && lease.ConvID == opts.Child
 		// Observe-only requests (haiku background calls, count_tokens) are
 		// skipped: they may be served by a different provider than the
 		// session's main model and would make the reported credential flap.
 		// The route lets POST /v1/claudio/session/switch find this binding.
-		if !opts.ObserveOnly {
+		// A spread subagent is skipped too: the session record keeps
+		// describing the main conversation, which claudio's switch moves.
+		if !opts.ObserveOnly && !spread {
 			h.Sessions.RecordRequest(r, cred.ID, sessionbind.Route{
 				ConvID: dr.ConvID, Provider: prov, Scope: custom.Model, Allowed: custom.CredIDs})
 		}
-		h.log.Info("bind",
+		bindAttrs := []any{
 			"conv", convID, "src", string(convSrc), "new", lease.IsNew,
 			"provider", string(prov),
 			"cred", cred.ID, "label", cred.Label,
 			"sub", cred.SubscriptionType, "weight", cred.Weight,
 			"status", string(cred.Status),
-			"req_count", cred.RequestCount, "path", r.URL.Path)
+			"req_count", cred.RequestCount, "path", r.URL.Path}
+		if spread {
+			bindAttrs = append(bindAttrs, "agent", strings.TrimPrefix(lease.ConvID, opts.Family+"/a_"), "family", opts.Family)
+		}
+		h.log.Info("bind", bindAttrs...)
 	} else {
 		c, err := h.pickForProvider(r.Context(), prov)
 		if err != nil {

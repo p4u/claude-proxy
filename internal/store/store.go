@@ -114,6 +114,9 @@ func Open(path string) (*DB, error) {
 		// Login refresh deadline in Unix seconds. The default 0 means unknown,
 		// which is what every row that predates the column reads as.
 		`ALTER TABLE credentials ADD COLUMN refresh_expires_at INTEGER NOT NULL DEFAULT 0`,
+		// Subagent spreading is on by default; the DEFAULT turns it on for
+		// every user that predates the column.
+		`ALTER TABLE user_tokens ADD COLUMN spread_subagents INTEGER NOT NULL DEFAULT 1`,
 	} {
 		if _, err := sdb.Exec(alter); err != nil && !isDuplicateColumn(err) {
 			_ = sdb.Close()

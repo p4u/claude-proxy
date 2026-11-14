@@ -21,6 +21,9 @@ type userView struct {
 	// BlockSuggestions => the proxy answers Claude Code's prompt-suggestion
 	// requests locally instead of spending quota on them.
 	BlockSuggestions bool `json:"block_suggestions"`
+	// SpreadSubagents => each Claude Code subagent gets its own binding,
+	// preferring a subscription its session is not using.
+	SpreadSubagents bool `json:"spread_subagents"`
 
 	// Usage limit (v4). 0/0 => unlimited, in which case usage_output_tokens
 	// and usage_pct are 0 and blocked_until is null.
@@ -94,6 +97,9 @@ func (s *Server) userAction(w http.ResponseWriter, r *http.Request, id, action s
 	case action == "suggestions" && r.Method == http.MethodPost:
 		s.setUserSuggestions(w, r, id)
 		return
+	case action == "subagents" && r.Method == http.MethodPost:
+		s.setUserSubagents(w, r, id)
+		return
 	case action == "limit" && r.Method == http.MethodPost:
 		s.setUserLimit(w, r, id)
 		return
@@ -138,6 +144,7 @@ func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {
 			CreatedAt:          ut.CreatedAt.Format(time.RFC3339),
 			FullCapture:        ut.FullCapture,
 			BlockSuggestions:   ut.BlockSuggestions,
+			SpreadSubagents:    ut.SpreadSubagents,
 			LimitOutputTokens:  ut.LimitOutputTokens,
 			LimitWindowSeconds: ut.LimitWindowSeconds,
 		}
@@ -201,6 +208,22 @@ func (s *Server) setUserSuggestions(w http.ResponseWriter, r *http.Request, id s
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true, "block_suggestions": body.Block})
+}
+
+// setUserSubagents turns subagent spreading on or off for a user.
+func (s *Server) setUserSubagents(w http.ResponseWriter, r *http.Request, id string) {
+	var body struct {
+		Spread bool `json:"spread"`
+	}
+	if err := decodeJSON(w, r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := usertoken.SetSpreadSubagents(r.Context(), s.db, id, body.Spread); err != nil {
+		s.userErr(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "spread_subagents": body.Spread})
 }
 
 // setUserLimit configures or clears a user's rolling-window usage cap.

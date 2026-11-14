@@ -818,3 +818,54 @@ response is an empty completion matching the request's `stream` flag (SSE or
 JSON), reporting zero tokens. The attempt is logged to `request_log` with an
 empty `credential_id`/`conv_id` and zero tokens, and carries
 `X-Router-Reason: suggestion-blocked`.
+
+## v6 additions — subagents on their own subscriptions (2026-11-14)
+
+### Schema
+
+`user_tokens` gains `spread_subagents INTEGER NOT NULL DEFAULT 1` (in
+`CREATE TABLE` and the additive ALTER list). The default is what turns it on
+for every existing user.
+
+### Model
+
+`usertoken.UserToken` and `usertoken.Identity` gain `SpreadSubagents bool`;
+`usertoken.SetSpreadSubagents(ctx, db, id, on)` writes it (`ErrNotFound` for an
+unknown id). `usertoken.SpreadSubagentsFor(id)` is its only reader on the
+request path: true for no identity (no auth configured) and the admin token,
+else the user's flag. `auth.go` copies the flag into the request identity.
+
+### API
+
+- `GET /api/users` — each entry gains `"spread_subagents": bool`.
+- `POST /api/users/{id}/subagents` `{"spread": bool}` ->
+  `{"ok":true,"spread_subagents":bool}`. 404 for an unknown user, mirroring
+  `/suggestions`.
+
+### Frontend
+
+- Users table gains a **Subagents** column after *Block suggestions*, built
+  with `switchToggle` (`subagentsToggle`), and `api.setUserSubagents`.
+- The column header explains it: on, each subagent Claude Code launches gets
+  its own binding, preferring a subscription the session is not using while
+  one has room; off, subagents share the session's subscription; Anthropic
+  subscriptions only.
+- Mock backend: `spread_subagents` on all four fixture users (ci-runner off,
+  so both states render), in the `/users` list, plus a stateful
+  `POST /users/{id}/subagents` route.
+
+### Proxy behaviour
+
+A sticky Anthropic request (no custom host) keyed by `metadata.user_id` that
+carries a valid `X-Claude-Code-Agent-Id` (1-128 of `[0-9A-Za-z_-]`), from a
+caller with the switch on, is a subagent candidate. The pool keys every such request `<session key>/a_<agent id>`. A fresh
+subagent's first request (portable, no assistant turn) gets a binding that
+avoids the session's own credential and those of its subagents seen in the last
+15 minutes while another subscription keeps headroom ≥ 0.25; any other first
+request (a fork, a subagent already running) is bound to the session's
+credential, so its later requests, side calls included, stay there. Such a request is logged under the
+child key in `request_log`, `prompt_log` and `conversation_message`, does not
+update the `/v1/claudio/session` record, and its `bind` log line adds `agent`
+and `family`. A child binding on a `limited` credential (`retry_after` in the future, not
+account-bound) moves to an active credential on its next request; the main
+binding keeps its pin.
