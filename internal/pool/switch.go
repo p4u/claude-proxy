@@ -84,7 +84,7 @@ func (p *Pool) RequestSwitch(ctx context.Context, convID string, prov provider.I
 		return SwitchPlan{From: from, To: to}, nil
 	}
 
-	candidates, err := activeCandidates(ctx, p.db, prov, allowed, from.ID, time.Now())
+	candidates, err := activeCandidates(ctx, p.db, prov, allowed, []string{from.ID}, time.Now())
 	if err != nil {
 		return SwitchPlan{}, err
 	}
@@ -162,7 +162,7 @@ func (p *Pool) userSwitchOnce(ctx context.Context, key string, current *creds.Cr
 	if stored != current.ID || accountBound {
 		return nil, nil
 	}
-	candidates, err := activeCandidates(ctx, tx, prov, allowed, current.ID, time.Now())
+	candidates, err := activeCandidates(ctx, tx, prov, allowed, []string{current.ID}, time.Now())
 	if err != nil {
 		return nil, err
 	}

@@ -80,10 +80,13 @@ func (p *Pool) BindScoped(ctx context.Context, convID string, prov provider.ID, 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	return p.bindLocked(ctx, convID, prov, scope, allowed, true)
+	return p.bindLocked(ctx, convID, prov, scope, allowed, "", false, true)
 }
 
-func (p *Pool) bindLocked(ctx context.Context, convID string, prov provider.ID, scope string, allowed []string, touch bool) (*creds.Credential, bool, error) {
+// bindLocked binds convID. A non-empty family marks convID as a subagent's
+// child key under that session key; startChild lets a new child row avoid
+// the family (see subagentKey).
+func (p *Pool) bindLocked(ctx context.Context, convID string, prov provider.ID, scope string, allowed []string, family string, startChild, touch bool) (*creds.Credential, bool, error) {
 	if prov == "" {
 		prov = provider.Default
 	}
@@ -93,7 +96,7 @@ func (p *Pool) bindLocked(ctx context.Context, convID string, prov provider.ID, 
 	)
 	err := store.Retry(ctx, func() error {
 		var err error
-		c, isNew, err = p.bindOnce(ctx, convID, prov, scope, allowed, touch)
+		c, isNew, err = p.bindOnce(ctx, convID, prov, scope, allowed, family, startChild, touch)
 		return err
 	})
 	if err == nil {
@@ -134,7 +137,7 @@ func KeyScoped(convID string, prov provider.ID, scope string) string {
 	return key
 }
 
-func (p *Pool) bindOnce(ctx context.Context, convID string, prov provider.ID, scope string, allowed []string, touch bool) (*creds.Credential, bool, error) {
+func (p *Pool) bindOnce(ctx context.Context, convID string, prov provider.ID, scope string, allowed []string, family string, startChild, touch bool) (*creds.Credential, bool, error) {
 	tx, err := p.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, false, err
@@ -152,7 +155,11 @@ func (p *Pool) bindOnce(ctx context.Context, convID string, prov provider.ID, sc
 	switch {
 	case err == sql.ErrNoRows:
 		newConv = true
-		credID, err = p.pickActiveLocked(ctx, tx, prov, allowed)
+		if family != "" {
+			credID, err = p.pickNewChildLocked(ctx, tx, prov, allowed, family, startChild)
+		} else {
+			credID, err = p.pickActiveLocked(ctx, tx, prov, allowed)
+		}
 		if err != nil {
 			return nil, false, err
 		}
@@ -237,8 +244,15 @@ func (p *Pool) bindOnce(ctx context.Context, convID string, prov provider.ID, sc
 			if serr != nil {
 				return nil, false, serr
 			}
-			if saturated && !accountBound {
-				newCredID, perr := p.pickActiveLocked(ctx, tx, prov, allowed)
+			// A child binding has no user switch, so it leaves a pin cooling
+			// down after a 429 for an active credential, if there is one.
+			limitedChild := family != "" && !saturated && limitedNow(c, time.Now())
+			if (saturated || limitedChild) && !accountBound {
+				pick := p.pickActiveLocked
+				if limitedChild {
+					pick = p.pickActiveOnly
+				}
+				newCredID, perr := pick(ctx, tx, prov, allowed)
 				switch {
 				case errors.Is(perr, ErrNoCredentials):
 					// No healthy alternative — keep the sticky (saturated) pin
@@ -308,7 +322,7 @@ func (p *Pool) pickActiveLocked(ctx context.Context, tx rebalanceReader, prov pr
 	if prov == "" {
 		prov = provider.Default
 	}
-	candidates, err := activeCandidates(ctx, tx, prov, allowed, "", time.Now())
+	candidates, err := activeCandidates(ctx, tx, prov, allowed, nil, time.Now())
 	if err != nil {
 		return "", err
 	}
@@ -352,14 +366,19 @@ func (p *Pool) pickActiveLocked(ctx context.Context, tx rebalanceReader, prov pr
 
 // activeCandidates is the picker's eligible set: active credentials of prov
 // (restricted to allowed when non-empty) that are not cooling down after a 429
-// and whose latest usage snapshot is not saturated. exclude, when set, removes
-// one credential — the current pin of a user-requested switch.
-func activeCandidates(ctx context.Context, q rebalanceReader, prov provider.ID, allowed []string, exclude string, now time.Time) ([]weightedEntry, error) {
+// and whose latest usage snapshot is not saturated. exclude removes
+// credentials: the current pin of a user-requested switch, or the family of a
+// subagent's first binding.
+func activeCandidates(ctx context.Context, q rebalanceReader, prov provider.ID, allowed []string, exclude []string, now time.Time) ([]weightedEntry, error) {
 	inClause, inArgs := idFilter(allowed)
 	args := append([]any{string(prov), now.Unix()}, inArgs...)
-	if exclude != "" {
-		inClause += " AND c.id <> ?"
-		args = append(args, exclude)
+	if len(exclude) > 0 {
+		ph := make([]string, len(exclude))
+		for i, id := range exclude {
+			ph[i] = "?"
+			args = append(args, id)
+		}
+		inClause += " AND c.id NOT IN (" + strings.Join(ph, ",") + ")"
 	}
 	rows, err := q.QueryContext(ctx, `
 		SELECT c.id, c.weight FROM credentials c

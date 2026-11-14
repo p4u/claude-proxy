@@ -34,6 +34,12 @@ type RequestOptions struct {
 	// including later requests that omit account-scoped objects.
 	AccountBound bool
 	Compaction   CompactionRequest
+	// A subagent candidate: Family is the session key (also passed as convID),
+	// Child the subagent's key under it; StartChild (portable, no assistant
+	// turn) lets a new child binding avoid the family. Empty otherwise.
+	Family     string
+	Child      string
+	StartChild bool
 }
 
 type rebalancePlan struct {
@@ -93,6 +99,7 @@ type Lease struct {
 	IsNew           bool
 	Rebalance       string // empty, "pending", "switched", "deferred", or "cancelled"
 	RebalanceReason string // bounded, account-neutral diagnostic for deferred/cancelled; "user" for a requested switch
+	ConvID          string // raw key the binding used: the convID passed in, or RequestOptions.Child
 
 	pool       *Pool
 	state      *sessionState
@@ -143,6 +150,7 @@ func (l *Lease) ReleaseSummary(notified bool, proof SummaryProof) {
 func (p *Pool) AcquireScoped(ctx context.Context, convID string, prov provider.ID, scope string, allowed []string, opts RequestOptions) (*Lease, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	convID, family, startChild := subagentKey(convID, prov, scope, allowed, opts)
 	key := KeyScoped(convID, prov, scope)
 	compactionKey := compactionRequestKey(key, opts.Compaction)
 	s := p.sessions[key]
@@ -166,7 +174,7 @@ func (p *Pool) AcquireScoped(ctx context.Context, convID string, prov provider.I
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		c, isNew, err := p.bindLocked(ctx, convID, prov, scope, allowed, touch)
+		c, isNew, err := p.bindLocked(ctx, convID, prov, scope, allowed, family, startChild, touch)
 		if err != nil {
 			return nil, err
 		}
@@ -191,7 +199,7 @@ func (p *Pool) AcquireScoped(ctx context.Context, convID string, prov provider.I
 		case s.pending != nil && now.Sub(s.pending.created) >= rebalanceNoticeTTL:
 			p.finishPlan(s, "notice-expired")
 		}
-		l := &Lease{Credential: c, IsNew: isNew, pool: p, state: s}
+		l := &Lease{Credential: c, IsNew: isNew, ConvID: convID, pool: p, state: s}
 		gate := compactionGate{allowSwitch: true, allowCheck: true, reason: "usage-advantage"}
 		if trackCompaction {
 			gate = p.compactionFor(s, compactionKey, c.ID, opts.Compaction, now)
