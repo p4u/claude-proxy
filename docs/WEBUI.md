@@ -866,4 +866,6 @@ request (a fork, a subagent already running) is bound to the session's
 credential, so its later requests, side calls included, stay there. Such a request is logged under the
 child key in `request_log`, `prompt_log` and `conversation_message`, does not
 update the `/v1/claudio/session` record, and its `bind` log line adds `agent`
-and `family`.
+and `family`. A child binding on a `limited` credential (`retry_after` in the future, not
+account-bound) moves to an active credential on its next request; the main
+binding keeps its pin.

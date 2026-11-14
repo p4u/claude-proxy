@@ -1368,7 +1368,9 @@ each subagent its own sticky binding. Its first binding prefers an Anthropic
 subscription the session is not already using, for the main conversation or
 another live subagent, as long as one has room; with more subagents than
 subscriptions they share. Forks and subagents already running start on
-the session's subscription, keeping its prompt cache, and stay there.
+the session's subscription and keep its prompt cache. A subagent whose
+subscription hits a usage limit moves to another active one on its next
+request; the main conversation waits for claudio's switch instead.
 
 Each user token carries a `spread_subagents` flag, **on** by default (also for
 the admin token and for deployments without auth). Only Anthropic models and

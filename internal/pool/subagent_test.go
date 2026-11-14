@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -184,6 +185,38 @@ func TestChildAvoidsFamilyAfterRestart(t *testing.T) {
 		}
 		if got := boundTo(t, db, f.key+"/a_s2"); got != l.Credential.ID {
 			t.Fatalf("%s: stored %s, leased %s", f.key, got, l.Credential.ID)
+		}
+	}
+}
+
+// Siblings launched together see each other: p.mu serialises the binds and
+// each insert commits before the next pick. Twenty families, so chance cannot pass.
+func TestConcurrentChildrenAvoidEachOther(t *testing.T) {
+	db, _ := setup(t)
+	p := New(db)
+	for i := range 20 {
+		fam := fmt.Sprintf("u_par%d", i)
+		main := acquireAs(t, p, fam, RequestOptions{}).Credential.ID
+		var wg sync.WaitGroup
+		got, errs := make([]string, 2), make([]error, 2)
+		for j := range 2 {
+			wg.Go(func() {
+				l, err := p.AcquireScoped(context.Background(), fam, provider.Anthropic, "", nil,
+					childOpts(fam, fmt.Sprintf("s%d", j), true))
+				if err != nil {
+					errs[j] = err
+					return
+				}
+				got[j] = l.Credential.ID
+				l.Release(false)
+			})
+		}
+		wg.Wait()
+		if errs[0] != nil || errs[1] != nil {
+			t.Fatal(errs)
+		}
+		if got[0] == got[1] || got[0] == main || got[1] == main {
+			t.Fatalf("%s: main on %s, children on %v", fam, main, got)
 		}
 	}
 }
