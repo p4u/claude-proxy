@@ -333,10 +333,10 @@ func (p *Pool) pickActiveLocked(ctx context.Context, tx rebalanceReader, prov pr
 	if len(candidates) == 0 {
 		limitedIn, limitedArgs := idFilter(allowed)
 		lrows, lerr := tx.QueryContext(ctx, `
-			SELECT id, weight FROM credentials
-			WHERE status='limited'
-			  AND COALESCE(provider,'anthropic') = ?`+limitedIn+`
-			ORDER BY COALESCE(retry_after, 0) ASC, id`,
+			SELECT c.id, c.weight FROM credentials c
+			WHERE c.status='limited'
+			  AND COALESCE(c.provider,'anthropic') = ?`+limitedIn+`
+			ORDER BY COALESCE(c.retry_after, 0) ASC, c.id`,
 			append([]any{string(prov)}, limitedArgs...)...)
 		if lerr != nil {
 			return "", lerr

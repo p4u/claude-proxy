@@ -675,3 +675,21 @@ func TestKeyIsProviderQualified(t *testing.T) {
 		t.Errorf("Key(glm) = %q, want %q", got, "glm:abc")
 	}
 }
+
+// A scoped binding (custom host) whose allowed credentials are all limited
+// falls back to the limited ones for a real 429, not a SQL error: the
+// fallback query must alias credentials as c, which idFilter's clause names.
+func TestScopedLimitedFallback(t *testing.T) {
+	db, cs := setup(t)
+	ctx := context.Background()
+	if err := creds.MarkLimited(ctx, db, cs[0].ID, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	c, _, err := New(db).BindScoped(ctx, "conv-scoped", provider.Anthropic, "house-model", []string{cs[0].ID})
+	if err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	if c.ID != cs[0].ID {
+		t.Fatalf("bound %s, want the limited allowed credential %s", c.ID, cs[0].ID)
+	}
+}
