@@ -1,6 +1,6 @@
 # Subagents on their own subscriptions: design
 
-Status: audited (2026-11-14)   Class: architectural (schema column, admin API, CLI)
+Status: approved (2026-11-14)   Class: architectural (schema column, admin API, CLI)
 Owner decisions so far:
 - 2026-11-14: implement it in the proxy, with an option to disable it per user in the web UI,
   enabled by default.
