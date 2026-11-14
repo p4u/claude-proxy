@@ -66,7 +66,10 @@ CREATE TABLE IF NOT EXISTS user_tokens (
   limit_window_seconds INTEGER NOT NULL DEFAULT 0,
   -- 1 => answer Claude Code's prompt-suggestion requests locally with an empty
   -- completion instead of forwarding them upstream. Default 0 = forward.
-  block_suggestions INTEGER NOT NULL DEFAULT 0
+  block_suggestions INTEGER NOT NULL DEFAULT 0,
+  -- 1 => a Claude Code subagent's first request gets its own binding,
+  -- preferring a subscription its session is not using. Default 1 = on.
+  spread_subagents INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_user_tokens_token  ON user_tokens(token);
 CREATE INDEX IF NOT EXISTS idx_user_tokens_status ON user_tokens(status);

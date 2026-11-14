@@ -20,7 +20,8 @@ var ErrEmailTaken = errors.New("e-mail already belongs to another user token")
 
 // columns is the SELECT list scan reads, in order.
 const columns = `id, name, token, status, created_at, last_used_at, full_capture,
-		       limit_output_tokens, limit_window_seconds, block_suggestions, email`
+		       limit_output_tokens, limit_window_seconds, block_suggestions, email,
+		       spread_subagents`
 
 type Status string
 
@@ -51,6 +52,9 @@ type UserToken struct {
 	// Email is the member this token belongs to (lower-cased); empty for
 	// admin-created tokens.
 	Email string
+	// SpreadSubagents gives each Claude Code subagent its own binding, on a
+	// subscription its session is not using when one has room. Default true.
+	SpreadSubagents bool
 }
 
 // contextKey is unexported to prevent collisions across packages.
@@ -71,6 +75,18 @@ type Identity struct {
 	// BlockSuggestions => answer Claude Code's prompt-suggestion requests
 	// locally instead of forwarding them upstream.
 	BlockSuggestions bool
+	// SpreadSubagents is the user's switch; read it through SpreadSubagentsFor.
+	SpreadSubagents bool
+}
+
+// SpreadSubagentsFor reports whether a caller's subagent requests get their
+// own bindings. It is on for a deployment without auth (nil) and for the
+// admin token; a user token carries its own switch.
+func SpreadSubagentsFor(id *Identity) bool {
+	if id == nil || id.IsAdmin {
+		return true
+	}
+	return id.SpreadSubagents
 }
 
 // FromContext returns the identity attached by the auth middleware, or nil.
@@ -140,12 +156,13 @@ func CreateForEmail(ctx context.Context, db *store.DB, email string) (*UserToken
 // insert stores a new active token; email "" is stored as NULL.
 func insert(ctx context.Context, db *store.DB, name, email string) (*UserToken, error) {
 	ut := &UserToken{
-		ID:        newID(),
-		Name:      name,
-		Token:     GenerateToken(),
-		Status:    StatusActive,
-		CreatedAt: time.Now(),
-		Email:     email,
+		ID:              newID(),
+		Name:            name,
+		Token:           GenerateToken(),
+		Status:          StatusActive,
+		CreatedAt:       time.Now(),
+		Email:           email,
+		SpreadSubagents: true, // the column's default
 	}
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO user_tokens (id, name, token, status, created_at, email)
@@ -309,6 +326,19 @@ func SetBlockSuggestions(ctx context.Context, db *store.DB, id string, block boo
 	return nil
 }
 
+// SetSpreadSubagents turns subagent spreading on or off for a user.
+func SetSpreadSubagents(ctx context.Context, db *store.DB, id string, on bool) error {
+	res, err := db.ExecContext(ctx,
+		`UPDATE user_tokens SET spread_subagents=? WHERE id=?`, boolToInt(on), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func boolToInt(b bool) int {
 	if b {
 		return 1
@@ -362,7 +392,8 @@ func scan(rs interface{ Scan(...any) error }) (*UserToken, error) {
 	var email sql.NullString
 	var status string
 	if err := rs.Scan(&ut.ID, &ut.Name, &ut.Token, &status, &created, &lu, &ut.FullCapture,
-		&ut.LimitOutputTokens, &ut.LimitWindowSeconds, &ut.BlockSuggestions, &email); err != nil {
+		&ut.LimitOutputTokens, &ut.LimitWindowSeconds, &ut.BlockSuggestions, &email,
+		&ut.SpreadSubagents); err != nil {
 		return nil, err
 	}
 	ut.Status = Status(status)

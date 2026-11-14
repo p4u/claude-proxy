@@ -113,3 +113,37 @@ func TestUserTokenEmailUniqueWhenSet(t *testing.T) {
 	}
 	_ = db.Close()
 }
+
+// AC9: a database from before user_tokens.spread_subagents opens with every
+// existing user at 1 (subagent spreading on).
+func TestMigrateUserTokensSpreadSubagents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-users.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Recreate the previous user_tokens shape in this synthetic database.
+	if _, err := db.Exec(`ALTER TABLE user_tokens DROP COLUMN spread_subagents;
+		INSERT INTO user_tokens (id,name,token,created_at) VALUES ('utok_a','a','tok-a',1700000000),('utok_b','b','tok-b',1700000000)`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		db, err = Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var n, on int
+		err = db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(spread_subagents),0) FROM user_tokens`).Scan(&n, &on)
+		db.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != 2 || on != 2 {
+			t.Fatalf("users=%d with spread_subagents=1: %d, want 2 of 2", n, on)
+		}
+	}
+}

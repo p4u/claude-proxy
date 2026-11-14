@@ -81,6 +81,7 @@ func AuthMiddleware(adminToken string, db *store.DB, uiEnabled bool, next http.H
 					LimitOutputTokens:  ut.LimitOutputTokens,
 					LimitWindowSeconds: ut.LimitWindowSeconds,
 					BlockSuggestions:   ut.BlockSuggestions,
+					SpreadSubagents:    ut.SpreadSubagents,
 				})
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return

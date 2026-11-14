@@ -263,3 +263,31 @@ func TestAuthMiddlewareClaudioLoginExempt(t *testing.T) {
 		})
 	}
 }
+
+// AuthMiddleware carries the user's subagent-spread switch into the identity.
+func TestAuthMiddlewareCopiesSpreadSubagents(t *testing.T) {
+	ctx := context.Background()
+	db := openDB(t)
+	on, _ := usertoken.Create(ctx, db, "on")
+	off, _ := usertoken.Create(ctx, db, "off")
+	if err := usertoken.SetSpreadSubagents(ctx, db, off.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	var got *usertoken.Identity
+	h := AuthMiddleware("", db, false, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = usertoken.FromContext(r.Context())
+		w.WriteHeader(200)
+	}))
+	for _, tc := range []struct {
+		token string
+		want  bool
+	}{{on.Token, true}, {off.Token, false}} {
+		got = nil
+		req := httptest.NewRequest("POST", "/v1/messages", nil)
+		req.Header.Set("Authorization", "Bearer "+tc.token)
+		h.ServeHTTP(httptest.NewRecorder(), req)
+		if got == nil || got.SpreadSubagents != tc.want {
+			t.Fatalf("identity = %+v, want SpreadSubagents=%v", got, tc.want)
+		}
+	}
+}
