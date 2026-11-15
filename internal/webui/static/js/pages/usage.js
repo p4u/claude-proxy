@@ -220,15 +220,15 @@ function quotaMeters(r, five, seven, scoped) {
 // Selection metric row: pool share + effective score
 // (weight × room_5h × room_7d^1.5 × (1 + urgency)). The score shown is the one
 // the pool actually weighs, so the share matches routing. When the 7-day
-// urgency term is doing real work — unspent weekly allowance about to reset —
-// the multiplier is called out, since it is what pulls a low-usage credential
-// ahead of an equally fresh one.
+// urgency term is doing real work (weekly allowance unspent faster than the
+// window runs out, not necessarily a reset that is close) the multiplier is
+// called out, since it is what pulls a low-usage credential ahead.
 function selectionRow(sel) {
   const share = sel.share_pct == null ? "—" : pct(sel.share_pct, sel.share_pct >= 10 ? 0 : 1);
   const saturated = !!sel.saturated;
   const urgency = Number(sel.urgency) || 0;
   const scoreText = sel.score == null ? null
-    : `score ${sel.score.toFixed(2)}` + (urgency >= 0.05 ? ` · ×${(1 + urgency).toFixed(1)} 7d reset soon` : "");
+    : `score ${sel.score.toFixed(2)}` + (urgency >= 0.05 ? ` · ×${(1 + urgency).toFixed(1)} unused weekly quota` : "");
   return el("div", { class: "sub-card__sel" + (saturated ? " sub-card__sel--sat" : "") }, [
     el("span", { class: "sub-card__sel-lbl", text: saturated ? "excluded from new sessions" : "selection share" }),
     el("span", { class: "sub-card__sel-val", text: saturated ? "0%" : share }),
