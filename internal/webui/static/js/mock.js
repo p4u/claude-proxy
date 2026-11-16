@@ -530,7 +530,7 @@ const DB = {
     const sevens = [58, 0, 92, 22, 0, 0];
     const weeklyUnreported = (c) => c.type === "team";
     const scopeds = [44, 51, 78, 15, 0, 0];
-    // Score mirrors the pool: weight × room_5h × room_7d^1.5 × (1 + urgency),
+    // Score mirrors the pool: weight × room_7d^1.5 × (1 + urgency),
     // urgency = max(0, room_7d / remaining_fraction_7d − 1). Disabled creds and
     // saturated snapshots (≥100% on either window) are excluded from the share.
     const rows = CREDS.map((c, i) => {
@@ -541,7 +541,7 @@ const DB = {
       const active = c.status !== "disabled" && !saturated;
       const remaining7d = (2 + i) / 7; // matches seven_day.resets_at below
       const urgency = hasUsageAPI(c) && !weeklyUnreported(c) ? Math.max(0, room7 / remaining7d - 1) : 0;
-      const score = active ? c.weight * room5 * Math.pow(room7, 1.5) * (1 + urgency) : 0;
+      const score = active ? c.weight * Math.pow(room7, 1.5) * (1 + urgency) : 0;
       return { c, i, five, seven, scoped: scopeds[i], room5, room7, urgency, saturated, score };
     });
     // Share is totalled per provider, matching the backend: the pool filters by
@@ -580,7 +580,7 @@ const DB = {
       const room5 = Math.max(0, 1 - five / 100);
       const room7 = Math.max(0, 1 - seven / 100);
       const saturated = five >= 100 || seven >= 100;
-      const score = a.disabled || saturated ? 0 : bw * room5 * Math.pow(room7, 1.5);
+      const score = a.disabled || saturated ? 0 : bw * Math.pow(room7, 1.5);
       return {
         credential_id: "codex:" + a.name, label: a.email || a.label || a.name,
         subscription_type: a.quota?.plan_type || a.account_type || "subscription", provider: "codex",
@@ -715,7 +715,7 @@ const USER_TURNS = [
 ];
 
 const ASSISTANT_TURNS = [
-  "The selection score mirrors the pool exactly:\n\n```go\nfunc Score(weight, room5h, room7d float64) float64 {\n\treturn weight * room5h * math.Pow(room7d, SevenDayExp)\n}\n```\n\nThe 5h and 7d windows are **independent ceilings** — a request 429s on whichever it hits first — so their remaining room is multiplied, not averaged.",
+  "The selection score mirrors the pool exactly:\n\n```go\nfunc Score(weight, room7d float64) float64 {\n\treturn weight * math.Pow(room7d, SevenDayExp)\n}\n```\n\nThe 7-day room and urgency set the share; the 5h window is only a **ceiling** — a credential at 100% of it is excluded, but its 5h usage does not weigh the score.",
   "Short answer: the binding is sticky, but no longer unconditionally.\n\n1. `Bind()` looks up the conversation row\n2. If the pinned credential's latest snapshot is ≥100% on either window, it re-picks\n3. Otherwise it returns the existing pin unchanged\n\nThat's why the test sees `cred_ck88`: its snapshot is at 100%, so it should have been excluded before scoring.",
   "That string is stored verbatim and rendered with `textContent`, so the browser shows it as text instead of parsing it as HTML. Nothing executes.",
   "Priority order:\n\n| # | Source |\n|---|---|\n| 1 | `X-Router-Conversation-ID` header |\n| 2 | `$.metadata.user_id` in the body |\n| 3 | `SHA256(system_prompt + first_user_message)` |\n| 4 | `SHA256(remote_addr + body[:4096])` |\n\nThe first one that yields a non-empty value wins.",

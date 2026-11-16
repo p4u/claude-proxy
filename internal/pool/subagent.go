@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	// familyHeadroom is the least headroom, Room(5h) × Room(7d)^SevenDayExp,
+	// familyHeadroom is the least headroom, Room(7d)^SevenDayExp,
 	// a candidate needs for a subagent's first binding to avoid its family's
 	// credentials. Below it on every other candidate, the ordinary pick runs.
 	familyHeadroom = 0.25
@@ -118,14 +118,14 @@ func familyCredentials(ctx context.Context, q rebalanceReader, family string, no
 func withHeadroom(ctx context.Context, q rebalanceReader, candidates []weightedEntry, floor float64) ([]weightedEntry, error) {
 	var kept []weightedEntry
 	for _, e := range candidates {
-		var fh, sd float64
+		var sd float64
 		err := q.QueryRowContext(ctx, `
-			SELECT five_hour_pct, seven_day_pct FROM usage_history
-			WHERE credential_id=? ORDER BY captured_at DESC LIMIT 1`, e.id).Scan(&fh, &sd)
+			SELECT seven_day_pct FROM usage_history
+			WHERE credential_id=? ORDER BY captured_at DESC LIMIT 1`, e.id).Scan(&sd)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return nil, err
 		}
-		if Score(1, fh, sd) >= floor {
+		if Score(1, sd) >= floor {
 			kept = append(kept, e)
 		}
 	}

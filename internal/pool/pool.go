@@ -290,12 +290,12 @@ func (p *Pool) bindOnce(ctx context.Context, convID string, prov provider.ID, sc
 //
 // Effective score per credential:
 //
-//	score   = weight × headroom
-//	headroom = room_5h × room_7d^sevenDayExp
-//	room_X   = max(0, 1 − utilization_pct/100)
+//	score   = weight × room_7d^sevenDayExp × (1 + urgency)
+//	room_7d = max(0, 1 − utilization_pct/100)
 //
-// The two windows are independent ceilings — a request is rejected the moment
-// it hits EITHER limit — so their remaining room is multiplied, not averaged.
+// Only the 7-day window sets the share. The 5-hour window is a ceiling: a
+// credential at or above 100% of it is excluded, but its 5h usage below that
+// does not change the score.
 // Multiplying means a credential that is saturated on one window scores near
 // zero even if the other window is wide open, which the old additive blend
 // failed to capture (it would keep routing to a credential whose 7 d quota was
@@ -435,15 +435,15 @@ func Room(pct float64) float64 {
 
 // Score is the pool's usage-aware effective selection score for one credential:
 //
-//	score = weight × room_5h × room_7d^SevenDayExp
+//	score = weight × room_7d^SevenDayExp
 //
 // It is the single source of truth for selection weighting, shared between the
 // pool's picker and the web UI's usage view so the two can never diverge.
-func Score(weight int, fhPct, sdPct float64) float64 {
+func Score(weight int, sdPct float64) float64 {
 	if weight < 1 {
 		weight = 1
 	}
-	return float64(weight) * Room(fhPct) * math.Pow(Room(sdPct), SevenDayExp)
+	return float64(weight) * math.Pow(Room(sdPct), SevenDayExp)
 }
 
 // Saturated reports whether a credential's latest snapshot maxes out EITHER
@@ -482,7 +482,7 @@ const minRemainingFraction = 1.0 / (7 * 24)
 //
 // Only the 7-day window counts. Spending inside an about-to-reset 5-hour
 // window still charges the weekly allowance, so it is not "free"; the 5-hour
-// window is a ceiling (handled by room_5h) rather than an expiring budget.
+// window is a ceiling (Saturated) rather than an expiring budget.
 //
 // Zero when the reset time is unknown or in the past (the poller has not
 // refreshed since the window rolled over, so the snapshot describes the
@@ -502,21 +502,20 @@ func Urgency(sdPct float64, sdResetsUnix int64, now time.Time) float64 {
 
 // EffectiveScore is what the picker actually weighs:
 //
-//	Score(weight, fh%, sd%) × (1 + Urgency(sd%, sd_resets_at, now))
+//	Score(weight, sd%) × (1 + Urgency(sd%, sd_resets_at, now))
 //
 // Shared by the pool, the web UI's selection view and the Codex rebalance
 // loop so no surface can show a different number from the one used to route.
-func EffectiveScore(weight int, fhPct, sdPct float64, sdResetsUnix int64, now time.Time) float64 {
-	return Score(weight, fhPct, sdPct) * (1 + Urgency(sdPct, sdResetsUnix, now))
+func EffectiveScore(weight int, sdPct float64, sdResetsUnix int64, now time.Time) float64 {
+	return Score(weight, sdPct) * (1 + Urgency(sdPct, sdResetsUnix, now))
 }
 
 // weightedRandPick computes a usage-aware effective score for each candidate
 // and returns one chosen by weighted-random selection.
 //
-// Score formula: weight × room_5h × room_7d^sevenDayExp × (1 + urgency),
-// room = 1 − util. The two windows are independent ceilings, so their
-// remaining room is multiplied rather than averaged: saturation on either
-// window drives the score toward zero. Urgency (see Urgency) favours weekly
+// Score formula: weight × room_7d^sevenDayExp × (1 + urgency), room = 1 − util.
+// The 5-hour window is only a ceiling (a credential at 100% is excluded before
+// this runs), so it does not weigh the share. Urgency (see Urgency) favours weekly
 // windows about to reset with allowance unspent. See pickActiveLocked for
 // the full rationale.
 //
@@ -554,9 +553,8 @@ func (p *Pool) weightedRandPick(ctx context.Context, tx rebalanceReader, candida
 			// Stale data beats assuming 0% usage: if a cred was at 80%
 			// thirty minutes ago it is likely still near 80%, not 0%.
 			//
-			// Multiply the two windows' remaining room (independent ceilings)
-			// and penalise low 7d room harder via the exponent.
-			s.head = Room(s.fhPct) * math.Pow(Room(s.sdPct), SevenDayExp)
+			// Only the 7d room weighs; the exponent penalises low room harder.
+			s.head = math.Pow(Room(s.sdPct), SevenDayExp)
 			s.boost = Urgency(s.sdPct, sdReset.Int64, now)
 		}
 		// err == sql.ErrNoRows → no snapshot yet; keep head=1.0, boost=0
@@ -565,7 +563,7 @@ func (p *Pool) weightedRandPick(ctx context.Context, tx rebalanceReader, candida
 		// urgency boost — they compete on weight alone within their provider.
 
 		// Same formula the web UI and the Codex rebalance loop use.
-		s.score = EffectiveScore(e.weight, s.fhPct, s.sdPct, sdReset.Int64, now)
+		s.score = EffectiveScore(e.weight, s.sdPct, sdReset.Int64, now)
 		entries[i] = s
 
 		if e.weight > bestWeight {
