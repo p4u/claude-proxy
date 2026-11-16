@@ -78,7 +78,7 @@ func parseFloatSignal(m map[string]string, k string) float64 {
 // the same math the Anthropic pool uses per pick.
 func AccountScore(baseWeight int, q CodexQuota, now time.Time) float64 {
 	q = q.Current(now)
-	return pool.EffectiveScore(baseWeight, q.FiveHourPct, q.SevenDayPct, q.SevenDayResets, now)
+	return pool.EffectiveScore(baseWeight, q.SevenDayPct, q.SevenDayResets, now)
 }
 
 // BaseWeight returns the operator-configured weight for a Codex account.

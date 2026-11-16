@@ -513,9 +513,9 @@ queries must use the indexes on `request_log(ts)` / `usage_history(credential_id
     tokens:{input:[...],output:[...],cache_read:[...],cache_creation:[...]}}`.
 - **`GET /api/usage/current`**: each entry gains
   `"selection": {room_5h, room_7d, urgency, score, share_pct, saturated}` — score
-  mirrors the pool exactly (`pool.EffectiveScore` = `weight × room_5h × room_7d^1.5
+  mirrors the pool exactly (`pool.EffectiveScore` = `weight × room_7d^1.5
   × (1 + urgency)`, where `urgency = max(0, room_7d / remaining_fraction_7d − 1)`
-  favours weekly windows about to reset with allowance unspent; the same
+  favours weekly windows about to reset with allowance unspent; `room_5h` is shown, not weighed (the 5-hour window only excludes a credential at 100%); the same
   function drives `weightedRandPick` and the Codex rebalance loop),
   `share_pct` = score/Σscore×100 across active credentials of the same provider,
   `saturated` = latest snapshot ≥100% on either window (excluded from new bindings).

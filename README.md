@@ -73,7 +73,7 @@ to keep them alive.
   token plans in one pool. Their models appear in Claude Code's `/model` picker
   and are selectable transparently.
 - **Sticky binding** — each Claude Code conversation pins to a single credential (the binding is persisted across restarts); a long-lived pin may move to a substantially better-provisioned Anthropic subscription after an API header notice; `REBALANCE_SESSIONS=0` disables it.
-- **Usage-aware weighted selection** for new conversations: each credential's score combines its configured weight with live 5h/7d usage headroom, and a credential that has hit either limit is excluded entirely. Default weights: `max`/`team`/`enterprise` = 5, `pro` = 1.
+- **Usage-aware weighted selection** for new conversations: each credential's score combines its configured weight with its live 7-day usage headroom and how close that window is to resetting, and a credential that has hit either the 5h or the 7d limit is excluded entirely. Default weights: `max`/`team`/`enterprise` = 5, `pro` = 1.
 - **Automatic refresh** — proactive (every 60 s if `expires_at < now+5min`) and reactive (on `401` retry once with a fresh token).
 - **Automatic reroute** — when a pinned credential becomes permanently invalid (`expired`/`revoked`), the conversation auto-rebinds to a healthy credential.
 - **Rate-limit awareness** — `429` from Anthropic flips the credential to `limited` and excludes it from new-conversation selection until `Retry-After` elapses (heals automatically).
@@ -780,15 +780,15 @@ When a *new* conversation needs a credential, the pool scores every healthy
 candidate and picks one by weighted-random draw:
 
 ```
-score = weight × room_5h × room_7d^1.5        room_X = max(0, 1 − utilization/100)
+score = weight × room_7d^1.5 × (1 + urgency)        room_7d = max(0, 1 − utilization/100)
 ```
 
-The 5h and 7d usage windows (polled from Anthropic every 10 min) are treated as
-independent ceilings, so their remaining room is multiplied — a credential
-near-saturated on *either* window scores close to zero. The `^1.5` on the 7-day
-term protects the slow-resetting weekly quota harder than the 5-hour window. A
-credential whose latest snapshot shows **either window at ≥100%** is excluded
-from selection entirely. Selection stays weighted-random (not greedy) so load
+The usage windows are polled from Anthropic every 10 min. The 7-day room and
+the urgency term set a credential's share: the `^1.5` protects the
+slow-resetting weekly quota, and urgency favours a weekly window about to reset
+with allowance unspent. The 5-hour window is only a ceiling and does not weigh
+the score. A credential whose latest snapshot shows **either window at ≥100%**
+is excluded from selection entirely. Selection stays weighted-random (not greedy) so load
 spreads smoothly across credentials and self-corrects each poll cycle.
 
 Override the weight at import time or at runtime:

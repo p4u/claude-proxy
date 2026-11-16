@@ -230,9 +230,9 @@ func TestUsageAwareScoring(t *testing.T) {
 		   seven_day_pct, seven_day_resets_at, seven_day_sonnet_pct, seven_day_sonnet_resets_at)
 		VALUES (?, ?, 5.0, NULL, 5.0, NULL, 0.0, NULL)`, fresh.ID, now)
 
-	// "fresh" score = 1 × 0.95 × 0.95^1.5 ≈ 0.880
-	// "busy"  score = 1 × 0.10 × 0.10^1.5 ≈ 0.00316
-	// Expected selection ratio ≈ 278:1 in favour of "fresh".
+	// "fresh" score = 1 × 0.95^1.5 ≈ 0.926
+	// "busy"  score = 1 × 0.10^1.5 ≈ 0.0316
+	// Expected selection ratio ≈ 29:1 in favour of "fresh".
 
 	p := New(db)
 	const N = 200
@@ -256,7 +256,7 @@ func TestUsageAwareScoring(t *testing.T) {
 // TestSevenDayExhaustedAvoided guards the bottleneck fix: a credential whose
 // weekly quota is spent (7d=100%) must not be picked just because its 5h
 // window looks free. The old additive blend scored it 0.6×room_5h and kept
-// routing to it; the multiplicative model drives its headroom to zero.
+// routing to it; the 7d room term drives its score to zero.
 func TestSevenDayExhaustedAvoided(t *testing.T) {
 	dir := t.TempDir()
 	db, err := store.Open(dir + "/t.db")
@@ -458,14 +458,63 @@ func TestStickySaturatedKeptWhenNoAlternative(t *testing.T) {
 }
 
 func TestScoreSharedFormula(t *testing.T) {
-	// Score must equal weight × room_5h × room_7d^SevenDayExp.
-	got := Score(2, 20, 40)
-	want := 2.0 * Room(20) * math.Pow(Room(40), SevenDayExp)
+	// Score must equal weight × room_7d^SevenDayExp; the 5h window is no weight.
+	got := Score(2, 40)
+	want := 2.0 * math.Pow(Room(40), SevenDayExp)
 	if got != want {
 		t.Fatalf("Score=%v want %v", got, want)
 	}
 	if !Saturated(100, 0) || !Saturated(0, 100) || Saturated(99, 99) {
 		t.Fatal("Saturated cutoff wrong")
+	}
+}
+
+// TestFiveHourDoesNotWeighScore: two credentials with equal 7-day usage and
+// reset get equal scores whatever their 5-hour usage, and the 5h-busy one is
+// picked as often as the idle one.
+func TestFiveHourDoesNotWeighScore(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reset := now.Add(2 * 24 * time.Hour).Unix()
+	if a, b := Score(3, 30), Score(3, 30); a != b {
+		t.Fatalf("Score differs: %v vs %v", a, b)
+	}
+	if a, b := EffectiveScore(3, 30, reset, now), EffectiveScore(3, 30, reset, now); a != b {
+		t.Fatalf("EffectiveScore differs: %v vs %v", a, b)
+	}
+
+	db, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	busy5h, _ := creds.Insert(ctx, db, "busy5h", "pro", "sk-ant-oat-b5", "rt-b5", time.Now().Add(time.Hour), 1)
+	idle5h, _ := creds.Insert(ctx, db, "idle5h", "pro", "sk-ant-oat-i5", "rt-i5", time.Now().Add(time.Hour), 1)
+	ts := time.Now().Unix()
+	ins := func(id string, fh float64) {
+		_, err := db.ExecContext(ctx, `INSERT INTO usage_history
+			(credential_id, captured_at, five_hour_pct, five_hour_resets_at,
+			 seven_day_pct, seven_day_resets_at, seven_day_sonnet_pct, seven_day_sonnet_resets_at)
+			VALUES (?, ?, ?, NULL, 30.0, NULL, 0.0, NULL)`, id, ts, fh)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	ins(busy5h.ID, 90)
+	ins(idle5h.ID, 10)
+	p := New(db)
+	const N = 400
+	count := map[string]int{}
+	for i := range N {
+		c, _, err := p.Bind(ctx, fmt.Sprintf("fh-%d", i), provider.Anthropic)
+		if err != nil {
+			t.Fatalf("bind %d: %v", i, err)
+		}
+		count[c.ID]++
+	}
+	// Old formula: ~9:1 for idle5h, so busy5h would get ~10%. New: 50%.
+	if got := count[busy5h.ID]; got < N*35/100 || got > N*65/100 {
+		t.Fatalf("busy5h picked %d/%d, want about half (idle5h=%d)", got, N, count[idle5h.ID])
 	}
 }
 
@@ -516,9 +565,9 @@ func TestEffectiveScoreOrdersByReset(t *testing.T) {
 	days := now.Add(60 * time.Hour).Unix()
 	far := now.Add(5 * 24 * time.Hour).Unix()
 
-	logins := EffectiveScore(20, 3, 0, soon, now)
-	tarat := EffectiveScore(20, 1, 0, days, now)
-	ops := EffectiveScore(20, 51, 11, far, now)
+	logins := EffectiveScore(20, 0, soon, now)
+	tarat := EffectiveScore(20, 0, days, now)
+	ops := EffectiveScore(20, 11, far, now)
 	total := logins + tarat + ops
 	if share := logins / total; share < 0.9 {
 		t.Fatalf("about-to-reset credential share = %.2f, want ≥ 0.9 (logins=%.1f tarat=%.1f ops=%.1f)",

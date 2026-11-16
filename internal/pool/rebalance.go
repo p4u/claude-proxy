@@ -394,9 +394,9 @@ func (c rebalanceCandidate) betterThan(source rebalanceCandidate, now time.Time)
 }
 
 func rebalanceAdvantage(oldWeight int, old rebalanceSample, weight int, target rebalanceSample, at time.Time) bool {
-	oldScore := EffectiveScore(oldWeight, old.fh, old.sd, old.sdReset, at)
-	newScore := EffectiveScore(weight, target.fh, target.sd, target.sdReset, at)
-	roomGain := Score(1, target.fh, target.sd) >= 2*Score(1, old.fh, old.sd)
+	oldScore := EffectiveScore(oldWeight, old.sd, old.sdReset, at)
+	newScore := EffectiveScore(weight, target.sd, target.sdReset, at)
+	roomGain := Score(1, target.sd) >= 2*Score(1, old.sd)
 	urgencyGain := 1+Urgency(target.sd, target.sdReset, at) >= 4*(1+Urgency(old.sd, old.sdReset, at))
 	return oldScore > 0 && newScore >= 4*oldScore && (roomGain || urgencyGain)
 }
@@ -445,7 +445,7 @@ func (p *Pool) rebalanceOnce(ctx context.Context, key string, current *creds.Cre
 			continue
 		}
 		s := candidate.samples[0]
-		score := EffectiveScore(candidate.weight, s.fh, s.sd, s.sdReset, now)
+		score := EffectiveScore(candidate.weight, s.sd, s.sdReset, now)
 		total += score
 		if rand.Float64()*total < score {
 			selected = id

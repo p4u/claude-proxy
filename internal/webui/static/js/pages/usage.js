@@ -218,7 +218,7 @@ function quotaMeters(r, five, seven, scoped) {
 }
 
 // Selection metric row: pool share + effective score
-// (weight × room_5h × room_7d^1.5 × (1 + urgency)). The score shown is the one
+// (weight × room_7d^1.5 × (1 + urgency)). The score shown is the one
 // the pool actually weighs, so the share matches routing. When the 7-day
 // urgency term is doing real work (weekly allowance unspent faster than the
 // window runs out, not necessarily a reset that is close) the multiplier is
@@ -233,7 +233,7 @@ function selectionRow(sel) {
     el("span", { class: "sub-card__sel-lbl", text: saturated ? "excluded from new sessions" : "selection share" }),
     el("span", { class: "sub-card__sel-val", text: saturated ? "0%" : share }),
     scoreText ? el("span", { class: "sub-card__sel-score", text: scoreText,
-      title: "weight × room_5h × room_7d^1.5 × (1 + urgency); urgency = room_7d ÷ remaining share of the 7-day window − 1 (0 when on pace)" }) : null,
+      title: "weight × room_7d^1.5 × (1 + urgency); the 5-hour window only excludes a credential at 100%; urgency = room_7d ÷ remaining share of the 7-day window − 1 (0 when on pace)" }) : null,
   ]);
 }
 

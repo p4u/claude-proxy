@@ -49,7 +49,8 @@ type selectionView struct {
 	Room5h float64 `json:"room_5h"`
 	Room7d float64 `json:"room_7d"`
 	// Urgency is the 7-day use-it-or-lose-it term (pool.Urgency); Score
-	// already includes it, so score = weight × room_5h × room_7d^1.5 × (1+urgency).
+	// already includes it, so score = weight × room_7d^1.5 × (1+urgency). room_5h
+	// is shown, not weighted: the 5-hour window only excludes a credential at 100%.
 	Urgency   float64 `json:"urgency"`
 	Score     float64 `json:"score"`
 	SharePct  float64 `json:"share_pct"`
@@ -213,7 +214,7 @@ func (s *Server) handleUsageCurrent(w http.ResponseWriter, r *http.Request) {
 			Room5h:    pool.Room(uc.FiveHour.Pct),
 			Room7d:    pool.Room(uc.SevenDay.Pct),
 			Urgency:   pool.Urgency(uc.SevenDay.Pct, sdReset.Int64, now),
-			Score:     pool.EffectiveScore(c.Weight, uc.FiveHour.Pct, uc.SevenDay.Pct, sdReset.Int64, now),
+			Score:     pool.EffectiveScore(c.Weight, uc.SevenDay.Pct, sdReset.Int64, now),
 			Saturated: pool.Saturated(uc.FiveHour.Pct, uc.SevenDay.Pct),
 		}
 		out = append(out, uc)
